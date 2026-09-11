@@ -238,3 +238,173 @@ def test_apply_sampled_token_updates_request_state():
 
 
 # endregion Output state
+
+
+# region Deferred async apply
+
+
+def _deferred_apply(runner):
+    """Bind the unbound runner method on a fake runner, the way
+    ``TTAsyncDecodeController`` calls it."""
+    return lambda **kwargs: TTModelRunner._apply_sampled_tokens_to_state(
+        runner, **kwargs
+    )
+
+
+def test_apply_deferred_step_skips_request_finished_after_submit():
+    """A speculative async decode step whose request finished (stop token / EOS /
+    abort) between submit and apply must be dropped, not asserted on.
+
+    Reproduces the live crash: request A ends on a stop token while async
+    scheduling already submitted its next decode step; ``_update_states`` pops
+    A; the completed step is applied at the start of the next ``execute_model``
+    -> ``AssertionError: captured request missing from runner state``.
+    """
+    import torch
+
+    prompt_len = 8
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=0,
+        num_computed_tokens=prompt_len,
+    )
+    runner = _fake_runner(batch, request)
+    runner.model_config.max_model_len = MAX_MODEL_LEN
+    # What the step captured at submit time...
+    captured_states = (request,)
+    # ...and what ``_update_states`` did in between: the request finished.
+    runner.requests.pop("r")
+    batch.remove_request("r")
+
+    TTModelRunner._apply_sampled_tokens_to_state(
+        runner,
+        sampled_token_ids=torch.tensor([[SAMPLED_TOKEN_ID]], dtype=torch.int32),
+        req_ids=["r"],
+        request_states=captured_states,
+    )
+
+    assert request.output_token_ids == []
+    assert batch.num_reqs == 0
+
+
+def test_apply_deferred_step_skips_row_reused_by_new_request():
+    """After the finished request's row went to a new request (same or other id),
+    the stale step must not write into that row."""
+    import torch
+
+    prompt_len = 8
+    batch, old_request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=0,
+        num_computed_tokens=prompt_len,
+    )
+    runner = _fake_runner(batch, old_request)
+    runner.model_config.max_model_len = MAX_MODEL_LEN
+    captured_states = (old_request,)
+    runner.requests.pop("r")
+    batch.remove_request("r")
+    # A new request re-uses the id and lands on the same row.
+    new_request = CachedRequestState(
+        req_id="r",
+        prompt_token_ids=list(range(5)),
+        mm_features=None,
+        sampling_params=SamplingParams(temperature=0.0),
+        generator=None,
+        block_ids=([0],),
+        num_computed_tokens=5,
+        output_token_ids=[],
+    )
+    batch.add_request(new_request)
+    runner.requests["r"] = new_request
+    tokens_before = batch.num_tokens[0]
+
+    TTModelRunner._apply_sampled_tokens_to_state(
+        runner,
+        sampled_token_ids=torch.tensor([[SAMPLED_TOKEN_ID]], dtype=torch.int32),
+        req_ids=["r"],
+        request_states=captured_states,
+    )
+
+    assert new_request.output_token_ids == []
+    assert old_request.output_token_ids == []
+    assert batch.num_tokens[0] == tokens_before
+
+
+def test_apply_deferred_step_through_controller_after_finish():
+    """The controller path the live crash took: ``apply_completed_decode_step``."""
+    import torch
+
+    from vllm_tt_plugin.async_decode import (
+        CompletedDecodeStep,
+        SubmittedStepContext,
+        TTAsyncDecodeController,
+    )
+
+    prompt_len = 8
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=0,
+        num_computed_tokens=prompt_len,
+    )
+    runner = _fake_runner(batch, request)
+    runner.model_config.max_model_len = MAX_MODEL_LEN
+    runner._apply_sampled_tokens_to_state = _deferred_apply(runner)
+    controller = TTAsyncDecodeController(runner)
+    context = controller.capture_submitted_step_context()
+    assert context.req_ids == ["r"] and context.request_states == (request,)
+    completed = CompletedDecodeStep(
+        sampled_token_ids=torch.tensor([[SAMPLED_TOKEN_ID]], dtype=torch.int32),
+        logprobs=None,
+        context=context,
+        completion_time_ns=0,
+    )
+    # The request finished before the readback was applied.
+    runner.requests.pop("r")
+    batch.remove_request("r")
+
+    controller.apply_completed_decode_step(completed)
+
+    assert request.output_token_ids == []
+    # A step whose request is still alive applies normally.
+    batch.add_request(request)
+    runner.requests["r"] = request
+    live = CompletedDecodeStep(
+        sampled_token_ids=torch.tensor([[SAMPLED_TOKEN_ID]], dtype=torch.int32),
+        logprobs=None,
+        context=SubmittedStepContext(
+            req_ids=["r"],
+            req_id_to_index={"r": 0},
+            request_states=(request,),
+            submit_time_ns=0,
+        ),
+        completion_time_ns=0,
+    )
+    controller.apply_completed_decode_step(live)
+    assert request.output_token_ids == [SAMPLED_TOKEN_ID]
+    assert batch.token_ids_cpu[0, prompt_len] == SAMPLED_TOKEN_ID
+
+
+def test_apply_sync_step_still_requires_the_request():
+    """Without a captured ``request_states`` (the synchronous path applies the
+    step in the same engine step) a missing request is still a bug."""
+    import torch
+
+    prompt_len = 8
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=0,
+        num_computed_tokens=prompt_len,
+    )
+    runner = _fake_runner(batch, request)
+    runner.model_config.max_model_len = MAX_MODEL_LEN
+    runner.requests.pop("r")
+
+    with pytest.raises(AssertionError, match="captured request missing"):
+        TTModelRunner._apply_sampled_tokens_to_state(
+            runner,
+            sampled_token_ids=torch.tensor([[SAMPLED_TOKEN_ID]], dtype=torch.int32),
+            req_ids=["r"],
+        )
+
+
+# endregion Deferred async apply

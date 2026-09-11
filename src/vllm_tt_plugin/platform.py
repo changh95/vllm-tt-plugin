@@ -605,7 +605,21 @@ def _register_models_from_extra_dir(ModelRegistry) -> int:
     ``insert(0)``, so an installed package of the same name always wins and
     nothing is shadowed); built-in adapters given as a full dotted path resolve
     normally and need no path entry. The arch is registered under the plugin's
-    ``TT``-prefixed convention (mirroring ``check_and_update_config``).
+    ``TT``-prefixed convention (mirroring ``check_and_update_config``) AND under
+    its plain HF name when upstream vLLM has no class of that name.
+
+    The plain name matters since vLLM 0.25: ``ModelConfig.__post_init__`` resolves
+    ``hf_config.architectures`` before ``check_and_update_config`` prefixes them,
+    and it keeps that resolution in ``model_config.architecture`` and in
+    ``model_config.architectures`` (``model_arch_config``, a validated copy the
+    in-place prefix never reaches). An arch unknown upstream therefore resolves to
+    the Transformers backend (e.g. ``TransformersMoEForCausalLM``), the worker's
+    KV-spec hook then looks up ``"TT" + that name`` and the engine dies with
+    "Model architectures ['TTTransformersMoEForCausalLM'] are not supported".
+    Registering the plain name makes upstream resolve to the bundle's class (the
+    same approach as the built-in Gemma4 entries); ``_register_model_if_missing``
+    leaves an upstream in-tree arch of the same name untouched, so bundles for
+    natively supported archs keep the ``TT``-prefix-only behaviour.
     """
     count = 0
 
@@ -615,10 +629,16 @@ def _register_models_from_extra_dir(ModelRegistry) -> int:
 
         tt_arch = arch if arch.startswith("TT") else "TT" + arch
         _register_model_if_missing(ModelRegistry, tt_arch, main_class)
+        registered_names = [tt_arch]
+        if arch != tt_arch:
+            plain_known_upstream = arch in ModelRegistry.get_supported_archs()
+            _register_model_if_missing(ModelRegistry, arch, main_class)
+            if not plain_known_upstream:
+                registered_names.append(arch)
 
         logger.info(
             "Registered TT model %s -> %s (from EXTRA_MODELS_DIR/%s)",
-            tt_arch,
+            " / ".join(registered_names),
             main_class,
             os.path.basename(folder),
         )

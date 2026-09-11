@@ -307,10 +307,23 @@ class TTWorker(WorkerBase):
         # holds the upstream (e.g. CUDA) name, and resolving it would find
         # upstream's vLLM model class — which doesn't have our
         # ``get_kv_cache_spec`` hook. Prefer the prefixed entry from the
-        # ``architectures`` list (which the platform modifies in-place) and
-        # fall back to prepending ``"TT"`` when neither is available.
+        # architectures lists: ``model_config.architectures`` (in-place on vLLM
+        # < 0.25) and, since vLLM 0.25 keeps a validated copy there
+        # (``model_arch_config``), ``hf_config.architectures`` itself, which is
+        # what the platform actually prefixes. Fall back to prepending ``"TT"``
+        # to the resolved name when neither carries a prefixed entry. Without
+        # the ``hf_config`` scan an arch unknown upstream resolves to the
+        # Transformers backend name and the lookup below becomes
+        # ``TTTransformers...ForCausalLM``.
+        hf_architectures = (
+            getattr(self.model_config.hf_config, "architectures", None) or []
+        )
         arch = next(
-            (a for a in self.model_config.architectures if a.startswith("TT")),
+            (
+                a
+                for a in (*self.model_config.architectures, *hf_architectures)
+                if a.startswith("TT")
+            ),
             None,
         )
         if arch is None:

@@ -54,7 +54,14 @@ def _is_host_decode_output(tt_out: Any) -> bool:
 
 @dataclass(frozen=True)
 class SubmittedStepContext:
-    """Immutable snapshot of the host state associated with one decode submit."""
+    """Immutable snapshot of the host state associated with one decode submit.
+
+    Applied later by ``TTModelRunner._apply_sampled_tokens_to_state``; by then a
+    captured request may already be gone from ``runner.requests`` (it finished on
+    a stop token / EOS / abort while this speculative step was in flight, and the
+    scheduler discards the step's token for it) or replaced by a new request of
+    the same id -- both are skipped there via ``request_states`` identity.
+    """
 
     req_ids: list[str]
     req_id_to_index: dict[str, int]

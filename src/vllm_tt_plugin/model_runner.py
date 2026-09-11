@@ -2259,6 +2259,15 @@ class TTModelRunner:
         captured_req_ids = req_ids
         for req_idx, req_id in enumerate(captured_req_ids):
             req_state = self.requests.get(req_id)
+            if req_state is None and request_states is not None:
+                # Deferred async step whose request is gone: it finished (stop
+                # token / EOS / stop string / abort) after the step was submitted.
+                # Async scheduling speculatively schedules one decode step past
+                # the token that finishes a request, ``_update_states`` already
+                # popped the request when the scheduler reported it finished, and
+                # the scheduler discards this step's token for it. Nothing to
+                # apply -- the row (if any) now belongs to another request.
+                continue
             assert req_state is not None, (
                 "captured request missing from runner state while applying sampled "
                 f"tokens: req_id={req_id!r}"
