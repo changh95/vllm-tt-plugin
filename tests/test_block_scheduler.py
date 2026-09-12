@@ -34,6 +34,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_tt_plugin.config import (
     store_tt_adaptive_block_output,
+    store_tt_block_output_kv_lookahead_tokens,
     store_tt_output_tokens_per_step,
 )
 from vllm_tt_plugin.scheduler import (
@@ -86,6 +87,7 @@ def _scheduler(
     async_scheduling: bool = False,
     adaptive: bool = False,
     max_num_seqs: int = 1,
+    kv_lookahead: int = 0,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -129,6 +131,8 @@ def _scheduler(
     store_tt_output_tokens_per_step(config, output_width)
     if adaptive:
         store_tt_adaptive_block_output(config, True)
+    if kv_lookahead:
+        store_tt_block_output_kv_lookahead_tokens(config, kv_lookahead)
     num_blocks = max_model_len // BLOCK_SIZE + 2
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
@@ -1104,3 +1108,30 @@ def test_adaptive_under_frontier_prompt_still_blocks():
     scheduler.schedule()
     assert request._tt_block_step is True
     assert request.num_output_placeholders == CANVAS
+
+
+def test_block_kv_lookahead_allocates_the_block_before_the_step():
+    """A speculative block model writes the whole block (plus its rejected-draft
+    tail) into the paged KV inside one step; the declared lookahead must make
+    allocate_slots cover that reach on the very step that writes it."""
+    lookahead = CANVAS + 3
+    scheduler, request, prefill = _scheduler(
+        adaptive=True, kv_lookahead=lookahead
+    ), None, None
+    assert scheduler.num_lookahead_tokens == lookahead
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(prefill, _runner_output(prefill, [7]))
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens[request.request_id] == 1
+    # Prompt (32) + anchor + one scheduled token + lookahead slots, rounded up
+    # to whole blocks, are all allocated before the model runs the block step.
+    blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)[0]
+    need = request.num_computed_tokens + 1 + lookahead
+    assert len(blocks) * BLOCK_SIZE >= need
+
+
+def test_block_kv_lookahead_defaults_to_upstream():
+    scheduler = _scheduler(adaptive=True)
+    assert scheduler.num_lookahead_tokens == 0

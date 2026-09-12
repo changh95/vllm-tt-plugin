@@ -250,6 +250,7 @@ Keys currently consumed by `src/vllm_tt_plugin/platform.py`:
 | `supports_async_decode` | `False` | Whether async scheduling may stay on. When `False`, the platform warns and clears `async_scheduling` |
 | `tt_adaptive_block_output` | `False` | Block-output models only: commit the block only on solo decode steps and decode batched steps as plain 1-token baseline. Relaxes the `max_num_seqs 1` and DP gates |
 | `tt_adaptive_block_max_prompt_tokens` | `0` (no limit) | Adaptive block models only: prompts longer than this are served as plain baseline (width-1 steps) for their whole lifetime; the scheduler reserves accordingly |
+| `tt_block_output_kv_lookahead_tokens` | `0` | Block-output models only: KV slots the model writes past the step's scheduled token within one step (the block, plus a speculative verify's rejected-draft tail). The scheduler allocates them as lookahead so the write never lands in the null block |
 
 Absent keys default via `.get`. That is the live contract. Do not add
 fail-on-missing for a new key unless the matching tt-metal generators will

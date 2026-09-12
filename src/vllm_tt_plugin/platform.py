@@ -22,6 +22,7 @@ from vllm_tt_plugin.config import (
     require_tt_output_tokens_per_step,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
+    store_tt_block_output_kv_lookahead_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
     uses_tt_lane_coordinator,
@@ -1673,6 +1674,24 @@ class TTPlatform(Platform):
         store_tt_adaptive_block_max_prompt_tokens(
             vllm_config, adaptive_block_max_prompt
         )
+        # KV lookahead for block steps: a block-output model that writes its
+        # whole block (and, for a speculative verify, the rejected-draft tail)
+        # into the paged KV within ONE step needs those slots allocated before
+        # the step runs. Upstream only allocates the scheduled token; the model
+        # declares the extra reach and TTScheduler passes it as lookahead.
+        block_kv_lookahead = int(
+            (model_capabilities or {}).get("tt_block_output_kv_lookahead_tokens", 0)
+        )
+        if block_kv_lookahead < 0:
+            raise ValueError(
+                "tt_block_output_kv_lookahead_tokens must be >= 0; got "
+                f"{block_kv_lookahead}"
+            )
+        if block_kv_lookahead and output_tokens_per_step <= 1:
+            raise ValueError(
+                "tt_block_output_kv_lookahead_tokens requires output_tokens_per_step > 1"
+            )
+        store_tt_block_output_kv_lookahead_tokens(vllm_config, block_kv_lookahead)
         is_block_output_model = is_tt_block_output_model(vllm_config)
         if is_diffusion_gemma and not is_block_output_model:
             raise ValueError(

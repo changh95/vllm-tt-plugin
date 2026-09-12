@@ -155,6 +155,35 @@ def store_tt_adaptive_block_max_prompt_tokens(
     additional[_ADAPTIVE_BLOCK_MAX_PROMPT_KEY] = int(limit)
 
 
+_BLOCK_KV_LOOKAHEAD_KEY = "tt_block_output_kv_lookahead_tokens"
+
+
+def get_tt_block_output_kv_lookahead_tokens(vllm_config: "VllmConfig") -> int:
+    """KV slots a block-output model may write past the step's scheduled token.
+
+    Upstream allocates KV blocks for ``num_new_tokens`` (one token on a decode
+    step) plus ``num_lookahead_tokens``. A block-output model writes the whole
+    committed block -- and a speculative one also its rejected-draft tail --
+    into the paged KV inside that single step, so those slots must already be
+    allocated when the model runs, not one step later. The model declares how
+    far past the scheduled token it writes; TTScheduler feeds it to
+    allocate_slots as lookahead. 0 = upstream behaviour (block-only models
+    whose canvas does not touch the paged KV).
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return int(additional.get(_BLOCK_KV_LOOKAHEAD_KEY, 0))
+
+
+def store_tt_block_output_kv_lookahead_tokens(
+    vllm_config: "VllmConfig", lookahead: int
+) -> None:
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_BLOCK_KV_LOOKAHEAD_KEY] = int(lookahead)
+
+
 def store_tt_output_tokens_per_step(
     vllm_config: "VllmConfig", output_tokens_per_step: int
 ) -> None:

@@ -13,6 +13,7 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
+    get_tt_block_output_kv_lookahead_tokens,
     get_tt_output_tokens_per_step,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -127,6 +128,16 @@ class TTScheduler(AsyncScheduler):
         self._adaptive_block_max_prompt = get_tt_adaptive_block_max_prompt_tokens(
             self.vllm_config
         )
+        # KV lookahead for block steps (model-declared): the block-output model
+        # writes the whole block -- and a speculative verify its rejected-draft
+        # tail -- into the paged KV within the step, so allocate_slots must
+        # cover that reach up front instead of one step later (a late slot is
+        # a write into the zero-padded page-table entry = the null block, and
+        # the token's KV is lost). Applied to every request for simplicity: at
+        # most one extra block per request is held early.
+        block_kv_lookahead = get_tt_block_output_kv_lookahead_tokens(self.vllm_config)
+        if self._is_block_output_model and block_kv_lookahead > 0:
+            self.num_lookahead_tokens = max(self.num_lookahead_tokens, block_kv_lookahead)
         if self._is_block_output_model:
             assert self.num_sampled_tokens_per_step == 1, (
                 "Block-output accounting requires upstream to reserve exactly "
