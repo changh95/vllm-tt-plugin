@@ -730,29 +730,40 @@ def _pin_v1_model_runner() -> None:
     os.environ[_V2_MODEL_RUNNER_ENV] = "0"
 
 
-def _neutralize_model_owned_sampling(params) -> list[str]:
+def _neutralize_model_owned_sampling(
+    params, keep_transport_controls: bool = False
+) -> list[str]:
     """Reset HTTP sampling controls on the cloned per-request SamplingParams.
 
     The model owns its Gumbel sampler and temperature schedule, but common
     OpenAI clients still send transport sampling controls, so they are
     accepted and ignored. Returns the neutralized fields for logging.
+
+    ``keep_transport_controls`` (adaptive block-output models): temperature,
+    top_p, top_k and seed are KEPT -- the prefill anchor and every width-1
+    step of such a model are sampled by vLLM's own sampler with the request's
+    controls (a temperature=0 request must stay greedy), and only the solo
+    block steps are model-owned. Host-only min_p and the penalties are still
+    neutralized: they would force host sampling onto a block step, or grow
+    penalty tensors with the session length.
     """
     ignored = []
-    if params.temperature != 1.0:
-        ignored.append(f"temperature={params.temperature!r}")
-        params.temperature = 1.0
-    if params.top_p != 1.0:
-        ignored.append(f"top_p={params.top_p!r}")
-        params.top_p = 1.0
-    if params.top_k not in (0, -1):
-        ignored.append(f"top_k={params.top_k!r}")
-        params.top_k = 0
+    if not keep_transport_controls:
+        if params.temperature != 1.0:
+            ignored.append(f"temperature={params.temperature!r}")
+            params.temperature = 1.0
+        if params.top_p != 1.0:
+            ignored.append(f"top_p={params.top_p!r}")
+            params.top_p = 1.0
+        if params.top_k not in (0, -1):
+            ignored.append(f"top_k={params.top_k!r}")
+            params.top_k = 0
+        if params.seed is not None:
+            ignored.append(f"seed={params.seed!r}")
+            params.seed = None
     if params.min_p != 0.0:
         ignored.append(f"min_p={params.min_p!r}")
         params.min_p = 0.0
-    if params.seed is not None:
-        ignored.append(f"seed={params.seed!r}")
-        params.seed = None
     if params.presence_penalty != 0.0:
         ignored.append(f"presence_penalty={params.presence_penalty!r}")
         params.presence_penalty = 0.0
@@ -805,7 +816,10 @@ def _install_block_output_input_processor_patch() -> None:
         if not is_block_output_model or cloned_params is None:
             return request
 
-        ignored = _neutralize_model_owned_sampling(cloned_params)
+        ignored = _neutralize_model_owned_sampling(
+            cloned_params,
+            keep_transport_controls=is_tt_adaptive_block_output_model(self.vllm_config),
+        )
         if ignored:
             logger.warning_once(
                 "This block-output model uses its model-owned sampler; HTTP "
@@ -2102,6 +2116,24 @@ class TTPlatform(Platform):
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:
             return
+
+        # An ADAPTIVE block model speculates on text; TTScheduler drops the
+        # multimodal features of any block-output request (a block model has no
+        # encoder budget), which would silently serve an image prompt as text.
+        # Reject it here, where the client gets the reason.
+        vllm_config = cls._resolve_tt_admission_handle()
+        if (
+            vllm_config is not None
+            and is_tt_adaptive_block_output_model(vllm_config)
+            and (
+                processed_inputs.get("mm_kwargs")
+                or processed_inputs.get("mm_placeholders")
+            )
+        ):
+            raise ValueError(
+                "This speculative (adaptive block-output) profile serves text "
+                "prompts only; multimodal prompts need the plain-decode profile"
+            )
 
         output_size, max_model_len = block_contract
         prompt_len = length_from_prompt_token_ids_or_embeds(

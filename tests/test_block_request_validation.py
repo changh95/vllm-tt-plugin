@@ -879,3 +879,49 @@ def test_default_max_tokens_without_canvas_room_is_rejected_at_validation():
         _validate(params, prompt_len=1000)
 
     assert params.max_tokens is None
+
+
+def test_input_processor_keeps_transport_controls_for_adaptive_block_model(
+    monkeypatch,
+):
+    """An adaptive block model's prefill anchor is sampled by vLLM's sampler:
+    temperature/top_p/top_k/seed must survive, min_p and penalties must not."""
+    from vllm_tt_plugin.platform import _neutralize_model_owned_sampling
+
+    params = SamplingParams(
+        max_tokens=16, temperature=0.7, top_p=0.9, top_k=5, seed=7, min_p=0.1,
+        repetition_penalty=1.2,
+    )
+    ignored = _neutralize_model_owned_sampling(params, keep_transport_controls=True)
+    assert params.temperature == 0.7 and params.top_p == 0.9
+    assert params.top_k == 5 and params.seed == 7
+    assert params.min_p == 0.0 and params.repetition_penalty == 1.0
+    assert any(x.startswith("min_p") for x in ignored)
+    assert not any(x.startswith("temperature") for x in ignored)
+
+    greedy = SamplingParams(max_tokens=16, temperature=0.0)
+    _neutralize_model_owned_sampling(greedy, keep_transport_controls=True)
+    assert greedy.temperature == 0.0  # a greedy request stays greedy
+
+    plain = SamplingParams(max_tokens=16, temperature=0.0)
+    _neutralize_model_owned_sampling(plain)
+    assert plain.temperature == 1.0  # non-adaptive block models: model-owned sampler
+
+
+def test_adaptive_block_model_rejects_multimodal_prompt(monkeypatch):
+    from vllm_tt_plugin.config import store_tt_adaptive_block_output
+
+    config = TTPlatform._resolve_tt_admission_handle()
+    assert config is not None
+    store_tt_adaptive_block_output(config, True)
+    try:
+        prompt = {"prompt_token_ids": [1] * 32, "mm_kwargs": [object()],
+                  "mm_placeholders": {"image": [object()]}}
+        with pytest.raises(ValueError, match="text prompts only"):
+            TTPlatform.validate_request(prompt, SamplingParams(max_tokens=16))
+        # text prompt still fine
+        TTPlatform.validate_request(
+            {"prompt_token_ids": [1] * 32}, SamplingParams(max_tokens=16)
+        )
+    finally:
+        store_tt_adaptive_block_output(config, False)
