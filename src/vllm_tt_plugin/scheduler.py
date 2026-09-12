@@ -15,6 +15,7 @@ from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_output_kv_lookahead_tokens,
     get_tt_output_tokens_per_step,
+    is_tt_adaptive_block_batched,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
 )
@@ -122,6 +123,10 @@ class TTScheduler(AsyncScheduler):
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
         # as plain baseline. Lets max_num_seqs>1 coexist with block-output.
         self._is_adaptive_block = is_tt_adaptive_block_output_model(self.vllm_config)
+        # Batched adaptive: the model runs one multi-user speculative step for
+        # every decoding request, so a decode step is a block step for ALL of
+        # them (not only when solo). Prefill anchors stay width-1.
+        self._adaptive_block_batched = is_tt_adaptive_block_batched(self.vllm_config)
         # Prompt-length frontier for the block path (0 = none): a longer prompt
         # is served as plain baseline by the model for its whole lifetime, so
         # its steps reserve width-1 even when solo.
@@ -137,7 +142,9 @@ class TTScheduler(AsyncScheduler):
         # most one extra block per request is held early.
         block_kv_lookahead = get_tt_block_output_kv_lookahead_tokens(self.vllm_config)
         if self._is_block_output_model and block_kv_lookahead > 0:
-            self.num_lookahead_tokens = max(self.num_lookahead_tokens, block_kv_lookahead)
+            self.num_lookahead_tokens = max(
+                self.num_lookahead_tokens, block_kv_lookahead
+            )
         if self._is_block_output_model:
             assert self.num_sampled_tokens_per_step == 1, (
                 "Block-output accounting requires upstream to reserve exactly "
@@ -618,28 +625,49 @@ class TTScheduler(AsyncScheduler):
         # _update_request_with_output takes the same path (block serving is
         # synchronous, so the stamp and its commit never interleave).
         solo = len(scheduler_output.num_scheduled_tokens) == 1
+
+        def _is_decode(req_id: str) -> bool:
+            # num_computed_tokens is already advanced by THIS step's scheduled
+            # tokens here, so subtract them back out: a step is a decode iff the
+            # prompt was fully computed BEFORE it. This is a pure scheduling-side
+            # quantity -- output-commit timing (which differs between sync tests
+            # and the pipelined engine loop) cannot skew it. A resumed replay
+            # scheduling prompt+output tokens lands back below the prompt
+            # boundary and correctly stays a non-block step.
+            request = self.requests[req_id]
+            scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            return request.num_computed_tokens - scheduled >= request.num_prompt_tokens
+
+        # Batched adaptive: the model speculates for every decoding request of
+        # the step at once, so the whole step is either a decode step (every
+        # request blocks) or not. A step mixing prefill and decode requests
+        # cannot be described by one per-step width and is refused here rather
+        # than misaccounted; TTScheduler's default mode never builds one.
+        batched_block = False
+        if self._is_adaptive_block and self._adaptive_block_batched and not solo:
+            decodes = [
+                _is_decode(req_id)
+                for req_id in scheduler_output.num_scheduled_tokens
+                if not self.requests[req_id].is_prefill_chunk
+            ]
+            if decodes and any(decodes) and not all(decodes):
+                raise RuntimeError(
+                    "tt_adaptive_block_batched: a step mixes prefill and decode "
+                    f"requests ({sum(decodes)} decode of {len(decodes)}); the batched "
+                    "block contract needs decode-only steps"
+                )
+            batched_block = bool(decodes) and all(decodes)
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
                 continue
             if self._is_adaptive_block:
-                # num_computed_tokens is already advanced by THIS step's
-                # scheduled tokens here, so subtract them back out: a step is a
-                # decode iff the prompt was fully computed BEFORE it. This is a
-                # pure scheduling-side quantity -- output-commit timing (which
-                # differs between sync tests and the pipelined engine loop)
-                # cannot skew it. A resumed replay scheduling prompt+output
-                # tokens lands back below the prompt boundary and correctly
-                # stays a non-block step.
-                scheduled = scheduler_output.num_scheduled_tokens[req_id]
-                is_decode = (
-                    request.num_computed_tokens - scheduled >= request.num_prompt_tokens
-                )
+                is_decode = _is_decode(req_id)
                 spec_eligible = (
                     self._adaptive_block_max_prompt == 0
                     or request.num_prompt_tokens <= self._adaptive_block_max_prompt
                 )
-                block_step = solo and is_decode and spec_eligible
+                block_step = (solo or batched_block) and is_decode and spec_eligible
             else:
                 block_step = True
             if block_step:

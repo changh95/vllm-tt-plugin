@@ -20,6 +20,7 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    store_tt_adaptive_block_batched,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_output_kv_lookahead_tokens,
@@ -1670,6 +1671,18 @@ class TTPlatform(Platform):
                 "tt_adaptive_block_output requires output_tokens_per_step > 1"
             )
         store_tt_adaptive_block_output(vllm_config, adaptive_block_output)
+        # Batched adaptive blocks: the model speculates for EVERY decoding
+        # request in one step (a multi-user verify), so every decode step is a
+        # block step for all of them. Only meaningful on top of the adaptive
+        # contract (prefill anchors stay width-1 host-sampled tokens).
+        adaptive_block_batched = bool(
+            (model_capabilities or {}).get("tt_adaptive_block_batched", False)
+        )
+        if adaptive_block_batched and not adaptive_block_output:
+            raise ValueError(
+                "tt_adaptive_block_batched requires tt_adaptive_block_output"
+            )
+        store_tt_adaptive_block_batched(vllm_config, adaptive_block_batched)
         # Optional prompt-length frontier for the adaptive block path: prompts
         # above it are served as plain baseline by the model, so the scheduler
         # must reserve width-1 for them (see TTScheduler). 0 = no limit.

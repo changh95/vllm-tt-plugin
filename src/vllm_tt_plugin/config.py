@@ -130,6 +130,34 @@ def store_tt_adaptive_block_output(vllm_config: "VllmConfig", flag: bool) -> Non
     additional[_ADAPTIVE_BLOCK_OUTPUT_KEY] = bool(flag)
 
 
+_ADAPTIVE_BLOCK_BATCHED_KEY = "tt_adaptive_block_batched"
+
+
+def is_tt_adaptive_block_batched(vllm_config: "VllmConfig") -> bool:
+    """Whether an adaptive block model commits its block on BATCHED decode steps too.
+
+    A plain adaptive block model blocks only when it decodes alone. A model that
+    runs its speculative session for every decoding request at once (one
+    multi-user verify per step) declares this flag: every decode step is a block
+    step for all of its requests, each committing exactly
+    ``output_tokens_per_step`` tokens (EOS-filled at a stop). Prefill steps still
+    commit one host-sampled anchor per request. The scheduler reserves the block
+    placeholders for every request of a decode step, so a step that mixes
+    prefill and decode requests is rejected -- TTScheduler's default mode never
+    builds one.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_ADAPTIVE_BLOCK_BATCHED_KEY, False))
+
+
+def store_tt_adaptive_block_batched(vllm_config: "VllmConfig", flag: bool) -> None:
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_ADAPTIVE_BLOCK_BATCHED_KEY] = bool(flag)
+
+
 _ADAPTIVE_BLOCK_MAX_PROMPT_KEY = "tt_adaptive_block_max_prompt_tokens"
 
 

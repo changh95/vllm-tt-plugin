@@ -249,6 +249,7 @@ Keys currently consumed by `src/vllm_tt_plugin/platform.py`:
 | `supports_sample_on_device` | `False` | Opt-in for on-device sampling. A requested `sample_on_device_mode` is rejected when `False` |
 | `supports_async_decode` | `False` | Whether async scheduling may stay on. When `False`, the platform warns and clears `async_scheduling` |
 | `tt_adaptive_block_output` | `False` | Block-output models only: commit the block only on solo decode steps and decode batched steps as plain 1-token baseline. Relaxes the `max_num_seqs 1` and DP gates |
+| `tt_adaptive_block_batched` | `False` | Adaptive block models only: the model speculates for every decoding request of a step at once, so every decode-only step is a block step for all of them (W placeholders each); prefill anchors stay width-1. A step mixing prefill and decode requests is refused |
 | `tt_adaptive_block_max_prompt_tokens` | `0` (no limit) | Adaptive block models only: prompts longer than this are served as plain baseline (width-1 steps) for their whole lifetime; the scheduler reserves accordingly |
 | `tt_block_output_kv_lookahead_tokens` | `0` | Block-output models only: KV slots the model writes past the step's scheduled token within one step (the block, plus a speculative verify's rejected-draft tail). The scheduler allocates them as lookahead so the write never lands in the null block |
 

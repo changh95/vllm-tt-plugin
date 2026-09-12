@@ -33,6 +33,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_tt_plugin.config import (
+    store_tt_adaptive_block_batched,
     store_tt_adaptive_block_output,
     store_tt_block_output_kv_lookahead_tokens,
     store_tt_output_tokens_per_step,
@@ -88,6 +89,7 @@ def _scheduler(
     adaptive: bool = False,
     max_num_seqs: int = 1,
     kv_lookahead: int = 0,
+    batched: bool = False,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -131,6 +133,8 @@ def _scheduler(
     store_tt_output_tokens_per_step(config, output_width)
     if adaptive:
         store_tt_adaptive_block_output(config, True)
+    if batched:
+        store_tt_adaptive_block_batched(config, True)
     if kv_lookahead:
         store_tt_block_output_kv_lookahead_tokens(config, kv_lookahead)
     num_blocks = max_model_len // BLOCK_SIZE + 2
@@ -1037,6 +1041,59 @@ def test_adaptive_batched_decode_commits_single_tokens():
     assert req_b.num_output_placeholders == 0
 
 
+def test_adaptive_batched_blocks_every_decode_in_the_step():
+    """With tt_adaptive_block_batched, a decode step with two requests reserves
+    the block for BOTH and each commits a full block; the batched prefill step
+    before it still commits one anchor per request."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2, batched=True)
+    req_a = _request(CANVAS * 2, request_id="req-a")
+    req_b = _request(CANVAS * 2, request_id="req-b")
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+    submitted = scheduler.schedule()
+    assert len(submitted.num_scheduled_tokens) == 2
+    for req in (req_a, req_b):
+        assert req._tt_block_step is False  # prefill anchors stay width-1
+        assert req.num_output_placeholders == 1
+    anchor_output = ModelRunnerOutput(
+        req_ids=["req-a", "req-b"],
+        req_id_to_index={"req-a": 0, "req-b": 1},
+        sampled_token_ids=[[5], [6]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(submitted, anchor_output)
+
+    submitted = scheduler.schedule()
+    assert len(submitted.num_scheduled_tokens) == 2
+    for req in (req_a, req_b):
+        assert req._tt_block_step is True
+        assert req.num_output_placeholders == CANVAS
+    block_a = list(range(100, 100 + CANVAS))
+    block_b = list(range(200, 200 + CANVAS))
+    decode_output = ModelRunnerOutput(
+        req_ids=["req-a", "req-b"],
+        req_id_to_index={"req-a": 0, "req-b": 1},
+        sampled_token_ids=[block_a, block_b],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    outputs = scheduler.update_from_output(submitted, decode_output)
+    committed = {o.request_id: o.new_token_ids for o in outputs[0].outputs}
+    assert committed == {"req-a": block_a, "req-b": block_b}
+    assert req_a.num_output_placeholders == 0
+    assert req_b.num_output_placeholders == 0
+
+
+def test_adaptive_batched_without_flag_keeps_single_token_batched_decodes():
+    """The flag is opt-in: an adaptive model without it keeps the solo-only gate
+    (the mechanism test_adaptive_batched_decode_commits_single_tokens pins)."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2, batched=False)
+    assert scheduler._adaptive_block_batched is False
+
+
 def test_adaptive_returns_to_block_width_when_solo_again():
     """After a peer finishes, the survivor's next solo decode reserves the
     block again."""
@@ -1115,9 +1172,11 @@ def test_block_kv_lookahead_allocates_the_block_before_the_step():
     tail) into the paged KV inside one step; the declared lookahead must make
     allocate_slots cover that reach on the very step that writes it."""
     lookahead = CANVAS + 3
-    scheduler, request, prefill = _scheduler(
-        adaptive=True, kv_lookahead=lookahead
-    ), None, None
+    scheduler, request, prefill = (
+        _scheduler(adaptive=True, kv_lookahead=lookahead),
+        None,
+        None,
+    )
     assert scheduler.num_lookahead_tokens == lookahead
     request = _request(CANVAS * 2)
     scheduler.add_request(request)
