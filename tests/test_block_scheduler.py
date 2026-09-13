@@ -35,6 +35,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm_tt_plugin.config import (
     store_tt_adaptive_block_batched,
     store_tt_adaptive_block_output,
+    store_tt_adaptive_block_ragged,
     store_tt_block_output_kv_lookahead_tokens,
     store_tt_output_tokens_per_step,
 )
@@ -90,6 +91,7 @@ def _scheduler(
     max_num_seqs: int = 1,
     kv_lookahead: int = 0,
     batched: bool = False,
+    ragged: bool = False,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -135,6 +137,8 @@ def _scheduler(
         store_tt_adaptive_block_output(config, True)
     if batched:
         store_tt_adaptive_block_batched(config, True)
+    if ragged:
+        store_tt_adaptive_block_ragged(config, True)
     if kv_lookahead:
         store_tt_block_output_kv_lookahead_tokens(config, kv_lookahead)
     num_blocks = max_model_len // BLOCK_SIZE + 2
@@ -164,7 +168,11 @@ def _scheduler(
 
 
 def _request(
-    max_tokens: int, *, ignore_eos: bool = True, request_id: str = "req-0"
+    max_tokens: int,
+    *,
+    ignore_eos: bool = True,
+    request_id: str = "req-0",
+    prompt_len: int = 32,
 ) -> Request:
     init_none_hash(sha256)
     sampling_params = SamplingParams(
@@ -174,7 +182,7 @@ def _request(
     sampling_params.update_from_generation_config({}, eos_token_id=2)
     return Request(
         request_id=request_id,
-        prompt_token_ids=[1] * 32,
+        prompt_token_ids=[1] * prompt_len,
         sampling_params=sampling_params,
         pooling_params=None,
         block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
@@ -1194,3 +1202,247 @@ def test_block_kv_lookahead_allocates_the_block_before_the_step():
 def test_block_kv_lookahead_defaults_to_upstream():
     scheduler = _scheduler(adaptive=True)
     assert scheduler.num_lookahead_tokens == 0
+
+
+# ── Ragged batched blocks (tt_adaptive_block_ragged) ─────────────────────────
+#
+# Contract: on a decode-only block step the model returns a rectangular int32
+# [num_reqs, W] tensor whose row i holds 1 <= n_i <= W real ids followed by -1
+# padding. The runner strips the padding, so the scheduler sees n_i tokens per
+# request; it accepts 1..W but still consumes the whole W reservation.
+
+PROMPT = 32  # _request's default prompt length
+
+
+def _multi_runner_output(tokens_by_req: dict[str, list[int]]) -> ModelRunnerOutput:
+    req_ids = list(tokens_by_req)
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: idx for idx, req_id in enumerate(req_ids)},
+        sampled_token_ids=[list(tokens_by_req[req_id]) for req_id in req_ids],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def _batched_pair(
+    *,
+    ragged: bool,
+    max_tokens_a: int = CANVAS * 4,
+    max_tokens_b: int = CANVAS * 4,
+    ignore_eos: bool = True,
+    prompt_len: int = PROMPT,
+    kv_lookahead: int = 0,
+) -> tuple[TTScheduler, Request, Request]:
+    """Two requests driven through their batched prefill anchors (5 and 6)."""
+    scheduler = _scheduler(
+        adaptive=True,
+        max_num_seqs=2,
+        batched=True,
+        ragged=ragged,
+        kv_lookahead=kv_lookahead,
+    )
+    req_a = _request(
+        max_tokens_a, request_id="req-a", ignore_eos=ignore_eos, prompt_len=prompt_len
+    )
+    req_b = _request(
+        max_tokens_b, request_id="req-b", ignore_eos=ignore_eos, prompt_len=prompt_len
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+    submitted = scheduler.schedule()
+    assert len(submitted.num_scheduled_tokens) == 2
+    scheduler.update_from_output(
+        submitted, _multi_runner_output({"req-a": [5], "req-b": [6]})
+    )
+    for req in (req_a, req_b):
+        assert req.num_output_placeholders == 0
+        assert req.num_computed_tokens == prompt_len
+        assert req.num_tokens == prompt_len + 1
+    return scheduler, req_a, req_b
+
+
+def test_ragged_rows_commit_their_own_widths_and_keep_the_w_reservation():
+    """A ragged decode step commits n_a=5 and n_b=1 (padding already stripped
+    by the runner). Each request consumes its WHOLE W reservation, so the next
+    schedule advances its computed tokens by exactly n (never past
+    num_tokens) and stamps a fresh W-wide reservation on top."""
+    scheduler, req_a, req_b = _batched_pair(ragged=True)
+    assert scheduler._adaptive_block_ragged is True
+
+    decode = scheduler.schedule()
+    for req in (req_a, req_b):
+        assert req._tt_block_step is True
+        assert req.num_output_placeholders == CANVAS
+        assert decode.num_scheduled_tokens[req.request_id] == 1  # the anchor
+    block_a = list(range(100, 105))
+    block_b = [200]
+    outputs = scheduler.update_from_output(
+        decode, _multi_runner_output({"req-a": block_a, "req-b": block_b})
+    )
+    committed = {o.request_id: o.new_token_ids for o in outputs[0].outputs}
+    assert committed == {"req-a": block_a, "req-b": block_b}
+    for req, anchor, block in ((req_a, 5, block_a), (req_b, 6, block_b)):
+        assert list(req.output_token_ids) == [anchor, *block]
+        assert req.num_output_placeholders == 0  # W consumed, not n
+        assert req.num_computed_tokens == PROMPT + 1  # pre-step: the anchor
+        assert req.num_tokens == PROMPT + 1 + len(block)
+        assert req.status == RequestStatus.RUNNING
+
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens == {"req-a": 5, "req-b": 1}
+    for req in (req_a, req_b):
+        assert req.num_computed_tokens == req.num_tokens
+        assert req.is_prefill_chunk is False
+        assert req._tt_block_step is True
+        assert req.num_output_placeholders == CANVAS
+
+    # A full-width row next to a short one in the same step.
+    block_a = list(range(300, 300 + CANVAS))
+    block_b = [400, 401, 402]
+    outputs = scheduler.update_from_output(
+        decode, _multi_runner_output({"req-a": block_a, "req-b": block_b})
+    )
+    committed = {o.request_id: o.new_token_ids for o in outputs[0].outputs}
+    assert committed == {"req-a": block_a, "req-b": block_b}
+    assert req_a.num_output_placeholders == 0
+    assert req_b.num_output_placeholders == 0
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens == {"req-a": CANVAS, "req-b": 3}
+    for req in (req_a, req_b):
+        assert req.num_computed_tokens == req.num_tokens
+        assert req.num_output_placeholders == CANVAS
+
+
+def test_ragged_solo_decode_commits_a_single_token_row():
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2, batched=True, ragged=True)
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+
+    decode = scheduler.schedule()
+    assert request._tt_block_step is True
+    assert request.num_output_placeholders == CANVAS
+    outputs = scheduler.update_from_output(decode, _runner_output(decode, [9]))
+    assert outputs[0].outputs[0].new_token_ids == [9]
+    assert request.num_output_placeholders == 0
+
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens == {"req-0": 1}
+    assert request.num_computed_tokens == request.num_tokens
+    assert request.num_output_placeholders == CANVAS
+
+
+@pytest.mark.parametrize(
+    ("row", "match"),
+    [
+        pytest.param([], r"0 not in 1\.\.16", id="empty-row"),
+        pytest.param(list(range(CANVAS + 1)), r"17 not in 1\.\.16", id="over-wide"),
+        pytest.param([7, -1, -1], "with padding", id="pad-reached-scheduler"),
+    ],
+)
+def test_ragged_width_guards(row, match):
+    scheduler, req_a, _ = _batched_pair(ragged=True)
+    scheduler.schedule()
+    assert req_a._tt_block_step is True
+    with pytest.raises(ValueError, match=match):
+        # Direct call: upstream update_from_output never forwards an empty row.
+        scheduler._update_request_with_output(req_a, list(row))
+
+
+def test_batched_without_ragged_keeps_the_fixed_width_check():
+    """The flag is opt-in: a batched model without it still rejects a short
+    row exactly as before (the old contract fills every row to W)."""
+    scheduler, _, _ = _batched_pair(ragged=False)
+    assert scheduler._adaptive_block_ragged is False
+    decode = scheduler.schedule()
+    with pytest.raises(ValueError, match=r"5 != 16"):
+        scheduler.update_from_output(
+            decode,
+            _multi_runner_output(
+                {"req-a": list(range(5)), "req-b": list(range(CANVAS))}
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"adaptive": False}, id="no-adaptive"),
+        pytest.param({"adaptive": True, "batched": False}, id="no-batched"),
+    ],
+)
+def test_ragged_requires_the_batched_contract(kwargs):
+    with pytest.raises(ValueError, match="requires tt_adaptive_block_batched"):
+        _scheduler(max_num_seqs=2, ragged=True, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "ignore_eos", "row", "kept", "status"),
+    [
+        # anchor + 3 of the 5-token row reach max_tokens=4
+        (
+            4,
+            True,
+            [10, 11, 12, 13, 14],
+            [10, 11, 12],
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+        ),
+        (CANVAS, False, [10, 2, 12], [10, 2], RequestStatus.FINISHED_STOPPED),
+    ],
+    ids=["max_tokens", "eos"],
+)
+def test_ragged_row_stops_trim_and_consume_the_reservation(
+    max_tokens, ignore_eos, row, kept, status
+):
+    """Stops inside a ragged row are vLLM's as today: the row is trimmed at the
+    stop, the finished request still consumes its whole W, and the survivor
+    carries on alone as a solo block step scheduling exactly its n tokens."""
+    scheduler, req_a, req_b = _batched_pair(
+        ragged=True, max_tokens_a=max_tokens, ignore_eos=ignore_eos
+    )
+    decode = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        decode, _multi_runner_output({"req-a": row, "req-b": [200, 201]})
+    )
+    committed = {o.request_id: o.new_token_ids for o in outputs[0].outputs}
+    assert committed == {"req-a": kept, "req-b": [200, 201]}
+    assert req_a.status == status
+    assert req_a.num_output_placeholders == 0
+    assert req_b.status == RequestStatus.RUNNING
+    assert req_b.num_output_placeholders == 0
+
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens == {"req-b": 2}
+    assert req_b._tt_block_step is True
+    assert req_b.num_output_placeholders == CANVAS
+    assert req_b.num_computed_tokens == req_b.num_tokens
+
+
+def test_ragged_block_kv_lookahead_covers_the_next_block_after_a_short_row():
+    """After a short row lands, the next schedule allocates n new slots plus
+    the declared lookahead: the model's next block (W) and rejected-draft tail
+    are covered from the tokens it actually has, exactly as with full rows."""
+    lookahead = CANVAS + 16
+    prompt_len = 92
+    scheduler, req_a, req_b = _batched_pair(
+        ragged=True, prompt_len=prompt_len, kv_lookahead=lookahead
+    )
+    assert scheduler.num_lookahead_tokens == lookahead
+    decode = scheduler.schedule()
+    scheduler.update_from_output(
+        decode, _multi_runner_output({"req-a": [100, 101], "req-b": [200]})
+    )
+
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens == {"req-a": 2, "req-b": 1}
+    for req in (req_a, req_b):
+        assert req.num_computed_tokens == req.num_tokens
+        blocks = scheduler.kv_cache_manager.get_block_ids(req.request_id)[0]
+        # Upstream allocates num_computed(pre) + n + lookahead == num_tokens
+        # + lookahead slots: everything the model holds, plus its whole next
+        # block and tail.
+        need = req.num_tokens + lookahead
+        assert len(blocks) * BLOCK_SIZE >= need
+        assert len(blocks) == -(-need // BLOCK_SIZE)

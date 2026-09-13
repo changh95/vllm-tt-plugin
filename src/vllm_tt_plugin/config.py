@@ -158,6 +158,43 @@ def store_tt_adaptive_block_batched(vllm_config: "VllmConfig", flag: bool) -> No
     additional[_ADAPTIVE_BLOCK_BATCHED_KEY] = bool(flag)
 
 
+_ADAPTIVE_BLOCK_RAGGED_KEY = "tt_adaptive_block_ragged"
+
+# Row padding of a ragged block: every row of the rectangular
+# ``[num_reqs, output_tokens_per_step]`` step output carries ``1..W`` real
+# token ids followed by this value. Token ids are never negative.
+TT_RAGGED_BLOCK_PAD_TOKEN_ID = -1
+
+
+def is_tt_adaptive_block_ragged(vllm_config: "VllmConfig") -> bool:
+    """Whether a batched adaptive block model commits RAGGED per-request widths.
+
+    Under ``tt_adaptive_block_batched`` every request of a decode step commits
+    exactly ``W = output_tokens_per_step`` tokens, so a slot that stops early
+    is held until every slot has a full block. A model that declares this flag
+    delivers each request's tokens as produced instead: a decode-only block
+    step still returns one rectangular int32 ``[num_reqs, W]`` tensor, but row
+    ``i`` holds ``1 <= n_i <= W`` real token ids followed by
+    ``TT_RAGGED_BLOCK_PAD_TOKEN_ID`` padding. The runner counts ``n_i`` as the
+    non-negative ids of the row, strips the padding and appends only those
+    ``n_i`` tokens; the scheduler accepts ``1 <= n_i <= W`` per request but
+    still consumes the whole ``W`` placeholder reservation, so the request's
+    computed tokens advance by ``n_i`` while the per-step reservation (and the
+    KV lookahead) stays ``W``. Prefill anchors stay width-1. Requires
+    ``tt_adaptive_block_batched``.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_ADAPTIVE_BLOCK_RAGGED_KEY, False))
+
+
+def store_tt_adaptive_block_ragged(vllm_config: "VllmConfig", flag: bool) -> None:
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_ADAPTIVE_BLOCK_RAGGED_KEY] = bool(flag)
+
+
 _ADAPTIVE_BLOCK_MAX_PROMPT_KEY = "tt_adaptive_block_max_prompt_tokens"
 
 
