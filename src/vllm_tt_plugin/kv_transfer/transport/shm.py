@@ -1186,6 +1186,14 @@ class ShmTransport(TTKVTransport):
                 self._inherited.values()
             )
 
+    def _segment_charge(self, hdr: Header, manifest: Manifest) -> int:
+        """Bytes ``open_put`` charges against ``budget_bytes`` / the tmpfs free space
+        for one segment: the whole file here (header + every part).  The fabric
+        control plane (``fabric._ControlSegments``) overrides this to charge only
+        what it really stores (header + taps rows), its K/V and recs travel over the
+        socket."""
+        return hdr.data_off + hdr.total_nbytes
+
     # -- producer
     def open_put(self, xfer_id: str, manifest: Manifest) -> PutHandle | None:
         engine, hx = parse_xfer_id(xfer_id)
@@ -1197,16 +1205,17 @@ class ShmTransport(TTKVTransport):
         if manifest.layout_version != LAYOUT_VERSION:
             raise ValueError("manifest layout_version mismatch")
         records, hdr = segment_layout(manifest, self.mode)
-        total_file = hdr.data_off + hdr.total_nbytes
+        total_file = hdr.data_off + hdr.total_nbytes  # raw mode: the mmap size
+        charge = self._segment_charge(hdr, manifest)
         with self._lock:
             if xfer_id in self._puts:
                 raise ValueError(f"{xfer_id} already open")
-            if self.outstanding_bytes() + total_file > self.budget_bytes:
+            if self.outstanding_bytes() + charge > self.budget_bytes:
                 self.stats["budget_refusals"] += 1
                 logger.warning(
                     "shm budget exhausted (%d + %d > %d): refusing %s",
                     self.outstanding_bytes(),
-                    total_file,
+                    charge,
                     self.budget_bytes,
                     xfer_id,
                 )
@@ -1216,13 +1225,13 @@ class ShmTransport(TTKVTransport):
                 st = os.statvfs(self._engine_dir())
                 free = st.f_bavail * st.f_frsize
             except OSError:  # pragma: no cover
-                free = total_file + self.free_space_headroom
-            if free < total_file + self.free_space_headroom:
+                free = charge + self.free_space_headroom
+            if free < charge + self.free_space_headroom:
                 self.stats["budget_refusals"] += 1
                 logger.warning(
                     "tmpfs has %d B free, need %d + headroom: refusing %s",
                     free,
-                    total_file,
+                    charge,
                     xfer_id,
                 )
                 return None
@@ -1237,7 +1246,7 @@ class ShmTransport(TTKVTransport):
             hdr.created_ts, hdr.lease_expiry_ts = now, now + self.lease_duration
             hdr.checksum_flags = CHECKSUM_CRC32C if self.checksum else 0
             hpath = os.path.join(tmp, self._header_name())
-            state = _PutState(xfer_id, hx, tmp, hpath, hdr, total_file, now)
+            state = _PutState(xfer_id, hx, tmp, hpath, hdr, charge, now)
             head = hdr.pack_fixed() + hdr.pack_table() + manifest.to_json()
             fd = os.open(hpath, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
             try:
