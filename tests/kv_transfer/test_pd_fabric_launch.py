@@ -976,6 +976,7 @@ RANK_MOD = "vllm_tt_plugin.kv_transfer.launch.pd_fabric_rank"
 PROC_TABLE = "\n".join(
     [
         "4103|VLLM::EngineCore|VLLM::EngineCore ",
+        "4105|PDFABRIC::Engin|PDFABRIC::EngineCore ",  # comm is truncated to 15 chars
         f"4102|python|/v/bin/python -m {RANK_MOD} --pd-args /pd/pd_node_args_p3.json ",
         "4101|prterun|prterun --np 1 -x TT_MESH_ID=0 /v/bin/python -m "
         f"{RANK_MOD} --pd-args /pd/na.json : --np 1 ... ",
@@ -1009,7 +1010,8 @@ def _sh(fn: str, stdin: str, tmp_path) -> list[str]:
 def test_script_pid_selection_targets_ranks_only(tmp_path):
     ranks = _sh("select_rank_pids", PROC_TABLE, tmp_path)
     launchers = _sh("select_launcher_pids", PROC_TABLE, tmp_path)
-    assert sorted(ranks) == ["4102", "4103"]  # never prterun/mpirun, never the stray
+    # the PDFABRIC-titled rank too; never prterun/mpirun, never the stray
+    assert sorted(ranks) == ["4102", "4103", "4105"]
     assert sorted(launchers) == ["4100", "4101"]
     # library mode ran nothing: no pid files were created
     assert not os.listdir(tmp_path / "pids")
@@ -1051,6 +1053,18 @@ def test_launch_modules_do_not_import_ttnn_or_vllm_at_import_time():
 # --------------------------------------------------------------------------- #
 # per-pair isolation: tag-scoped paths / ids and the engine identity lock
 # --------------------------------------------------------------------------- #
+def test_pool_below_prefill_bucket_trace_is_refused():
+    """P_POOL=1024 (18 KV blocks) under a 2048-token (32-block) bucket trace hung both
+    tiny fabric pairs of 2026-09-21 in the decode warm-up (DRAM overrun by the fixed-
+    width fill); the launch config refuses pools below chunk_tokens + one pad block."""
+    with pytest.raises(ValueError, match="P_POOL=1024 .* would write past the KV pool"):
+        lc.PairSettings(ctx=512, p_pool=1024, d_pool=4096)
+    with pytest.raises(ValueError, match="D_POOL=2048 "):
+        lc.PairSettings(ctx=512, p_pool=4096, d_pool=2048)
+    assert lc.PairSettings(ctx=2048, p_pool=2112, d_pool=4096).p_pool == 2112
+    assert lc.PairSettings(chunk_tokens=1024, p_pool=1088, d_pool=1088).p_pool == 1088
+
+
 def test_tag_scopes_every_per_pair_path_and_id():
     """Two pairs on one host must never share a segment dir + engine id (a producer's
     startup_sweep unlinks the other pair's READY segments): every default is derived
@@ -1350,6 +1364,52 @@ def test_install_mesh_hooks_close_shuts_down_transports_before_mesh_close(
         )
 
 
+def test_install_pump_hook_calls_transport_pump_after_end_step(monkeypatch):
+    """I4 shim: off by default; on, end_step runs first and pump() follows even when
+    end_step raises; a transport without pump (shm) is a no-op; idempotent."""
+    log: list = []
+
+    class Transport:
+        def pump(self):
+            log.append("pump")
+
+    class Worker:
+        def __init__(self, transport):
+            self.transport = transport
+
+        def end_step(self, finished_req_ids=None):
+            log.append(("end_step", finished_req_ids))
+            if finished_req_ids == "boom":
+                raise RuntimeError("step failed")
+
+    monkeypatch.delenv("TT_PD_FABRIC_PUMP", raising=False)
+    assert rank_mod.install_pump_hook(worker_cls=Worker) is None  # default off
+    Worker(Transport()).end_step(finished_req_ids={"a"})
+    assert log == [("end_step", {"a"})]
+    log.clear()
+    monkeypatch.setenv("TT_PD_FABRIC_PUMP", "1")
+    wrapped = rank_mod.install_pump_hook(worker_cls=Worker)
+    assert wrapped is not None and wrapped._pd_fabric_wrapped
+    assert rank_mod.install_pump_hook(worker_cls=Worker) is wrapped  # idempotent
+    Worker(Transport()).end_step(finished_req_ids={"b"})
+    assert log == [("end_step", {"b"}), "pump"]
+    log.clear()
+    with pytest.raises(RuntimeError, match="step failed"):
+        Worker(Transport()).end_step("boom")
+    assert log == [("end_step", "boom"), "pump"]  # pump still runs
+    log.clear()
+    Worker(object()).end_step()  # shm transport: no pump attribute -> no-op
+    assert log == [("end_step", None)]
+
+    class BadPump:
+        def pump(self):
+            raise ValueError("pump broke")
+
+    Worker(BadPump()).end_step()  # a raising pump never takes the step down
+    with pytest.raises(RuntimeError, match="end_step"):
+        rank_mod.install_pump_hook(worker_cls=object, enabled=True)
+
+
 def test_default_shutdown_transports_uses_fabric_socket_registry(
     clean_mesh_registry,
 ):
@@ -1411,6 +1471,88 @@ def test_install_dist_cleanup_patch_skips_accelerator_cache_without_accelerator(
     # a vLLM whose shutdown path moved is an error, not a silent skip
     with pytest.raises(RuntimeError, match="cleanup_dist_env_and_memory"):
         rank_mod.install_dist_cleanup_patch(SimpleNamespace(), torch_mod)
+
+
+def test_install_idle_pump_hook_pumps_while_idle_and_handles_requests():
+    """Idle half of the I4 shim: off by default; on, the blocking input-queue wait
+    becomes a timeout poll that pumps every registered transport on each timeout,
+    keeps the idle callbacks / aborts drain / request handling of the original, and
+    falls through to the original when the engine is in the non-blocking shape."""
+    import queue
+
+    log: list = []
+
+    class Proc:
+        process_input_queue_block = True
+
+        def __init__(self, work_after: int):
+            self.input_queue = queue.Queue()
+            self.aborts_queue = queue.Queue()
+            self.aborts_queue.put("abort-1")
+            self._work_after, self._polls = work_after, 0
+
+        def has_work(self):
+            return self._polls >= self._work_after
+
+        def is_running(self):
+            return True
+
+        def _notify_idle_state_callbacks(self):
+            self._polls += 1
+            log.append("idle")
+
+        def _handle_client_request(self, *req):
+            log.append(("req", req))
+
+        def _process_input_queue(self):
+            log.append("orig")
+
+    pumps: list = []
+    assert rank_mod.install_idle_pump_hook(proc_cls=Proc) is None  # default off
+    wrapped = rank_mod.install_idle_pump_hook(
+        proc_cls=Proc, enabled=True, period_s=0.01, pump_all=lambda: pumps.append(1)
+    )
+    assert Proc._process_input_queue is wrapped and wrapped._pd_fabric_wrapped
+    assert (
+        rank_mod.install_idle_pump_hook(proc_cls=Proc, enabled=True) is wrapped
+    )  # idempotent
+    p = Proc(work_after=3)
+    p._process_input_queue()
+    assert len(pumps) >= 2 and log.count("idle") == 3  # pumped on every timeout
+    assert p.aborts_queue.empty()  # aborts drained while idle (as the original)
+    # a request arriving while idle is handled; the non-blocking tail drains the rest
+    log.clear()
+    pumps.clear()
+    q = Proc(work_after=10)
+    q.input_queue.put(("add", "r1"))
+    q.input_queue.put(("add", "r2"))
+    q.has_work = lambda: q._polls >= 2  # work appears after the first request
+    q._process_input_queue()
+    assert ("req", ("add", "r1")) in log and ("req", ("add", "r2")) in log
+    # non-blocking shape: the original runs untouched
+    log.clear()
+    nb = Proc(work_after=0)
+    nb.process_input_queue_block = False
+    nb._process_input_queue()
+    assert log == ["orig"]
+    # a raising pump never takes the loop down
+    log.clear()
+
+    def boom():
+        raise ValueError("pump broke")
+
+    class Proc2(Proc):
+        pass
+
+    Proc2._process_input_queue = Proc._process_input_queue._pd_fabric_orig
+    rank_mod.install_idle_pump_hook(
+        proc_cls=Proc2, enabled=True, period_s=0.01, pump_all=boom
+    )
+    Proc2(work_after=2)._process_input_queue()
+    assert log.count("idle") == 2
+    # a vLLM whose idle loop moved is an error, not a silent skip
+    with pytest.raises(RuntimeError, match="_process_input_queue"):
+        rank_mod.install_idle_pump_hook(proc_cls=object, enabled=True)
 
 
 def test_run_headless_engine_exit_codes_and_lock_release(tmp_path):

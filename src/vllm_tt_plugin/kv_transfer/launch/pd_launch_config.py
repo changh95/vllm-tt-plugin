@@ -286,6 +286,21 @@ class PairSettings:
             )
         if self.export_slots < 1:
             raise ValueError("EXPORT_SLOTS must be >= 1")
+        # The model's prefill bucket traces fill the WHOLE chunk (chunk_tokens / 64 = 32
+        # KV blocks) through a fixed-width page table at warm-up; a KV pool with fewer
+        # blocks makes that fill write past the pool in DRAM and the rank hangs in the
+        # next decode warm-up (device stopped consuming commands; seen twice on the
+        # 2026-09-21 tiny pairs: P_POOL=1024 -> "KV cache 18 blocks" vs a 32-block
+        # bucket, py-spy in SystemMemoryManager::fetch_queue_reserve_back).  One spare
+        # block (the pad block the scheduler never hands out) on top.
+        min_pool = self.chunk_tokens + 64
+        for name, pool in (("P_POOL", self.p_pool), ("D_POOL", self.d_pool)):
+            if pool < min_pool:
+                raise ValueError(
+                    f"{name}={pool} tokens is below the {self.chunk_tokens}-token "
+                    f"prefill bucket trace + one pad block (>= {min_pool}); the "
+                    "warm-up fill would write past the KV pool and hang the rank"
+                )
         if self.export_budget <= 0:
             self.export_budget = export_pool_bytes(self.ctx, slots=self.export_slots)
         elif self.export_budget < export_pool_bytes(self.ctx):

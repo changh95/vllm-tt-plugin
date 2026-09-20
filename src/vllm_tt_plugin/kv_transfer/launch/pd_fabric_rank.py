@@ -61,6 +61,14 @@ its mesh; the MPI job ends when both ranks have exited and MPI finalizes at
 interpreter exit), releases the engine lock, and returns non-zero only for a real
 failure.
 
+``TT_PD_FABRIC_PUMP=1`` (``install_pump_hook`` + ``install_idle_pump_hook``) adds
+plan item I4 as a shim: every ``TTKVWorker.end_step`` ends with ``transport.pump()``
+AND an idle engine pumps every second from its input-queue wait, so an orphaned
+export (D leg never arrives) is drained by the consumer at lease expiry instead of
+parking the producer's CQ until the next request that names an xfer (D5; V7
+measurement; without the idle half the 07:25 ``bogus_xfer`` orphan killed P after
+the 600 s device timeout because D had gone idle).
+
 ``--dry-run`` builds and prints the resolved config without MPI, ttnn or a device.
 Fallback if this shape fails on hardware: F2 (single engine, ``create_socket_pair`` on
 two (1,1) submeshes) -- see profiles/pd/p3_device_validation_plan.md; nothing here
@@ -566,6 +574,150 @@ def install_dist_cleanup_patch(
     return cleanup_dist_env_tt
 
 
+def install_pump_hook(
+    worker_cls: Any = None, enabled: bool | None = None
+) -> Callable[..., Any] | None:
+    """Plan item I4 as a launch-layer shim (env ``TT_PD_FABRIC_PUMP=1``): after every
+    ``TTKVWorker.end_step`` call ``transport.pump()`` when the transport has one.
+
+    Why: over the fabric the producer's sends of an export PARK its CQ0 until the
+    consumer posts the matching recvs, and the consumer enters transport code only
+    for a request that names an xfer (``open_get`` / ``release_remote``).  An export
+    whose D leg never arrives (client gone during the P leg, proxy died, D leg lost)
+    therefore parks P until the consumer's NEXT such request -- and every later
+    proxy request needs P first: the pair is stuck (D5, PHASE3_RESULTS v2 V7).
+    ``FabricSocketTransport.pump()`` drains released / lease-expired orphans at the
+    channel head (consumer) and reclaims finished exports (producer); calling it once
+    per step bounds the stall by LEASE + one step.  The proper home is
+    ``TTKVWorker.end_step`` itself (p3_needed_patches.md I4); until that lands the
+    rank wraps the method here.  Idempotent; returns the wrapper (None when off).
+    The shm transport has no ``pump`` -> the wrapper is a no-op there."""
+    if enabled is None:
+        enabled = os.environ.get("TT_PD_FABRIC_PUMP", "0") == "1"
+    if not enabled:
+        return None
+    if worker_cls is None:
+        from vllm_tt_plugin.kv_transfer.worker import (  # noqa: PLC0415
+            TTKVWorker as worker_cls,
+        )
+    orig = getattr(worker_cls, "end_step", None)
+    if orig is None:
+        raise RuntimeError(
+            "TTKVWorker has no end_step: the per-step seam moved; re-check "
+            "pd_fabric_rank.install_pump_hook"
+        )
+    if getattr(orig, "_pd_fabric_wrapped", False):
+        return orig
+
+    def end_step_pd(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            pump = getattr(getattr(self, "transport", None), "pump", None)
+            if pump is not None:
+                try:
+                    pump()
+                except Exception:  # noqa: BLE001 - never take the step down with it
+                    log.exception("pd_fabric_rank: transport.pump() raised")
+
+    end_step_pd._pd_fabric_wrapped = True  # type: ignore[attr-defined]
+    end_step_pd._pd_fabric_orig = orig  # type: ignore[attr-defined]
+    worker_cls.end_step = end_step_pd
+    log.info("pd_fabric_rank: TT_PD_FABRIC_PUMP=1: transport.pump() after every step")
+    return end_step_pd
+
+
+IDLE_PUMP_S = 1.0  # idle-tick period of install_idle_pump_hook
+
+
+def install_idle_pump_hook(
+    proc_cls: Any = None,
+    enabled: bool | None = None,
+    period_s: float = IDLE_PUMP_S,
+    pump_all: Callable[[], Any] | None = None,
+) -> Callable[..., Any] | None:
+    """The other half of the I4 shim (same gate ``TT_PD_FABRIC_PUMP=1``): pump the
+    started fabric transports while the engine is IDLE.
+
+    ``install_pump_hook`` runs ``transport.pump()`` after every step, but an idle
+    engine does not step: ``EngineCoreProc._process_input_queue`` blocks in
+    ``input_queue.get(block=True)`` until a request arrives.  That is exactly the
+    orphan deadlock seen on 2026-09-21 07:25 (chips 0,3, drill ``bad_params`` case
+    ``bogus_xfer``): D demoted the request to a local prefill without ever naming the
+    genuine xfer, went idle, the 80 sends of that export stayed parked on P's CQ0,
+    the next P leg hung behind them and after TT_METAL_OPERATION_TIMEOUT_SECONDS
+    (600 s) P died with "Timeout, potential hang detected, the device is
+    unrecoverable" -- while D would have drained the orphan at lease expiry had it
+    entered transport code once.  This wrapper replaces the blocking wait of the
+    idle loop with ``input_queue.get(timeout=period_s)`` and calls ``pump_all``
+    (default: ``pump()`` of every transport in ``fabric_socket.registered_transports``)
+    on every timeout, on the engine thread (the only thread that may issue device
+    ops), so an orphan is drained <= LEASE + ``period_s`` after its publish and the
+    producer's CQ unparks.  Everything else of the original method is kept (idle
+    callbacks, aborts-queue drain, request handling, the non-blocking tail); an
+    engine with ``process_input_queue_block`` False (DP shape) falls through to the
+    original.  Idempotent; returns the wrapper (None when off).  Raises when the
+    vLLM in use has no such method or attributes (the seam moved: re-check here)."""
+    if enabled is None:
+        enabled = os.environ.get("TT_PD_FABRIC_PUMP", "0") == "1"
+    if not enabled:
+        return None
+    if proc_cls is None:
+        from vllm.v1.engine.core import EngineCoreProc as proc_cls  # noqa: PLC0415
+    orig = getattr(proc_cls, "_process_input_queue", None)
+    if orig is None:
+        raise RuntimeError(
+            "EngineCoreProc has no _process_input_queue: the idle loop moved; "
+            "re-check pd_fabric_rank.install_idle_pump_hook"
+        )
+    if getattr(orig, "_pd_fabric_wrapped", False):
+        return orig
+    if pump_all is None:
+
+        def pump_all() -> None:
+            from vllm_tt_plugin.kv_transfer.transport.fabric_socket import (  # noqa: PLC0415
+                registered_transports,
+            )
+
+            for t in registered_transports():
+                pump = getattr(t, "pump", None)
+                if pump is not None:
+                    pump()
+
+    def _process_input_queue_pd(self: Any) -> Any:
+        if not getattr(self, "process_input_queue_block", True):
+            return orig(self)  # non-blocking shape: the step loop pumps
+        import queue as _queue  # noqa: PLC0415
+
+        while not self.has_work() and self.is_running():
+            self._notify_idle_state_callbacks()
+            if self.input_queue.empty():
+                with self.aborts_queue.mutex:
+                    self.aborts_queue.queue.clear()
+            try:
+                req = self.input_queue.get(timeout=period_s)
+            except _queue.Empty:
+                try:
+                    pump_all()
+                except Exception:  # noqa: BLE001 - never take the loop down with it
+                    log.exception("pd_fabric_rank: idle transport.pump() raised")
+                continue
+            self._handle_client_request(*req)
+        while not self.input_queue.empty():
+            req = self.input_queue.get_nowait()
+            self._handle_client_request(*req)
+
+    _process_input_queue_pd._pd_fabric_wrapped = True  # type: ignore[attr-defined]
+    _process_input_queue_pd._pd_fabric_orig = orig  # type: ignore[attr-defined]
+    proc_cls._process_input_queue = _process_input_queue_pd
+    log.info(
+        "pd_fabric_rank: TT_PD_FABRIC_PUMP=1: idle engine pumps the fabric transport "
+        "every %.1f s",
+        period_s,
+    )
+    return _process_input_queue_pd
+
+
 def run_headless_engine(
     run_engine_core: Callable[[], Any],
     *,
@@ -788,6 +940,8 @@ def _main_locked(
         enable_fabric=not args.no_fabric_wrapper,
     )
     install_dist_cleanup_patch()
+    install_pump_hook()
+    install_idle_pump_hook()
 
     from vllm.v1.engine.core import EngineCoreProc
     from vllm.v1.executor.abstract import UniProcExecutor
