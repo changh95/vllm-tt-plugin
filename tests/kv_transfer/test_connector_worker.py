@@ -6,6 +6,8 @@ remote-slot API). No device, no ttnn."""
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from vllm.utils.math_utils import cdiv
 
@@ -719,3 +721,64 @@ def test_shutdown_stops_transport():
 def test_stats_default_instance():
     w, tr, model, runner = make_worker()
     assert isinstance(w.stats, TTKVConnectorStats) and w.take_stats() is None
+
+
+# --------------------------------------------------------------------------- #
+# [fix] PD polish: NIT-5 (finished ids at step-end), lease check before the claim
+# --------------------------------------------------------------------------- #
+def test_end_step_skips_ids_finished_after_step_begin():
+    """Critic NIT-5: ``end_step`` takes this step's finished ids too, so an
+    aborted IMPORTING_KV job never imports a chunk into blocks that may already
+    belong to another request -- even when ``begin_step`` did not see the id."""
+    w, tr, model, runner = make_worker()
+    rm = recv_meta("r1")
+    tr.publish(rm.xfer.xfer_id)
+    w.begin_step(meta(reqs_to_recv={"r1": rm}), set(), set())
+    assert w.loads()["r1"].state == LoadState.IMPORTING_KV
+
+    w.end_step(finished_req_ids={"r1"})
+
+    assert model.calls == [], "no K/V device write for a finished id"
+    assert w.loads()["r1"].state == LoadState.IMPORTING_KV
+    assert w.get_finished({"r1"}) == (None, {"r1"})
+    assert tr.segments[rm.xfer.xfer_id] == "LOAD_FAILED" and "r1" not in w.loads()
+    # Control: without the id the same step imports.
+    rm2 = recv_meta("r2")
+    tr.publish(rm2.xfer.xfer_id)
+    w.begin_step(meta(reqs_to_recv={"r2": rm2}), set(), set())
+    w.end_step(finished_req_ids=set())
+    assert model.names() == ["import_kv_blocks", "validate_gdn_parts"]
+    assert w.loads()["r2"].state == LoadState.KV_DONE
+
+
+def test_pending_ready_job_with_an_expired_lease_fails_without_claiming():
+    """Audit minor (janitor-vs-claim race): a job that waited for a slot past
+    the producer's lease must not race the janitor's sweep with a claim; it
+    FAILS (blocks invalidated, recompute) and releases the segment."""
+    w, tr, model, runner = make_worker(slots=1)
+    runner.fill_local(1)  # no free slot -> PENDING_SLOT
+    rm = recv_meta("r1")
+    rm.xfer.expiry = time.time() + 3600.0  # valid at the offer
+    tr.publish(rm.xfer.xfer_id)
+    fin, inv, wm = step(w, meta(reqs_to_recv={"r1": rm}))
+    assert fin == (None, None) and w.loads()["r1"].state == LoadState.PENDING_SLOT
+
+    rm.xfer.expiry = time.time() - 1.0  # ran out while waiting for the slot
+    runner.requests.clear()
+    runner._req_state_slot.clear()  # the slot frees
+    fin, inv, wm = step(w)
+
+    assert fin == (None, {"r1"}) and inv == set(rm.local_block_ids)
+    assert tr.count("open_get", rm.xfer.xfer_id) == 0, "never claimed"
+    assert tr.count("release_remote", rm.xfer.xfer_id) == 1
+    assert tr.segments[rm.xfer.xfer_id] == "RELEASED"
+    assert "r1" not in runner._req_state_slot and "r1" not in w.loads()
+    assert model.calls == []
+
+    # Control: a valid lease claims and imports as before.
+    rm2 = recv_meta("r2")
+    rm2.xfer.expiry = time.time() + 3600.0
+    tr.publish(rm2.xfer.xfer_id)
+    fin, inv, wm = step(w, meta(reqs_to_recv={"r2": rm2}))
+    assert fin == (None, {"r2"}) and w.loads()["r2"].state == LoadState.KV_DONE
+    assert tr.count("open_get", rm2.xfer.xfer_id) == 1

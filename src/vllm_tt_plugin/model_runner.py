@@ -1162,14 +1162,26 @@ class TTModelRunner:
                 "slots; admission is the scheduler's job, not this function's"
             )
         prefilling = set(row_req_ids)
-        # PD: a remote-KV load's claimed slot is held although the request is
-        # not in ``self.requests`` yet (I7); a concurrent local prefill must not
-        # take it.
         held = {
             slot
             for req_id, slot in self._req_state_slot.items()
-            if req_id not in prefilling
-        } & TTModelRunner.held_state_slots(self, include_loading=True)
+            if req_id not in prefilling and req_id in self.requests
+        }
+        # PD (I7): a remote-KV load's claimed slot is held although the request
+        # is not in ``self.requests`` yet; a concurrent local prefill must not
+        # take it. Written as a per-request predicate (not a set intersection
+        # on slot ids, which is only equivalent while the map is injective).
+        # Without a connector both sets are empty and ``held`` is the plain
+        # expression above, unchanged.
+        remote_loading = getattr(self, "_remote_loading", None) or {}
+        remote_ready = getattr(self, "_remote_ready", None) or set()
+        if remote_loading or remote_ready:
+            held |= {
+                slot
+                for req_id, slot in self._req_state_slot.items()
+                if req_id not in prefilling
+                and (req_id in remote_loading or req_id in remote_ready)
+            }
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
             if row not in held:
@@ -1288,6 +1300,29 @@ class TTModelRunner:
         input_batch.advance_generators(rows_to_advance)
         return generators
 
+    def _is_still_prefilling(self, input_batch: InputBatch, req_id: str) -> bool:
+        """Whether a cached request's next step is prefill work (critic NIT-4:
+        a method, shared by the batch-shape decision and the B2 guard).
+
+        Any uncomputed PROMPT token is prefill work, including a final chunk of
+        exactly one token: prompt work must dispatch through the prefill path,
+        which owns chunk bookkeeping (e.g. the intermediate-prefill mask and
+        vision rope state). Past the prompt, a steady-state step legitimately
+        has exactly one output width outstanding (the sampled token for AR, one
+        whole canvas for block models); only MORE than that means uncomputed
+        history (preemption-resume replay). A plain ``computed < total``
+        comparison dispatched every post-first block step as prompt work,
+        re-encoding the entire session per canvas: quadratic prefill and decode
+        never ran.
+        """
+        row = input_batch.req_id_to_index[req_id]
+        # ``num_computed_tokens`` is the scheduler's pre-step snapshot.
+        num_computed = input_batch.num_computed_tokens_cpu[row]
+        return (
+            num_computed < input_batch.num_prompt_tokens[row]
+            or num_computed + self._output_tokens_per_step < input_batch.num_tokens[row]
+        )
+
     def _prepare_model_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1375,27 +1410,6 @@ class TTModelRunner:
         cached_reqs = scheduler_output.scheduled_cached_reqs
         num_scheduled = scheduler_output.num_scheduled_tokens
 
-        def _is_still_prefilling(req_id: str) -> bool:
-            # Any uncomputed PROMPT token is prefill work, including a final
-            # chunk of exactly one token: prompt work must dispatch through
-            # the prefill path, which owns chunk bookkeeping (e.g. the
-            # intermediate-prefill mask and vision rope state). Past the
-            # prompt, a steady-state step legitimately has exactly one output
-            # width outstanding (the sampled token for AR, one whole canvas
-            # for block models); only MORE than that means uncomputed history
-            # (preemption-resume replay). A plain ``computed < total``
-            # comparison dispatched every post-first block step as prompt
-            # work, re-encoding the entire session per canvas: quadratic
-            # prefill and decode never ran.
-            row = input_batch.req_id_to_index[req_id]
-            # ``num_computed_tokens`` is the scheduler's pre-step snapshot.
-            num_computed = input_batch.num_computed_tokens_cpu[row]
-            return (
-                num_computed < input_batch.num_prompt_tokens[row]
-                or num_computed + self._output_tokens_per_step
-                < input_batch.num_tokens[row]
-            )
-
         # A "prefill" step can contain:
         # - brand new requests (scheduled_new_reqs), and/or
         # - resumed-from-preemption requests (scheduled_cached_reqs with
@@ -1403,8 +1417,10 @@ class TTModelRunner:
         #   and/or
         # - chunked-prefill continuations: cached requests that have not
         #   computed all their prompt tokens yet.
+        # Unbound call (like ``_uses_async_scheduler``): host tests drive this
+        # builder with a bare namespace runner.
         has_chunked_continuation = any(
-            _is_still_prefilling(req_id)
+            TTModelRunner._is_still_prefilling(self, input_batch, req_id)
             for req_id in cached_reqs.req_ids
             if req_id not in cached_reqs.resumed_req_ids
         )
@@ -1441,7 +1457,7 @@ class TTModelRunner:
                 req_id
                 for req_id in cached_reqs.req_ids
                 if req_id not in cached_reqs.resumed_req_ids
-                and not _is_still_prefilling(req_id)
+                and not TTModelRunner._is_still_prefilling(self, input_batch, req_id)
             ]
             if decode_rows:
                 raise RuntimeError(
@@ -2042,9 +2058,13 @@ class TTModelRunner:
             return None
         except Exception:
             # R8: a stale entry in either FIFO would be paired with the NEXT
-            # step's output. The engine re-raises the real error.
+            # step's output. The engine re-raises the real error. NIT-6: the
+            # step's metadata stays bound only until here (``_kv_connector_step_end``
+            # never ran), so unbind it and drop the per-step context too.
             self._pending_samples.clear()
             self._pending_kv_outputs.clear()
+            self._step_finished_ids = set()
+            self._step_join_ids = set()
             if self._kv_connector.has_connector_metadata():
                 self._kv_connector.clear_connector_metadata()
             raise

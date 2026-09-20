@@ -398,6 +398,7 @@ class TTKVConnector(KVConnectorBase_V1, SupportsHMA):
         self._step_finished_ids: set[str] | None = None
         self._step_join_ids: set[str] | None = None
         self._step_num_scheduled_tokens: int | None = None
+        self._last_step_finished: set[str] = set()
 
         logger.info(
             "TTKVConnector(%s) engine_id=%s producer=%s consumer=%s hybrid_state=%s "
@@ -562,6 +563,15 @@ class TTKVConnector(KVConnectorBase_V1, SupportsHMA):
             return False, (
                 f"remote_transport {desc.transport} != local "
                 f"{self.transport_descriptor}"
+            )
+        if desc.chunk_tokens != self.xfer_chunk_tokens:
+            # NIT-3: a layout fact checked at admission, not at the first
+            # ``paged_fill_cache`` after a wasted import. Kept beside (not
+            # inside) ``transport_descriptor`` because the fabric handshake
+            # replaces that dict wholesale (``set_xfer_handshake_metadata``).
+            return False, (
+                f"tt_chunk_tokens {desc.chunk_tokens} != local "
+                f"xfer_chunk_tokens {self.xfer_chunk_tokens}"
             )
         prompt = request.prompt_token_ids or []
         if desc.prompt_hash != _prompt_hash(prompt[:want]):
@@ -893,9 +903,11 @@ class TTKVConnector(KVConnectorBase_V1, SupportsHMA):
             nsched = self._step_num_scheduled_tokens
         self._step_finished_ids = self._step_join_ids = None
         self._step_num_scheduled_tokens = None
+        finished = set(finished or ())
+        self._last_step_finished = finished  # handed to end_step (NIT-5)
         self._w.begin_step(
             self._get_connector_metadata(),
-            set(finished or ()),
+            finished,
             set(join or ()),
             num_scheduled_tokens=nsched,
         )
@@ -907,10 +919,11 @@ class TTKVConnector(KVConnectorBase_V1, SupportsHMA):
         return
 
     def wait_for_save(self) -> None:
-        """Step-END hook for BOTH roles: producer exports, consumer K/V imports."""
+        """Step-END hook for BOTH roles: producer exports, consumer K/V imports.
+        This step's finished ids travel to ``end_step`` too (NIT-5)."""
         if self._w is None:
             raise RuntimeError("PD: attach_runner() must run before the first step")
-        self._w.end_step()
+        self._w.end_step(finished_req_ids=self._last_step_finished)
 
     def get_finished(
         self, finished_req_ids: set[str]

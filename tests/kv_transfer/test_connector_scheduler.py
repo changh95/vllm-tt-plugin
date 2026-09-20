@@ -453,6 +453,8 @@ def _mutate(name, params, T):
         p["xfer_id"] = "q9:" + p["xfer_id"].split(":")[1]
     elif name == "mistyped":
         p["remote_num_tokens"] = "many"
+    elif name == "chunk_tokens":
+        p["tt_chunk_tokens"] = 4096  # NIT-3: demoted at admission, not at import
     return p
 
 
@@ -469,6 +471,7 @@ def _mutate(name, params, T):
         "xfer_id_path",
         "xfer_id_engine",
         "mistyped",
+        "chunk_tokens",
         "mm",
         "T1",
     ],
@@ -733,3 +736,48 @@ def test_transfer_descriptor_validation():
         TransferDescriptor.from_params(
             {k: v for k, v in good.items() if k != "xfer_id"}
         )
+
+
+# --------------------------------------------------------------------------- #
+# [fix] PD polish: NIT-3 reason text, NIT-5 finished ids reach end_step
+# --------------------------------------------------------------------------- #
+def test_chunk_tokens_mismatch_is_demoted_at_admission_with_a_clear_reason(pair):
+    pc, dc = pair
+    _, _, _, params = produce(pc, "c-p", 130)
+    ok, why = dc._params_ok(params, make_request("c", 130, params), 129)
+    assert ok and why == ""
+    bad = {**params, "tt_chunk_tokens": 4096}
+    ok, why = dc._params_ok(bad, make_request("c", 130, bad), 129)
+    assert not ok and "tt_chunk_tokens 4096 != local xfer_chunk_tokens 2048" in why
+    # The transport descriptor itself is unchanged (the fabric handshake may
+    # replace it wholesale), so chunk_tokens rides its own params key.
+    assert "chunk_tokens" not in dc.transport_descriptor
+    assert params["tt_chunk_tokens"] == pc.xfer_chunk_tokens
+
+
+def test_wait_for_save_hands_this_steps_finished_ids_to_end_step():
+    dc = make_connector()
+
+    class W:
+        def __init__(self):
+            self.calls = []
+
+        def begin_step(self, meta, finished, join, *, num_scheduled_tokens=None):
+            self.calls.append(("begin", set(finished), set(join)))
+
+        def end_step(self, finished_req_ids=None):
+            self.calls.append(
+                ("end", None if finished_req_ids is None else set(finished_req_ids))
+            )
+
+    dc._w = W()
+    dc.bind_connector_metadata(TTKVConnectorMetadata())
+    dc.start_load_kv(
+        None, finished_req_ids={"a"}, join_req_ids=set(), num_scheduled_tokens=0
+    )
+    dc.wait_for_save()
+    assert dc._w.calls == [("begin", {"a"}, set()), ("end", {"a"})]
+    # The next step's begin replaces the set.
+    dc.start_load_kv(None, finished_req_ids=set(), join_req_ids=set())
+    dc.wait_for_save()
+    assert dc._w.calls[-1] == ("end", set())

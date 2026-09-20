@@ -10,10 +10,12 @@ Two step hooks, both on the ENGINE thread (I5):
   saves; consumer releases, claims slots, polls headers and installs the GDN
   row of exactly the requests whose FIRST decode is in this step's batch
   (``join_req_ids``, I11). No K/V device writes here.
-* ``end_step()`` — step-END, called from ``_kv_connector_step_end`` after the
-  forward returned (device idle): producer exports; consumer K/V block imports
-  (request-private, may land in any step), then ``validate_gdn_parts`` and
-  ``KV_DONE``.
+* ``end_step(finished_req_ids=None)`` — step-END, called from
+  ``_kv_connector_step_end`` after the forward returned (device idle): producer
+  exports; consumer K/V block imports (request-private, may land in any step),
+  then ``validate_gdn_parts`` and ``KV_DONE``. Jobs whose id finished this step
+  (the set ``begin_step`` saw, plus anything passed here; critic NIT-5) are
+  never imported: their blocks may already belong to another request.
 
 LoadJob states: PENDING_SLOT -> PENDING_READY -> IMPORTING_KV -> KV_DONE
 (``finished_recving`` reported; job stays, holding the claimed GetHandle) ->
@@ -301,6 +303,14 @@ class TTKVWorker:
                 job.state = LoadState.PENDING_READY
                 self._step_progress = True
             if job.state == LoadState.PENDING_READY:
+                expiry = job.meta.xfer.expiry
+                if expiry is not None and time.time() > float(expiry):
+                    # The producer's janitor sweeps an unclaimed segment past
+                    # its lease; claiming it now would race that sweep (audit:
+                    # janitor-vs-claim). The lease was valid at the offer
+                    # (``_lease_ok``), it ran out while PENDING_SLOT: recompute.
+                    self._fail(r, job, "lease expired before the claim", handle=None)
+                    continue
                 h = self.transport.open_get(job.meta.xfer)
                 if h is None:
                     continue  # still WRITING
@@ -315,7 +325,12 @@ class TTKVWorker:
     # ------------------------------------------------------------------ #
     # step-END
     # ------------------------------------------------------------------ #
-    def end_step(self) -> None:
+    def end_step(self, finished_req_ids: Iterable[str] | None = None) -> None:
+        if finished_req_ids is not None:
+            # NIT-5: the caller's view of this step's finished ids, on top of
+            # what ``begin_step`` recorded (robust to a step-end without a
+            # matching step-begin, e.g. after a failed forward).
+            self._step_finished |= set(finished_req_ids)
         if self.is_producer:
             self._run_exports()
         if self.is_consumer:

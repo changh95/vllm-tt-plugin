@@ -640,3 +640,135 @@ def test_prepare_inputs_padding_uses_torch_int32_positions_for_remote_rows():
     model_input = TTModelRunner._prepare_model_inputs(runner, _so(new=["R"]), None)
     assert model_input.input_positions.dtype in (torch.int32, torch.int64)
     assert model_input.input_positions.tolist() == [T - 1] + [-1] * (SLOTS - 1)
+
+
+# ---------------------------------------------------------------------------
+# [fix] PD polish: slot predicate equivalence, NIT-4 (method), NIT-6 (failed step)
+
+
+def _reference_alloc(runner, row_req_ids, *, remote):
+    """``_alloc_prefill_state_slots`` as committed before PD (7ddf2c8) with,
+    when ``remote``, the audited per-request predicate for loads in flight."""
+    n_slots = runner.tt_per_lane_max_num_seqs
+    prefilling = set(row_req_ids)
+    held = set()
+    for req_id, slot in runner._req_state_slot.items():
+        if req_id in prefilling:
+            continue
+        live = req_id in runner.requests
+        loading = req_id in runner._remote_loading or req_id in runner._remote_ready
+        if live or (remote and loading):
+            held.add(slot)
+    slots = []
+    for row, req_id in enumerate(row_req_ids):
+        if row not in held:
+            slot = row
+        else:
+            free = [s for s in range(n_slots) if s not in held]
+            if not free:
+                raise RuntimeError("no free device state slot")
+            slot = free[0]
+        held.add(slot)
+        slots.append(slot)
+    return slots
+
+
+def test_alloc_prefill_state_slots_matches_the_reference_predicate():
+    """The non-PD expression is the pre-PD one byte for byte (no remote sets
+    -> identical results incl. exhaustion), and with loads in flight ``held``
+    is the per-request predicate, not a slot-id intersection."""
+    import random
+
+    rng = random.Random(7)
+    n_cases = 0
+    for _ in range(400):
+        n_slots = rng.randint(2, 6)
+        ids = [f"r{i}" for i in range(rng.randint(0, n_slots))]
+        slots = rng.sample(range(n_slots), len(ids))  # injective, as on device
+        pd = rng.random() < 0.6
+        r = _slot_runner(slots=n_slots)
+        r._req_state_slot = dict(zip(ids, slots))
+        live = rng.sample(ids, rng.randint(0, len(ids)))
+        r.requests = dict.fromkeys(live)
+        if pd:
+            others = [i for i in ids if i not in r.requests]
+            rng.shuffle(others)
+            half = len(others) // 2
+            r._remote_loading = {i: r._req_state_slot[i] for i in others[:half]}
+            r._remote_ready = set(others[half:])
+        else:
+            r._remote_loading, r._remote_ready = {}, set()
+        rows = rng.sample(live, rng.randint(0, len(live))) + [
+            f"new{i}" for i in range(rng.randint(0, 2))
+        ]
+        rng.shuffle(rows)
+        if len(rows) > n_slots:
+            continue
+        n_cases += 1
+        before = dict(r._req_state_slot)
+        try:
+            want = _reference_alloc(r, rows, remote=pd)
+        except RuntimeError:
+            with pytest.raises(RuntimeError, match="no free device state slot"):
+                TTModelRunner._alloc_prefill_state_slots(r, list(rows))
+            continue
+        got = TTModelRunner._alloc_prefill_state_slots(r, list(rows))
+        assert got == want, (rows, before, r.requests, r._remote_loading)
+        assert all(r._req_state_slot[req] == slot for req, slot in zip(rows, got))
+    assert n_cases > 300
+
+
+def test_alloc_prefill_keeps_a_continuations_slot_when_a_dead_entry_shares_it():
+    """Why the predicate is per request: with a stale (dead) entry mapped to the
+    same slot as a chunked-prefill continuation, a slot-id intersection would
+    count the continuation's own slot as held and relocate the row mid-prefill;
+    the per-request rule (and the pre-PD code) leave it where it decodes."""
+    r = _slot_runner()
+    r._req_state_slot = {"cont": 0, "dead": 0}
+    r.requests = {"cont": None}
+    TTModelRunner.claim_remote_state_slot(r, "L")  # a PD claim: slot 1
+    assert TTModelRunner._alloc_prefill_state_slots(r, ["cont"]) == [0]
+    assert r._req_state_slot["cont"] == 0
+
+
+def test_is_still_prefilling_is_a_method_over_the_input_batch():
+    """Critic NIT-4: hoisted from a closure in ``_prepare_model_inputs`` (the
+    B2 guard needs it too). Prompt left -> prefill; exactly one output width
+    outstanding -> decode; more (a resume replay) -> prefill."""
+    batch, _states = _batch([("P", 8, 4, 0), ("D", 8, 8, 1), ("R", 8, 8, 3)])
+    runner = _bare_runner(_output_tokens_per_step=1)
+    assert TTModelRunner._is_still_prefilling(runner, batch, "P")
+    assert not TTModelRunner._is_still_prefilling(runner, batch, "D")
+    assert TTModelRunner._is_still_prefilling(runner, batch, "R")
+    # Block-output models: one canvas outstanding is the steady state.
+    runner._output_tokens_per_step = 3
+    assert not TTModelRunner._is_still_prefilling(runner, batch, "R")
+    assert callable(TTModelRunner._is_still_prefilling)
+
+
+def test_forward_exception_unbinds_metadata_and_drops_the_step_context():
+    """Critic NIT-6: when ``_forward_with_model_input`` raises, step-end never
+    runs; the bound metadata and the per-step context must not leak into the
+    next step (and both FIFOs stay empty, R8)."""
+    connector = FakeConnector()
+    r = _hook_runner(connector)
+    r._pending_samples = deque()
+    so = _so(finished=["X"], cached=["d0"])
+    so.kv_connector_metadata = object()
+
+    def build(scheduler_output, grammar):
+        TTModelRunner._kv_connector_step_begin(r, scheduler_output)
+        return "input"
+
+    def boom(model_input):
+        raise RuntimeError("device hang")
+
+    r.build_model_input = build
+    r._forward_with_model_input = boom
+    with pytest.raises(RuntimeError, match="device hang"):
+        TTModelRunner._execute_model_with_kv_connector(r, so)
+
+    assert connector.calls == ["bind", "start_load_kv", "clear"]
+    assert connector.metadata is None
+    assert r._pending_samples == deque() and r._pending_kv_outputs == deque()
+    assert r._step_finished_ids == set() and r._step_join_ids == set()
