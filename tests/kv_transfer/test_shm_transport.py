@@ -17,6 +17,7 @@ table, and concurrent producer/consumer PROCESSES (multiprocessing fork).
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
 import pickle
@@ -962,3 +963,117 @@ def test_concurrent_producer_consumer_processes(tmp_path, mode):
     # consumed segments unlinked by D, the released one swept by P's janitor
     assert sorted(p.name for p in edir.iterdir()) == []
     D.shutdown()
+
+
+# --- [fix] PD polish: the two audited minors ------------------------------------
+
+
+def test_dumpfile_truncated_file_is_not_present(tmp_path):
+    """Audit minor: design 5.4 says "exists + size". The producer records every
+    data file's byte length at finish_export; a file that later lost bytes is
+    ABSENT for ``nbytes_present``, so ``validate_gdn_parts`` fails the load
+    before ``finished_recving`` (recompute) instead of ``ttnn.load_tensor``
+    raising inside the fatal join-step install."""
+    rng = np.random.default_rng(3)
+    P = make(tmp_path, P_ENGINE, role="producer")
+    D = make(tmp_path, D_ENGINE, role="consumer")
+    m = small_manifest(64)
+    h = P.open_put(xfer(), m)
+    fill_all(h, rng, P.layer, "dumpfile")
+    P.finish_export(h, "READY")
+    pub = tmp_path / "shm" / P_ENGINE / XFER_HEX
+    sizes = json.loads((pub / shm.SIZES_FILE).read_text())
+    rec_file, kv_file = "gdn.L0.rec.c0.tensorbin", "kv.L0.k.c0.tensorbin"
+    assert {rec_file, kv_file, "gdn.L0.taps.rows.pt"} <= set(sizes)
+    assert sizes[rec_file] == (pub / rec_file).stat().st_size > 0
+    assert "header" not in sizes and shm.SIZES_FILE not in sizes
+
+    full = (pub / rec_file).read_bytes()
+    (pub / rec_file).write_bytes(full[: len(full) // 2])  # truncated after READY
+    g = D.open_get(Desc(xfer()))
+    assert g.ready()
+    rec, kv = g.sources["gdn.L0.rec"], g.sources["kv.L0.k"]
+    assert rec.nbytes_present == 0, "truncated -> absent"
+    assert kv.nbytes_present == kv.spec.chunk_nbytes * kv.spec.nchunks
+    taps = g.sources["gdn.L0.taps"]
+    assert taps.nbytes_present == taps.spec.nbytes
+    D.finish_import(g, ok=False)
+
+    # Legacy segment without a size record: the old exists-and-non-empty rule.
+    h = P.open_put(xfer(hx=XFER_HEX2), m)
+    fill_all(h, rng, P.layer, "dumpfile")
+    P.finish_export(h, "READY")
+    pub2 = tmp_path / "shm" / P_ENGINE / XFER_HEX2
+    (pub2 / shm.SIZES_FILE).unlink()
+    (pub2 / rec_file).write_bytes((pub2 / rec_file).read_bytes()[:10])
+    g2 = D.open_get(Desc(h.xfer_id))
+    assert g2.sources["gdn.L0.rec"].nbytes_present == rec.spec.chunk_nbytes
+    D.finish_import(g2, ok=False)
+
+
+def test_janitor_renames_before_rmtree_so_a_racing_claim_misses(tmp_path, monkeypatch):
+    """Audit minor: ``shutil.rmtree`` is dir-fd based, so a consumer claim
+    rename landing mid-sweep used to leave the consumer owning a directory
+    whose files were being deleted. The janitor now renames the segment to
+    ``{hx}.expired-{pid}`` first (atomic): a claim that comes later finds no
+    segment (MISSING -> recompute); a claim that came first wins."""
+    now = [1000.0]
+    P = make(tmp_path, P_ENGINE, lease_duration=10.0, clock=lambda: now[0])
+    D = make(tmp_path, D_ENGINE, clock=lambda: now[0])
+    edir = tmp_path / "shm" / P_ENGINE
+    h = P.open_put(xfer(), small_manifest(64))
+    P.finish_export(h, "READY")
+    pub = edir / XFER_HEX
+
+    seen = []
+    real_rmtree = shm.ShmTransport._rmtree
+
+    def racing_rmtree(path):
+        # The consumer's claim lands while the janitor is deleting.
+        g = D.open_get(Desc(xfer()))
+        seen.append((os.path.basename(path), g.status, pub.exists()))
+        real_rmtree(path)
+
+    P._rmtree = racing_rmtree
+    now[0] = 1010.5
+    P.janitor_once()
+    assert seen == [(f"{XFER_HEX}{shm.EXPIRED_MARK}{os.getpid()}", "MISSING", False)]
+    assert P.stats["expired"] == 1 and list(edir.iterdir()) == []
+    P._rmtree = real_rmtree
+
+    # The claim came first: the rename fails, nothing is expired, the claim stands.
+    h = P.open_put(xfer(hx=XFER_HEX2), small_manifest(64))
+    P.finish_export(h, "READY")
+    pub2 = edir / XFER_HEX2
+    real_rename = os.rename
+    claimed = []
+
+    def claim_then_rename(src, dst, *a, **kw):
+        if src == str(pub2) and shm.EXPIRED_MARK in dst:
+            claimed.append(D.open_get(Desc(h.xfer_id)))  # consumer wins the race
+        return real_rename(src, dst, *a, **kw)
+
+    monkeypatch.setattr(shm.os, "rename", claim_then_rename)
+    now[0] = 1030.0
+    P.janitor_once()
+    monkeypatch.undo()
+    assert len(claimed) == 1 and claimed[0].ready()
+    assert P.stats["expired"] == 1 and P.stats["swept"] == 0
+    assert (edir / f"{XFER_HEX2}.claimed-{D_ENGINE}").is_dir()
+    D.finish_import(claimed[0], ok=True)
+
+    # A sweep that died between rename and rmtree left an .expired-* dir: swept.
+    leftover = edir / f"{XFER_HEX2}{shm.EXPIRED_MARK}4242"
+    leftover.mkdir()
+    (leftover / "header").write_bytes(b"junk")
+    P.janitor_once()
+    assert not leftover.exists()
+    # Terminal unclaimed segments (RELEASED) take the same rename-first path.
+    h = P.open_put(xfer(), small_manifest(64))
+    P.finish_export(h, "READY")
+    D.release_remote(xfer())
+    seen.clear()
+    P._rmtree = racing_rmtree
+    P.janitor_once()
+    assert seen == [(f"{XFER_HEX}{shm.EXPIRED_MARK}{os.getpid()}", "MISSING", False)]
+    assert P.stats["swept"] == 1 and list(edir.iterdir()) == []

@@ -122,6 +122,12 @@ CHECKSUM_CRC32C = 1  # header.checksum_flags bit
 _HDR = struct.Struct("<4sIII32s32sQIIII16s16s32s16sddIIIIIIQQ")
 STATUS_OFFSET = 8  # magic(4) + version(4)
 CONSUMER_PID_FILE = "consumer.pid"  # inside a .claimed-* dir; C2 sweep rule
+# dumpfile mode: {file name: byte length} of every data file the producer wrote,
+# written at finish_export before the status flip; ``DumpfileSource`` treats a
+# file whose length differs as ABSENT (truncated/corrupt -> validate_gdn_parts
+# fails BEFORE finished_recving -> recompute, never a fatal join-step install).
+SIZES_FILE = "sizes.json"
+EXPIRED_MARK = ".expired-"  # janitor: renamed here first, then removed
 PRODUCER_PID_OFFSET = struct.calcsize("<4sIII32s32sQIIII16s16s32s16sdd")
 assert _HDR.size <= HEADER_FIXED
 # name, offset, nbytes, nchunks, chunk_nbytes, spec_json, crc32c, chunks_written
@@ -807,6 +813,20 @@ class DumpfileSource(Source):
     def __init__(self, rec: PartRecord, seg_dir: str, layer: Any) -> None:
         self.spec, self._rec, self._dir, self._layer = rec.spec, rec, seg_dir, layer
         self.spec_crc = rec.crc32c
+        self._sizes: dict[str, int] | None = None
+        self._sizes_loaded = False
+
+    def _recorded_sizes(self) -> dict[str, int] | None:
+        """The producer's ``SIZES_FILE`` (None for a legacy segment without one)."""
+        if not self._sizes_loaded:
+            self._sizes_loaded = True
+            try:
+                with open(os.path.join(self._dir, SIZES_FILE)) as f:
+                    raw = json.load(f)
+                self._sizes = {str(k): int(v) for k, v in dict(raw).items()}
+            except (OSError, ValueError, TypeError, AttributeError):
+                self._sizes = None
+        return self._sizes
 
     def _chunk_path(self, c: int) -> str:
         return os.path.join(self._dir, f"{self.spec.name}.c{c}.tensorbin")
@@ -815,11 +835,25 @@ class DumpfileSource(Source):
         return os.path.join(self._dir, f"{self.spec.name}.rows.pt")
 
     def _present_files(self) -> list[str]:
+        """Files that exist AND have the byte length the producer recorded
+        (design 5.4 "exists + size"); without a size record: exists and non-empty."""
         if self.spec.kind == "gdn_taps":
             paths = [self._rows_path()]
         else:
             paths = [self._chunk_path(c) for c in range(self.spec.nchunks)]
-        return [p for p in paths if os.path.isfile(p) and os.path.getsize(p) > 0]
+        sizes = self._recorded_sizes()
+        present: list[str] = []
+        for p in paths:
+            if not os.path.isfile(p):
+                continue
+            n = os.path.getsize(p)
+            if n <= 0:
+                continue
+            want = None if sizes is None else sizes.get(os.path.basename(p))
+            if want is not None and n != want:
+                continue  # truncated or corrupt: not present
+            present.append(p)
+        return present
 
     @property
     def nbytes_present(self) -> int:
@@ -1276,10 +1310,50 @@ class ShmTransport(TTKVTransport):
             finally:
                 os.close(fd)
             st.close()  # producer keeps nothing mapped after publish
+            if self.mode == "dumpfile":
+                self._write_sizes(st.tmp_dir)  # before the status flip
             write_status(st.header_path, code)  # LAST
             st.hdr.status = code
             os.rename(st.tmp_dir, self._pub_dir(engine, hx))  # atomic publish
             st.published = True
+
+    def _write_sizes(self, seg_dir: str) -> None:
+        """Dumpfile mode: record every data file's byte length (``SIZES_FILE``) so
+        the consumer's ``nbytes_present`` sees a truncated file as absent. Best
+        effort: a failure here leaves a legacy segment (size > 0 rule)."""
+        try:
+            sizes: dict[str, int] = {}
+            for n in os.listdir(seg_dir):
+                if n in ("header", "data", SIZES_FILE) or n.endswith(".tmp"):
+                    continue
+                p = os.path.join(seg_dir, n)
+                if os.path.isfile(p):
+                    sizes[n] = os.path.getsize(p)
+            tmp = os.path.join(seg_dir, SIZES_FILE + ".tmp")
+            with open(tmp, "w") as f:
+                json.dump(sizes, f, separators=(",", ":"))
+            os.replace(tmp, os.path.join(seg_dir, SIZES_FILE))
+        except OSError:  # pragma: no cover - tmpfs trouble; the export still publishes
+            logger.warning("could not write %s in %s", SIZES_FILE, seg_dir)
+
+    def _retire(self, path: str) -> bool:
+        """Janitor removal of a PUBLISHED (unclaimed) segment: rename it to a
+        name no consumer's ``open_get`` can claim, THEN rmtree. ``shutil.rmtree``
+        is dir-fd based, so a consumer claim rename landing mid-sweep would
+        otherwise leave it owning a directory whose files are being deleted
+        (audit: janitor-vs-claim race); after the rename its claim fails
+        (FileNotFoundError -> MISSING -> recompute). False when the directory
+        vanished or was claimed first."""
+        target = f"{path}{EXPIRED_MARK}{os.getpid()}"
+        try:
+            os.rename(path, target)
+        except FileNotFoundError:
+            return False  # claimed (renamed away) between listdir and here
+        except OSError:  # pragma: no cover - same-directory rename; fall back
+            self._rmtree(path)
+            return True
+        self._rmtree(target)
+        return True
 
     def abandon(self, xfer_id: str) -> None:
         try:
@@ -1485,6 +1559,8 @@ class ShmTransport(TTKVTransport):
                         logger.warning("removing stale claim %s (%s)", n, why)
                         self._rmtree(p)
                         self.stats["stale_claims"] += 1
+                elif EXPIRED_MARK in n:
+                    self._rmtree(p)  # a previous sweep died between rename and rmtree
                 else:
                     hp = self._find_header(p)
                     status, expiry = None, None
@@ -1495,11 +1571,10 @@ class ShmTransport(TTKVTransport):
                         except (ValueError, OSError):
                             pass
                     if status is None or status in TERMINAL_UNCLAIMED:
-                        self._rmtree(p)
-                        self.stats["swept"] += 1
-                    elif expiry is not None and now > expiry:
+                        if self._retire(p):
+                            self.stats["swept"] += 1
+                    elif expiry is not None and now > expiry and self._retire(p):
                         logger.warning("lease expired on %s: consumer never came", n)
-                        self._rmtree(p)
                         self.stats["expired"] += 1
             # budget: an entry is outstanding while any of its directories exists
             try:
