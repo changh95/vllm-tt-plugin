@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, cast
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
+from vllm.v1.core.sched.request_queue import (
+    RequestQueue,
+    SchedulingPolicy,
+    create_request_queue,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
@@ -454,12 +458,20 @@ class TTScheduler(AsyncScheduler):
 
         - WAITING_FOR_REMOTE_KVS: the load was admitted (blocks pinned, slot
           claimed or about to be claimed by the worker).
-        - WAITING with ``num_computed_tokens > 0``: promoted by
+        - WAITING with ``num_computed_tokens > 0`` AND ``_tt_recv_recorded``
+          (set by ``update_state_after_alloc`` for every load that was issued;
+          it survives promotion): promoted by
           ``_try_promote_blocked_waiting_request`` but not yet admitted for its
           1-token continuation (``running == max_num_seqs`` or
-          ``allocate_slots(request, 1)`` failed). Exclusive to promoted loads:
-          a FAILED load is always fully invalidated (``num_computed_tokens``
-          -> 0) and prefix caching is off on TT.
+          ``allocate_slots(request, 1)`` failed). A FAILED load is always
+          fully invalidated (``num_computed_tokens`` -> 0) and prefix caching
+          is off on TT, so ``num_computed_tokens > 0`` alone would be exact
+          for loads -- but a resumable streaming-input session re-enters
+          WAITING with ``num_computed_tokens > 0`` too
+          (``Scheduler._update_request_as_session``) and its next chunk is
+          plain prefill work: without the flag it would be hidden from the
+          prefill-only pass and admitted next to running decodes (critic
+          NIT-1 / code-review MAJOR).
         - WAITING, ``num_computed_tokens == 0`` and ``do_remote_prefill`` still
           set (not demoted): a fresh async admission or a ``(None, False)``
           deferral. A demoted request (``_tt_demoted``) is plain class.
@@ -469,9 +481,9 @@ class TTScheduler(AsyncScheduler):
             return True
         if status != RequestStatus.WAITING:
             return False
-        if getattr(request, "num_computed_tokens", 0) > 0:
-            return True
         params = getattr(request, "kv_transfer_params", None) or {}
+        if getattr(request, "num_computed_tokens", 0) > 0:
+            return bool(params.get("_tt_recv_recorded"))
         return bool(params.get("do_remote_prefill")) and not params.get("_tt_demoted")
 
     @staticmethod
@@ -483,14 +495,18 @@ class TTScheduler(AsyncScheduler):
         (``claim_remote_state_slot``); promoted WAITING entries with
         ``num_computed_tokens == T-1`` keep it until their 1-token admission
         moves them into ``running``. A ``(None, False)``-deferred request
-        (WAITING, ``num_computed_tokens == 0``) holds none.
+        (WAITING, ``num_computed_tokens == 0``) holds none, and neither does a
+        resumable streaming session re-entering WAITING (no
+        ``_tt_recv_recorded``; same guard as ``_is_remote_class``).
         """
         status = getattr(request, "status", None)
         if status == RequestStatus.WAITING_FOR_REMOTE_KVS:
             return True
-        return (
-            status == RequestStatus.WAITING
-            and getattr(request, "num_computed_tokens", 0) > 0
+        if status != RequestStatus.WAITING:
+            return False
+        params = getattr(request, "kv_transfer_params", None) or {}
+        return getattr(request, "num_computed_tokens", 0) > 0 and bool(
+            params.get("_tt_recv_recorded")
         )
 
     def _has_remote_class_pending(self) -> bool:
@@ -506,7 +522,7 @@ class TTScheduler(AsyncScheduler):
         ``prepend_request`` (the ``_take_preempted_requests_with_pending_outputs``
         convention: ``prepend_requests`` of that temporary restores FCFS order).
         Returns None when nothing was taken. A copy would duplicate every entry
-        once ``_schedule_decode_only``'s ``finally`` prepends its swapped-in
+        once ``_schedule_decode_only``'s ``finally`` merges its swapped-in
         queues back (G3)."""
         if not requests:
             return None
@@ -516,19 +532,52 @@ class TTScheduler(AsyncScheduler):
         queue.remove_requests(requests)
         return taken
 
-    def _restore_requests_in_order(
+    def _restore_requests_by_arrival(
         self, saved: RequestQueue, leftover: RequestQueue
     ) -> None:
-        """Prepend the entries of ``leftover`` (a queue in FCFS order, as the
-        base scheduler left it) at the head of ``saved`` preserving their order.
-        ``FCFSRequestQueue.prepend_requests`` is an ``extendleft`` and reverses
-        its argument, hence the reversed temporary."""
+        """Put the entries of ``leftover`` (a queue in FCFS order, as the base
+        scheduler left it) back into ``saved`` IN PLACE without inverting the
+        FCFS order between plain and remote-class requests (critic NIT-7).
+
+        A plain ``prepend_requests`` would land every leftover remote-class
+        entry at the HEAD of ``saved``, ahead of older plain requests, so each
+        fallback pass would rotate the queue. Instead:
+
+        - PREEMPTED entries keep the base scheduler's convention and stay at
+          the head (``_preempt_request`` prepends them): ``leftover``'s (this
+          pass's, newest first) before ``saved``'s;
+        - every other entry is merged by ``Request.arrival_time`` (ties:
+          ``saved`` first), which is the FCFS key.
+
+        Under the priority policy the queue orders itself by (priority,
+        arrival) on every insertion, so a ``prepend_requests`` is exact there.
+        """
         if not leftover:
             return
-        reversed_queue = create_request_queue(self.policy)
-        for request in leftover:
-            reversed_queue.prepend_request(request)
-        saved.prepend_requests(reversed_queue)
+        if self.policy != SchedulingPolicy.FCFS:
+            saved.prepend_requests(leftover)
+            return
+        resumes = [r for r in leftover if r.status == RequestStatus.PREEMPTED] + [
+            r for r in saved if r.status == RequestStatus.PREEMPTED
+        ]
+        kept = [r for r in saved if r.status != RequestStatus.PREEMPTED]
+        added = [r for r in leftover if r.status != RequestStatus.PREEMPTED]
+        merged: list[Request] = list(resumes)
+        i = j = 0
+        while i < len(kept) and j < len(added):
+            if added[j].arrival_time < kept[i].arrival_time:
+                merged.append(added[j])
+                j += 1
+            else:
+                merged.append(kept[i])
+                i += 1
+        merged.extend(kept[i:])
+        merged.extend(added[j:])
+        # ``FCFSRequestQueue`` is a deque: rebuild ``saved`` in place so every
+        # reference to the queue object (``self.waiting``) stays valid.
+        saved.remove_requests(list(saved))
+        for request in merged:
+            saved.add_request(request)
 
     def _take_preempted_requests_with_pending_outputs(self) -> RequestQueue | None:
         """Temporarily remove resumes that still own an in-flight output.
@@ -613,8 +662,10 @@ class TTScheduler(AsyncScheduler):
                 has_running_decode or (pd and self._has_remote_class_pending())
             ):
                 result = self._schedule_decode_only()
-                if pd:
-                    self._merge_discarded_pass_side_effects(prefill_result, result)
+                # Unconditionally (PD or not): the discarded pass drained the
+                # scheduler's finished/preempted ids and freed mm hashes; the
+                # worker must see them or its per-request state leaks (R7).
+                self._merge_discarded_pass_side_effects(prefill_result, result)
                 return self._finalize_scheduler_output(result)
             return self._finalize_scheduler_output(prefill_result)
 
@@ -661,6 +712,9 @@ class TTScheduler(AsyncScheduler):
         and returns the decode-only one, the worker would never see those ids:
         ``_release_dead_state_slots`` would leak the slot claims and
         ``runner.requests`` entries of every request that finished in that step.
+        This applies to plain serving as much as to PD (the fallback fires
+        whenever a starved local prefill meets a running decode), so the merge
+        is not gated on a connector.
         """
         result.finished_req_ids |= discarded.finished_req_ids
         if discarded.preempted_req_ids:
@@ -731,10 +785,12 @@ class TTScheduler(AsyncScheduler):
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            # NIT-7: back by arrival time, not at the head (the pass may have
+            # left older plain requests waiting).
             if taken_waiting is not None:
-                self.waiting.prepend_requests(taken_waiting)
+                self._restore_requests_by_arrival(self.waiting, taken_waiting)
             if taken_skipped is not None and skipped_waiting is not None:
-                skipped_waiting.prepend_requests(taken_skipped)
+                self._restore_requests_by_arrival(skipped_waiting, taken_skipped)
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
@@ -773,12 +829,14 @@ class TTScheduler(AsyncScheduler):
             result = super().schedule()
         finally:
             if pd:
-                self._restore_requests_in_order(saved_waiting, self.waiting)
+                self._restore_requests_by_arrival(saved_waiting, self.waiting)
             elif self.waiting:
                 saved_waiting.prepend_requests(self.waiting)
             if saved_skipped is not None:
                 if pd:
-                    self._restore_requests_in_order(saved_skipped, self.skipped_waiting)
+                    self._restore_requests_by_arrival(
+                        saved_skipped, self.skipped_waiting
+                    )
                 elif self.skipped_waiting:
                     saved_skipped.prepend_requests(self.skipped_waiting)
                 self.skipped_waiting = saved_skipped

@@ -36,6 +36,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -763,8 +764,10 @@ def test_am1_negative_control_plain_scheduler_would_have_admitted():
     _step(scheduler)
     scheduler.add_request(_request("local"))
 
-    # Bypass the subtraction the way the pre-AM1 scheduler behaved.
-    saved = TTScheduler._holds_remote_slot
+    # Bypass the subtraction the way the pre-AM1 scheduler behaved. Save the
+    # staticmethod DESCRIPTOR: the attribute access unwraps it to the plain
+    # function, and restoring that would turn it into an instance method.
+    saved = TTScheduler.__dict__["_holds_remote_slot"]
     try:
         TTScheduler._holds_remote_slot = staticmethod(lambda request: False)
         out = scheduler.schedule()
@@ -783,7 +786,9 @@ def test_promoted_and_deferred_requests_are_classified_by_slot_ownership():
     assert TTScheduler._holds_remote_slot(waiting_remote)
 
     promoted = _request("b", remote=True)
-    promoted.kv_transfer_params["do_remote_prefill"] = False
+    # What update_state_after_alloc leaves on every issued load (NIT-1: the
+    # flag, not num_computed_tokens alone, marks a promoted load).
+    promoted.kv_transfer_params.update(do_remote_prefill=False, _tt_recv_recorded=True)
     promoted.num_computed_tokens = PROMPT - 1
     assert TTScheduler._is_remote_class(promoted)
     assert TTScheduler._holds_remote_slot(promoted)
@@ -805,4 +810,165 @@ def test_existing_scheduler_behaviour_without_a_connector_is_unchanged():
     scheduler.add_request(_request("plain"))
     out = scheduler.schedule()
     assert _new_ids(out) == ["plain"] and _decode_ids(out) == []
+    assert out.kv_connector_metadata is None
+
+
+# ---------------------------------------------------------------------------
+# [fix] PD polish: critic NIT-1 (resumable sessions), NIT-7 (FCFS across the
+# fallback), and the discarded-pass side effects in plain serving
+
+
+def test_resumable_session_reentering_waiting_is_plain_class():
+    """Critic NIT-1 / code-review MAJOR: ``Scheduler._update_request_as_session``
+    puts a resumable streaming session back into WAITING with
+    ``num_computed_tokens > 0`` and no load recorded. It is prefill work, not
+    a promoted load: neither remote class nor a slot holder."""
+    session = _request("s")
+    session.num_computed_tokens = 16
+    assert session.status == RequestStatus.WAITING
+    assert not TTScheduler._is_remote_class(session)
+    assert not TTScheduler._holds_remote_slot(session)
+
+    # The same request with kv_transfer_params but no load ever issued (a
+    # demoted remote request that later became a session) is plain too.
+    demoted_session = _request("t", remote=True)
+    demoted_session.kv_transfer_params.update(do_remote_prefill=False, _tt_demoted=True)
+    demoted_session.num_computed_tokens = 16
+    assert not TTScheduler._is_remote_class(demoted_session)
+    assert not TTScheduler._holds_remote_slot(demoted_session)
+
+    # A promoted load (``_tt_recv_recorded`` set by update_state_after_alloc)
+    # keeps both properties.
+    promoted = _request("b", remote=True)
+    promoted.kv_transfer_params.update(do_remote_prefill=False, _tt_recv_recorded=True)
+    promoted.num_computed_tokens = PROMPT - 1
+    assert TTScheduler._is_remote_class(promoted)
+    assert TTScheduler._holds_remote_slot(promoted)
+
+
+def test_resumable_session_next_chunk_is_admitted_only_in_a_prefill_only_pass():
+    """With a decode running, the session's next chunk must go through the
+    prefill-only pass (alone), never next to the decode in the natural pass
+    (the runner's B2 guard would raise)."""
+    scheduler, connector = _pd_scheduler()
+    _admit_decodes(scheduler, ["d0"])
+    session = _request("session")
+    session.num_computed_tokens = 16  # what _update_request_as_session leaves
+    scheduler.add_request(session)
+
+    out = scheduler.schedule()
+
+    _assert_never_mixed(out, scheduler)
+    assert _new_ids(out) == ["session"] and _decode_ids(out) == []
+    assert out.num_scheduled_tokens["session"] == PROMPT - 16
+    assert connector.demoted == []
+
+
+def test_fallback_pass_keeps_fcfs_between_plain_and_remote_requests():
+    """Critic NIT-7: the decode-only fallback used to ``prepend`` its leftover
+    remote-class entries at the HEAD of the saved queue, ahead of older plain
+    requests, inverting FCFS on every fallback. Now: merged by arrival."""
+    scheduler, connector = _pd_scheduler(max_num_seqs=1)
+    _admit_decodes(scheduler, ["d0"])
+    old, new = _request("old"), _request("new", remote=True)
+    old.arrival_time, new.arrival_time = 1.0, 2.0
+    scheduler.add_request(old)
+    scheduler.add_request(new)
+
+    out = scheduler.schedule()  # prefill-only (0 tokens) -> decode-only fallback
+    assert _decode_ids(out) == ["d0"] and _new_ids(out) == []
+    assert [r.request_id for r in scheduler.waiting] == ["old", "new"]
+    scheduler.update_from_output(out, _runner_output(out))
+
+    out = scheduler.schedule()  # stable across steps
+    assert _decode_ids(out) == ["d0"]
+    assert [r.request_id for r in scheduler.waiting] == ["old", "new"]
+
+
+def test_prefill_only_pass_restores_hidden_remote_requests_by_arrival():
+    """Same inversion on the prefill-only pass: the hidden remote request went
+    back to the head, ahead of a starved older plain request."""
+    scheduler, connector = _pd_scheduler(num_blocks=PRESSURE_BLOCKS)
+    _admit_decodes(scheduler, ["d0"])
+    first = _request("first")
+    old = _request("old", prompt_len=STARVED)
+    new = _request("new", remote=True)
+    first.arrival_time, old.arrival_time, new.arrival_time = 1.0, 2.0, 3.0
+    for request in (first, old, new):
+        scheduler.add_request(request)
+
+    out = scheduler.schedule()
+
+    assert _new_ids(out) == ["first"] and _decode_ids(out) == []
+    left = [r.request_id for r in scheduler.waiting] + [
+        r.request_id for r in scheduler.skipped_waiting
+    ]
+    assert left == ["old", "new"]
+
+
+def test_restore_by_arrival_pins_preempted_resumes_at_the_head():
+    """The helper keeps the base scheduler's convention for PREEMPTED entries
+    (this pass's resumes first, then older ones) and merges the rest by
+    ``arrival_time`` with ties going to the saved queue."""
+    scheduler = _scheduler(max_num_seqs=8, num_blocks=64)
+
+    def req(rid, t, status=RequestStatus.WAITING):
+        request = _request(rid)
+        request.arrival_time = t
+        request.status = status
+        return request
+
+    saved = create_request_queue(scheduler.policy)
+    for request in (
+        req("old_resume", 0.5, RequestStatus.PREEMPTED),
+        req("a", 1.0),
+        req("c", 3.0),
+        req("tie_saved", 5.0),
+    ):
+        saved.add_request(request)
+    leftover = create_request_queue(scheduler.policy)
+    for request in (
+        req("fresh_resume", 9.0, RequestStatus.PREEMPTED),
+        req("b", 2.0),
+        req("tie_left", 5.0),
+        req("d", 6.0),
+    ):
+        leftover.add_request(request)
+
+    scheduler._restore_requests_by_arrival(saved, leftover)
+
+    assert [r.request_id for r in saved] == [
+        "fresh_resume",
+        "old_resume",
+        "a",
+        "b",
+        "c",
+        "tie_saved",
+        "tie_left",
+        "d",
+    ]
+    # No-op on an empty leftover.
+    empty = create_request_queue(scheduler.policy)
+    scheduler._restore_requests_by_arrival(saved, empty)
+    assert len(saved) == 8
+
+
+def test_plain_scheduler_forwards_finished_ids_of_the_discarded_prefill_pass(
+    monkeypatch,
+):
+    """Without a connector the fallback fires whenever a starved local prefill
+    meets a running decode; the discarded prefill-only pass drained
+    ``finished_req_ids``. The worker must still see them (else its
+    ``_req_state_slot`` / ``requests`` entries leak: Rev 4 open issue 7)."""
+    monkeypatch.setenv("TT_SCHED_ASSERT_NO_DROPPED_SIDE_EFFECTS", "1")
+    scheduler = _scheduler(max_num_seqs=8, num_blocks=PRESSURE_BLOCKS)
+    assert scheduler.connector is None
+    _admit_decodes(scheduler, ["d0", "d1"])
+    scheduler.finish_requests("d1", RequestStatus.FINISHED_ABORTED)
+    scheduler.add_request(_request("starved", prompt_len=STARVED))
+
+    out = scheduler.schedule()
+
+    assert _decode_ids(out) == ["d0"], "fallback decode-only pass"
+    assert "d1" in out.finished_req_ids
     assert out.kv_connector_metadata is None
