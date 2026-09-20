@@ -651,17 +651,25 @@ class _WorkerSide:
 
             pd_transfer.export_warmup(
                 self.model,
-                max_bucket=int(os.environ.get("QWEN36_PD_EXPORT_WARMUP_MAX", "256")),
+                max_bucket=int(os.environ.get("QWEN36_PD_EXPORT_WARMUP_MAX", "2048")),
             )
             return
         if not self.c._is_consumer:
             return
+        from models.demos.blackhole.qwen36.tt import pd_transfer
+
+        if os.environ.get("QWEN36_PD_IMPORT_WARMUP", "1") == "1":
+            # compile the KV import programs of every block bucket now, not inside the
+            # first request
+            pd_transfer.import_warmup(
+                self.model,
+                max_bucket=int(os.environ.get("QWEN36_PD_IMPORT_WARMUP_MAX", "2048")),
+            )
         if (
             os.environ.get("QWEN36_PD_GDN_IMPORT", "trace") != "trace"
             or os.environ.get("QWEN36_PD_GDN_PRECAPTURE", "1") != "1"
         ):
             return
-        from models.demos.blackhole.qwen36.tt import pd_transfer
 
         n_slots = int(getattr(self.runner, "tt_per_lane_max_num_seqs", 0) or 0)
         t0 = time.perf_counter()
