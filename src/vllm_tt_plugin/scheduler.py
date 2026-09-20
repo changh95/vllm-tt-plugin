@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import os
 from enum import Enum
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
@@ -22,7 +23,20 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.logger import init_tt_logger
 
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorMetadata,
+    )
+
 logger = init_tt_logger(__name__)
+
+
+def _assert_no_dropped_side_effects_enabled() -> bool:
+    """Debug assertion for the default-mode fallback (PHASE2_DESIGN 6.3 (2)):
+    the discarded prefill-only output must carry no drained side effect the
+    id-merge below does not forward. On in tests, off in production."""
+    return os.environ.get("TT_SCHED_ASSERT_NO_DROPPED_SIDE_EFFECTS", "0") == "1"
 
 
 # ``SchedulerOutput`` has no backend metadata field. Like lane step state, this
@@ -402,11 +416,119 @@ class TTScheduler(AsyncScheduler):
         A running ``is_prefill_chunk`` request is a partial prefill whose next
         chunk can only be scheduled by a prefill step.
         """
+        if self._pd_connector is None:
+            return (
+                bool(self.waiting)
+                or bool(getattr(self, "skipped_waiting", False))
+                or any(request.is_prefill_chunk for request in self.running)
+            )
+        # PD (PHASE2_DESIGN 6.3 (3)): remote-class requests (a fresh
+        # do_remote_prefill admission, a WAITING_FOR_REMOTE_KVS load, or a
+        # promoted-but-unadmitted continuation) are DECODE-pass work: their
+        # admission is a 0-token step and their first row is a 1-token decode
+        # at position T-1. Only plain local prefills count as prefill work.
         return (
-            bool(self.waiting)
-            or bool(getattr(self, "skipped_waiting", False))
+            any(not self._is_remote_class(r) for r in self.waiting)
+            or any(
+                not self._is_remote_class(r)
+                for r in (getattr(self, "skipped_waiting", None) or ())
+            )
             or any(request.is_prefill_chunk for request in self.running)
         )
+
+    # ---- PD (prefill/decode disaggregation) helpers; inert without a connector
+
+    @property
+    def _pd_connector(self) -> "KVConnectorBase_V1 | None":
+        """The scheduler-role KV connector, or None (plain serving).
+
+        ``Scheduler.__init__`` creates it iff ``kv_transfer_config`` is set;
+        ``getattr`` keeps the host-only tests that build a bare scheduler with
+        ``__new__`` working.
+        """
+        return getattr(self, "connector", None)
+
+    @staticmethod
+    def _is_remote_class(request: Request) -> bool:
+        """Whether ``request`` belongs to the natural decode pass (6.3 (3)).
+
+        - WAITING_FOR_REMOTE_KVS: the load was admitted (blocks pinned, slot
+          claimed or about to be claimed by the worker).
+        - WAITING with ``num_computed_tokens > 0``: promoted by
+          ``_try_promote_blocked_waiting_request`` but not yet admitted for its
+          1-token continuation (``running == max_num_seqs`` or
+          ``allocate_slots(request, 1)`` failed). Exclusive to promoted loads:
+          a FAILED load is always fully invalidated (``num_computed_tokens``
+          -> 0) and prefix caching is off on TT.
+        - WAITING, ``num_computed_tokens == 0`` and ``do_remote_prefill`` still
+          set (not demoted): a fresh async admission or a ``(None, False)``
+          deferral. A demoted request (``_tt_demoted``) is plain class.
+        """
+        status = getattr(request, "status", None)
+        if status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return True
+        if status != RequestStatus.WAITING:
+            return False
+        if getattr(request, "num_computed_tokens", 0) > 0:
+            return True
+        params = getattr(request, "kv_transfer_params", None) or {}
+        return bool(params.get("do_remote_prefill")) and not params.get("_tt_demoted")
+
+    @staticmethod
+    def _holds_remote_slot(request: Request) -> bool:
+        """Whether a remote-class request holds (or is owed) a device state
+        slot on the worker although it is not in ``running`` (AM1).
+
+        WAITING_FOR_REMOTE_KVS entries claim a slot at the worker's step-begin
+        (``claim_remote_state_slot``); promoted WAITING entries with
+        ``num_computed_tokens == T-1`` keep it until their 1-token admission
+        moves them into ``running``. A ``(None, False)``-deferred request
+        (WAITING, ``num_computed_tokens == 0``) holds none.
+        """
+        status = getattr(request, "status", None)
+        if status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return True
+        return (
+            status == RequestStatus.WAITING
+            and getattr(request, "num_computed_tokens", 0) > 0
+        )
+
+    def _has_remote_class_pending(self) -> bool:
+        return any(self._is_remote_class(r) for r in self.waiting) or any(
+            self._is_remote_class(r)
+            for r in (getattr(self, "skipped_waiting", None) or ())
+        )
+
+    def _take_requests(
+        self, queue: RequestQueue, requests: list[Request]
+    ) -> RequestQueue | None:
+        """MOVE ``requests`` out of ``queue`` into a temporary queue built with
+        ``prepend_request`` (the ``_take_preempted_requests_with_pending_outputs``
+        convention: ``prepend_requests`` of that temporary restores FCFS order).
+        Returns None when nothing was taken. A copy would duplicate every entry
+        once ``_schedule_decode_only``'s ``finally`` prepends its swapped-in
+        queues back (G3)."""
+        if not requests:
+            return None
+        taken = create_request_queue(self.policy)
+        for request in requests:
+            taken.prepend_request(request)
+        queue.remove_requests(requests)
+        return taken
+
+    def _restore_requests_in_order(
+        self, saved: RequestQueue, leftover: RequestQueue
+    ) -> None:
+        """Prepend the entries of ``leftover`` (a queue in FCFS order, as the
+        base scheduler left it) at the head of ``saved`` preserving their order.
+        ``FCFSRequestQueue.prepend_requests`` is an ``extendleft`` and reverses
+        its argument, hence the reversed temporary."""
+        if not leftover:
+            return
+        reversed_queue = create_request_queue(self.policy)
+        for request in leftover:
+            reversed_queue.prepend_request(request)
+        saved.prepend_requests(reversed_queue)
 
     def _take_preempted_requests_with_pending_outputs(self) -> RequestQueue | None:
         """Temporarily remove resumes that still own an in-flight output.
@@ -481,8 +603,18 @@ class TTScheduler(AsyncScheduler):
             # If prefill cannot make progress (e.g. KV pressure), do not stall
             # decode. Fall back to decode-only so running requests can advance
             # and free capacity for a later prefill admission.
-            if prefill_result.total_num_scheduled_tokens == 0 and has_running_decode:
+            pd = self._pd_connector is not None
+            # PD (6.3, C3): remote-class requests never appear in a
+            # prefill-only pass, so with no running decode and a starved local
+            # prefill they would never see a pass that includes them, while
+            # holding the blocks the local prefill waits for. The remote-only
+            # decode pass promotes/admits them.
+            if prefill_result.total_num_scheduled_tokens == 0 and (
+                has_running_decode or (pd and self._has_remote_class_pending())
+            ):
                 result = self._schedule_decode_only()
+                if pd:
+                    self._merge_discarded_pass_side_effects(prefill_result, result)
                 return self._finalize_scheduler_output(result)
             return self._finalize_scheduler_output(prefill_result)
 
@@ -499,7 +631,61 @@ class TTScheduler(AsyncScheduler):
         if pending_reset_discards:
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
+        connector = self._pd_connector
+        if connector is not None:
+            # PD (6.3 (1)): every TTScheduler path returns through here, so the
+            # connector's pending descriptors are drained into the ONE output
+            # the worker executes. ``_build_kv_connector_meta`` is a no-op for
+            # the base passes because default mode may run ``super().schedule()``
+            # twice per step and discard the first output.
+            scheduler_output.kv_connector_metadata = connector.build_connector_meta(
+                scheduler_output
+            )
         return scheduler_output
+
+    def _build_kv_connector_meta(
+        self, connector: "KVConnectorBase_V1", scheduler_output: SchedulerOutput
+    ) -> "KVConnectorMetadata | None":
+        # Built in ``_finalize_scheduler_output`` instead (see there).
+        return None
+
+    @staticmethod
+    def _merge_discarded_pass_side_effects(
+        discarded: SchedulerOutput, result: SchedulerOutput
+    ) -> None:
+        """Forward the drained per-step state of a discarded base pass (6.3 (2)).
+
+        Every base ``schedule()`` snapshots and resets ``finished_req_ids`` /
+        ``reset_preempted_req_ids`` and drains the freed encoder mm hashes onto
+        its output. When default mode discards the empty prefill-only output
+        and returns the decode-only one, the worker would never see those ids:
+        ``_release_dead_state_slots`` would leak the slot claims and
+        ``runner.requests`` entries of every request that finished in that step.
+        """
+        result.finished_req_ids |= discarded.finished_req_ids
+        if discarded.preempted_req_ids:
+            result.preempted_req_ids = (result.preempted_req_ids or set()) | set(
+                discarded.preempted_req_ids
+            )
+        if discarded.free_encoder_mm_hashes:
+            result.free_encoder_mm_hashes = [
+                *discarded.free_encoder_mm_hashes,
+                *result.free_encoder_mm_hashes,
+            ]
+        if _assert_no_dropped_side_effects_enabled():
+            dropped = {
+                "kv_connector_metadata": discarded.kv_connector_metadata,
+                "kv_cache_block_copies": discarded.kv_cache_block_copies,
+                "new_block_ids_to_zero": discarded.new_block_ids_to_zero,
+                "scheduled_new_reqs": discarded.scheduled_new_reqs,
+                "num_scheduled_tokens": discarded.num_scheduled_tokens,
+            }
+            dropped = {k: v for k, v in dropped.items() if v}
+            if dropped:
+                raise RuntimeError(
+                    "TTScheduler discarded a prefill-only output that carries "
+                    f"side effects the fallback does not forward: {dropped}"
+                )
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests and partial continuations.
@@ -512,14 +698,43 @@ class TTScheduler(AsyncScheduler):
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
+        # PD (6.3 (3), AM1): hide the remote-class requests (they belong to the
+        # decode pass) and reserve their device state slots. A
+        # WAITING_FOR_REMOTE_KVS load and a promoted-but-unadmitted
+        # continuation are not in ``running`` yet hold a slot on the worker, so
+        # ``running + remote holders + admitted local prefills <= max_num_seqs``
+        # is what keeps the runner's ``_alloc_prefill_state_slots`` exhaustion
+        # ("no free device state slot") unreachable.
+        remote_holders = 0
+        taken_waiting: RequestQueue | None = None
+        taken_skipped: RequestQueue | None = None
+        skipped_waiting = getattr(self, "skipped_waiting", None)
+        if self._pd_connector is not None:
+            remote_waiting = [r for r in self.waiting if self._is_remote_class(r)]
+            remote_skipped = [
+                r for r in (skipped_waiting or ()) if self._is_remote_class(r)
+            ]
+            remote_holders = sum(
+                1 for r in remote_waiting + remote_skipped if self._holds_remote_slot(r)
+            )
+            taken_waiting = self._take_requests(self.waiting, remote_waiting)
+            if skipped_waiting is not None:
+                taken_skipped = self._take_requests(skipped_waiting, remote_skipped)
+
         saved_max = self.max_num_running_reqs
         self.running = cast(list[Request], partial_prefills)
-        self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        self.max_num_running_reqs = max(
+            0, saved_max - len(pure_decodes) - remote_holders
+        )
         try:
             result = super().schedule()
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            if taken_waiting is not None:
+                self.waiting.prepend_requests(taken_waiting)
+            if taken_skipped is not None and skipped_waiting is not None:
+                skipped_waiting.prepend_requests(taken_skipped)
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
@@ -539,21 +754,48 @@ class TTScheduler(AsyncScheduler):
         self.waiting = create_request_queue(self.policy)
         if saved_skipped is not None:
             self.skipped_waiting = create_request_queue(self.policy)
+        pd = self._pd_connector is not None
+        if pd:
+            # PD (6.3 (3)): the swapped-in queues contain ONLY the remote-class
+            # entries, MOVED out of the saved queues (a copy would be duplicated
+            # by the ``finally`` below). The base waiting loop then admits fresh
+            # remote loads (0 tokens, WAITING_FOR_REMOTE_KVS), promotes KV_DONE
+            # loads and schedules their 1-token continuation next to the
+            # running decodes: one decode batch for the runner (6.2). A request
+            # the connector demotes lands in ``skipped_waiting`` via
+            # ``(None, False)`` and is restored as plain class.
+            self._move_remote_class_into(saved_waiting, self.waiting)
+            if saved_skipped is not None:
+                self._move_remote_class_into(saved_skipped, self.skipped_waiting)
         if partial_prefills:
             self.running = [r for r in self.running if not r.is_prefill_chunk]
         try:
             result = super().schedule()
         finally:
-            if self.waiting:
+            if pd:
+                self._restore_requests_in_order(saved_waiting, self.waiting)
+            elif self.waiting:
                 saved_waiting.prepend_requests(self.waiting)
             if saved_skipped is not None:
-                if self.skipped_waiting:
+                if pd:
+                    self._restore_requests_in_order(saved_skipped, self.skipped_waiting)
+                elif self.skipped_waiting:
                     saved_skipped.prepend_requests(self.skipped_waiting)
                 self.skipped_waiting = saved_skipped
             self.waiting = saved_waiting
             if partial_prefills:
                 self.running.extend(partial_prefills)
         return result
+
+    def _move_remote_class_into(self, source: RequestQueue, target: RequestQueue):
+        """MOVE the remote-class entries of ``source`` into ``target`` in FCFS
+        order (``target`` is the queue the base scheduler will peek from)."""
+        remote = [r for r in source if self._is_remote_class(r)]
+        if not remote:
+            return
+        for request in remote:
+            target.add_request(request)
+        source.remove_requests(remote)
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

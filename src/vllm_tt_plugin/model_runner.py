@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from copy import copy
 from dataclasses import dataclass, fields, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
@@ -24,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -75,6 +77,7 @@ from vllm_tt_plugin.structured_output import (
 )
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 import numpy as np
@@ -299,6 +302,31 @@ class TTModelRunner:
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
         self._pending_state_slot_settle: dict[str, int] | None = None
+
+        # PD (prefill/decode disaggregation, PHASE2_DESIGN 6.2). All None/empty
+        # without a --kv-transfer-config; every consumer is guarded on
+        # ``self._kv_connector is not None`` so plain serving is unchanged.
+        # The worker-role KVConnector is attached by TTWorker after the KV
+        # caches exist (``attach_kv_connector``).
+        self._kv_connector: KVConnectorBase_V1 | None = None
+        # One KVConnectorOutput per forward, FIFO with ``_pending_samples``;
+        # attached to the ModelRunnerOutput in ``sample_tokens``.
+        self._pending_kv_outputs: deque[KVConnectorOutput] = deque()
+        # req_id -> slot of a remote-KV load whose K/V blocks are still landing
+        # (claimed at step-begin, I7); req_ids whose K/V blocks are on device
+        # and whose GDN row waits for the join step (I11).
+        self._remote_loading: dict[str, int] = {}
+        self._remote_ready: set[str] = set()
+        # Per-step inputs for the worker-role connector (3.3 ``begin_step``).
+        self._step_finished_ids: set[str] = set()
+        self._step_join_ids: set[str] = set()
+        if vllm_config.kv_transfer_config is not None and self.async_decode_scheduling:
+            raise ValueError(
+                "TT KV transfer (prefill/decode disaggregation) requires "
+                "synchronous decode: the connector step hooks issue device work "
+                "from the engine thread around a blocking forward, which the "
+                "async decode reader thread would race (async_decode.py)"
+            )
 
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
@@ -972,10 +1000,150 @@ class TTModelRunner:
 
         ``preempted_req_ids`` is typed optional, hence the ``or ()``.
         """
+        remote_loading = getattr(self, "_remote_loading", None)
+        remote_ready = getattr(self, "_remote_ready", None)
         for req_id in scheduler_output.finished_req_ids:
             self._req_state_slot.pop(req_id, None)
+            # PD: an aborted or finished remote load drops its claim here,
+            # BEFORE the worker-role connector sees the id (6.2); its own
+            # ``release_remote_slot`` is then a harmless second pop.
+            if remote_loading is not None:
+                remote_loading.pop(req_id, None)
+            if remote_ready is not None:
+                remote_ready.discard(req_id)
         for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
+            if remote_loading is not None:
+                remote_loading.pop(req_id, None)
+            if remote_ready is not None:
+                remote_ready.discard(req_id)
+
+    # --- PD remote-KV slot bookkeeping (PHASE2_DESIGN 6.2; I7) ---
+
+    def held_state_slots(self, include_loading: bool) -> set[int]:
+        """Slots owned by live requests. ``include_loading`` adds the claims of
+        remote-KV loads that are not yet in ``self.requests`` (their first
+        row joins the batch only at promotion)."""
+        remote_loading = getattr(self, "_remote_loading", None) or {}
+        remote_ready = getattr(self, "_remote_ready", None) or set()
+        return {
+            slot
+            for req_id, slot in self._req_state_slot.items()
+            if req_id in self.requests
+            or (
+                include_loading and (req_id in remote_loading or req_id in remote_ready)
+            )
+        }
+
+    def claim_remote_state_slot(self, req_id: str) -> int | None:
+        """Claim the lowest free device state slot for a remote-KV load.
+
+        NEVER raises: None means every slot is held and the load waits (the
+        worker retries next step; the scheduler's ``_free_slots_estimate``
+        keeps further admissions out meanwhile). Recorded in
+        ``_req_state_slot`` so the same step's ``_decode_state_slot_remap``
+        carries the claim through ``moved`` (I7).
+        """
+        if req_id in self._req_state_slot:
+            raise RuntimeError(
+                f"remote-KV load {req_id!r} already holds slot "
+                f"{self._req_state_slot[req_id]}: map={self._req_state_slot}"
+            )
+        held = self.held_state_slots(include_loading=True)
+        free = [s for s in range(self.tt_per_lane_max_num_seqs) if s not in held]
+        if not free:
+            return None
+        slot = free[0]
+        self._req_state_slot[req_id] = slot
+        self._remote_loading[req_id] = slot
+        return slot
+
+    def remote_slot_of(self, req_id: str) -> int:
+        """The CURRENT slot of a remote-KV load (a decode remap may have moved
+        it since the claim; never cache it across steps). Raises when the claim
+        vanished (finished/aborted before the worker saw it)."""
+        slot = self._req_state_slot.get(req_id)
+        if slot is None:
+            raise RuntimeError(
+                f"remote-KV load {req_id!r} has no device state slot claim: "
+                f"map={self._req_state_slot}"
+            )
+        return slot
+
+    def mark_remote_ready(self, req_id: str) -> None:
+        """K/V blocks are on device and the GDN parts validated (KV_DONE); the
+        GDN row is installed at the begin of the step whose batch contains the
+        request (I11)."""
+        self._remote_loading.pop(req_id, None)
+        self._remote_ready.add(req_id)
+
+    def release_remote_slot(self, req_id: str) -> None:
+        """Failed or aborted load: drop the claim (idempotent)."""
+        self._remote_loading.pop(req_id, None)
+        self._remote_ready.discard(req_id)
+        self._req_state_slot.pop(req_id, None)
+
+    def attach_kv_connector(self, connector: KVConnectorBase_V1) -> None:
+        """Bind the worker-role KVConnector (called by TTWorker once the KV
+        caches exist); the connector binds its transport and model hook."""
+        self._kv_connector = connector
+        connector.attach_runner(self)
+
+    def _kv_connector_step_begin(self, scheduler_output: SchedulerOutput) -> None:
+        """Step-BEGIN connector hook (6.2; mirrors
+        ``kv_connector_model_runner_mixin`` without a forward context).
+
+        Runs inside ``build_model_input`` after ``_update_states`` and BEFORE
+        ``_prepare_model_inputs``: slot claims must precede the decode remap so
+        they ride ``moved`` (I7), and the GDN install of the rows whose FIRST
+        decode is this step must precede the same step's gather (I11). The K/V
+        block import of a fresh admission is NOT here (see ``_kv_connector_step_end``).
+        """
+        connector = self._kv_connector
+        assert connector is not None
+        if scheduler_output.kv_connector_metadata is None:
+            raise RuntimeError(
+                "TTScheduler must attach kv_connector_metadata to every "
+                "SchedulerOutput when a KV connector is configured"
+            )
+        if len(self._pending_kv_outputs) >= 2:
+            raise RuntimeError(
+                f"{len(self._pending_kv_outputs)} KVConnectorOutputs pending at "
+                "step-begin; sample_tokens did not drain the previous step (R8)"
+            )
+        self._step_finished_ids = set(scheduler_output.finished_req_ids)
+        self._step_join_ids = {
+            r.req_id for r in scheduler_output.scheduled_new_reqs
+        } & self._remote_ready
+        connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        # The step context travels as kwargs (KVConnectorBase_V1.start_load_kv
+        # takes **kwargs); the attributes above are the documented fallback.
+        connector.start_load_kv(
+            None,
+            finished_req_ids=self._step_finished_ids,
+            join_req_ids=self._step_join_ids,
+            num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+        )
+
+    def _kv_connector_step_end(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorOutput:
+        """Step-END connector hook (6.2): producer exports / consumer K/V block
+        imports run here, after the blocking forward returned (device idle),
+        including on zero-token steps. Reports finished transfers, failed
+        blocks (same output as the failed ids, I8) and the worker meta."""
+        connector = self._kv_connector
+        assert connector is not None
+        connector.wait_for_save()
+        out = KVConnectorOutput()
+        out.finished_sending, out.finished_recving = connector.get_finished(
+            scheduler_output.finished_req_ids
+        )
+        out.invalid_block_ids = connector.get_block_ids_with_load_errors()
+        out.kv_connector_worker_meta = connector.build_connector_worker_meta()
+        out.kv_connector_stats = connector.get_kv_connector_stats()
+        connector.clear_connector_metadata()
+        return out
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
@@ -994,11 +1162,14 @@ class TTModelRunner:
                 "slots; admission is the scheduler's job, not this function's"
             )
         prefilling = set(row_req_ids)
+        # PD: a remote-KV load's claimed slot is held although the request is
+        # not in ``self.requests`` yet (I7); a concurrent local prefill must not
+        # take it.
         held = {
             slot
             for req_id, slot in self._req_state_slot.items()
-            if req_id not in prefilling and req_id in self.requests
-        }
+            if req_id not in prefilling
+        } & TTModelRunner.held_state_slots(self, include_loading=True)
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
             if row not in held:
@@ -1237,11 +1408,48 @@ class TTModelRunner:
             for req_id in cached_reqs.req_ids
             if req_id not in cached_reqs.resumed_req_ids
         )
+        # PD (6.2): a NEW request whose K/V blocks were loaded remotely
+        # (``_remote_ready``) continues as a DECODE row at position T-1 on its
+        # claimed GDN slot, not through the prefill path. Prefix caching is off
+        # on TT, so ``num_computed_tokens > 0`` on a new request can only come
+        # from a remote load; without a connector ``_remote_ready`` is empty and
+        # ``is_prompt`` is the plain rule.
+        remote_ready = getattr(self, "_remote_ready", None) or ()
+        new_req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs]
+        remote_new = [r for r in new_req_ids if r in remote_ready]
+        plain_new = [r for r in new_req_ids if r not in remote_ready]
+        if remote_new and (
+            plain_new or cached_reqs.resumed_req_ids or has_chunked_continuation
+        ):
+            raise RuntimeError(
+                f"remote-ready rows {remote_new} must not share a step with "
+                f"prefill rows (new={plain_new}, resumed="
+                f"{sorted(cached_reqs.resumed_req_ids)}, chunked="
+                f"{has_chunked_continuation}); TTScheduler guarantees this"
+            )
         is_prompt = (
-            len(scheduler_output.scheduled_new_reqs) > 0
+            bool(plain_new)
             or bool(cached_reqs.resumed_req_ids)
-            or has_chunked_continuation
+            or (has_chunked_continuation)
         )
+        if getattr(self, "_kv_connector", None) is not None and is_prompt:
+            # B2 belt-and-braces: the prefill branch would run
+            # ``prefill_paged_slots``/``write_slot`` over LIVE decode rows. The
+            # scheduler must never admit a local prefill into a decode pass
+            # (a failed-load re-admission must be demoted first, 3.2).
+            decode_rows = [
+                req_id
+                for req_id in cached_reqs.req_ids
+                if req_id not in cached_reqs.resumed_req_ids
+                and not _is_still_prefilling(req_id)
+            ]
+            if decode_rows:
+                raise RuntimeError(
+                    f"prefill rows {plain_new} next to decode rows "
+                    f"{decode_rows[:4]}...: TTScheduler must not admit a local "
+                    "prefill into a decode pass (failed-load re-admission must "
+                    "be demoted, PHASE2_DESIGN 3.2)"
+                )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         if is_prompt:
@@ -1271,6 +1479,19 @@ class TTModelRunner:
             ]
             decode_layout_changed = False
         else:
+            for req_id in remote_new:
+                # The existing decode math then yields position T-1 and token
+                # prompt[T-1] for the remote continuation (2.3 step 8).
+                row = input_batch.req_id_to_index[req_id]
+                num_computed = int(input_batch.num_computed_tokens_cpu[row])
+                num_tokens = int(input_batch.num_tokens[row])
+                num_prompt = int(input_batch.num_prompt_tokens[row])
+                if not (num_computed == num_tokens - 1 == num_prompt - 1):
+                    raise RuntimeError(
+                        f"remote-ready row {req_id!r} is not a T-1 continuation: "
+                        f"num_computed={num_computed}, num_tokens={num_tokens}, "
+                        f"num_prompt_tokens={num_prompt}"
+                    )
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
             input_tokens = input_batch.token_ids_cpu_tensor[
@@ -1459,6 +1680,17 @@ class TTModelRunner:
             # remap has to reach the device: dropping it would leave the map claiming
             # a move that never happened.
             slot_remap = self._decode_state_slot_remap(row_req_ids)
+        if remote_new:
+            # The GDN row of every remote-new id was installed by this step's
+            # ``_kv_connector_step_begin`` (``_step_join_ids``); the claim now
+            # rides ``slot_remap``/``moved`` like any live slot.
+            join_ids = getattr(self, "_step_join_ids", None)
+            if join_ids is not None and join_ids != set(remote_new):
+                raise RuntimeError(
+                    f"remote-new rows {sorted(remote_new)} differ from the rows "
+                    f"installed at step-begin {sorted(join_ids)}"
+                )
+            self._remote_ready -= set(remote_new)
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -1524,6 +1756,11 @@ class TTModelRunner:
                 scheduler_output
             ),
         )
+        # PD: LOAD-BEARING placement (6.2, I5/I7/I11): after ``_update_states``
+        # released the finished/preempted claims, before the zero-token early
+        # return and before ``_prepare_model_inputs`` builds the decode remap.
+        if self._kv_connector is not None:
+            self._kv_connector_step_begin(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             return None
 
@@ -1743,6 +1980,9 @@ class TTModelRunner:
         ):
             self.async_decode.wait_for_all_pending_async_steps()
 
+        if self._kv_connector is not None:
+            return self._execute_model_with_kv_connector(scheduler_output)
+
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = self.build_model_input(scheduler_output, None)
         if model_input is None:
@@ -1772,6 +2012,42 @@ class TTModelRunner:
         fwd = self._forward_with_model_input(model_input)
         self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
         return None
+
+    def _execute_model_with_kv_connector(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | None:
+        """``execute_model`` with the PD connector step hooks (6.2).
+
+        Step-begin runs inside ``build_model_input``. A zero-token step
+        returns the step-end output directly (``with_kv_conn_output_only``:
+        ``EMPTY_MODEL_RUNNER_OUTPUT`` when the connector reports nothing, so the
+        engine skips ``sample_tokens``); on an idle decode node this is where a
+        fresh admission's K/V blocks land. After a forward the step-end output
+        is queued and attached in ``sample_tokens``. The async-decode branch is
+        unreachable: ``__init__`` rejects async scheduling with a connector.
+        """
+        try:
+            model_input = self.build_model_input(scheduler_output, None)
+            if model_input is None:
+                return ModelRunnerOutput.with_kv_conn_output_only(
+                    self._kv_connector_step_end(scheduler_output)
+                )
+            fwd = self._forward_with_model_input(model_input)
+            self._pending_samples.append(
+                partial(self._finish_front_packed_sync, fwd=fwd)
+            )
+            self._pending_kv_outputs.append(
+                self._kv_connector_step_end(scheduler_output)
+            )
+            return None
+        except Exception:
+            # R8: a stale entry in either FIFO would be paired with the NEXT
+            # step's output. The engine re-raises the real error.
+            self._pending_samples.clear()
+            self._pending_kv_outputs.clear()
+            if self._kv_connector.has_connector_metadata():
+                self._kv_connector.clear_connector_metadata()
+            raise
 
     def _reorder_grammar_bitmask(
         self,
@@ -1969,7 +2245,25 @@ class TTModelRunner:
         if not self._pending_samples:
             return None
         finish = self._pending_samples.popleft()
-        return finish(grammar_output)
+        out = finish(grammar_output)
+        # ``getattr``: host tests drive this with a bare fake runner.
+        if getattr(self, "_pending_kv_outputs", None):
+            # PD (6.2): one attach point for every output builder. The FIFO
+            # pairs 1:1 with ``_pending_samples`` (both appended per forward in
+            # ``_execute_model_with_kv_connector``).
+            kv_output = self._pending_kv_outputs.popleft()
+            if not kv_output.is_empty():
+                if not isinstance(out, ModelRunnerOutput):
+                    raise RuntimeError(
+                        "KV connector output cannot be attached to a "
+                        f"{type(out).__name__}; PD requires synchronous decode"
+                    )
+                if out is EMPTY_MODEL_RUNNER_OUTPUT:
+                    # Never mutate the shared singleton (finished ids would
+                    # replay on a later empty step).
+                    out = copy(out)
+                out.kv_connector_output = kv_output
+        return out
 
     def check_perform_device_sampling(
         self, is_decode: bool, has_structured_outputs: bool
@@ -2742,6 +3036,18 @@ class TTModelRunner:
         # Phase 1: compile all code paths (no trace capture)
         self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
         self.model.warmup_model_decode(enable_trace=False, **decode_kwargs)
+        if self._kv_connector is not None and hasattr(self.model, "warmup_kv_transfer"):
+            # PD (5.5, I6): compile every export/import op shape into the
+            # program cache BEFORE the decode traces are captured, so no
+            # request-time compile can clobber a parked trace.
+            ktc = self.vllm_config.kv_transfer_config
+            extra = ktc.kv_connector_extra_config
+            self.model.warmup_kv_transfer(
+                role=ktc.kv_role,
+                mode=extra.get("shm_mode", "dumpfile"),
+                chunk_tokens=int(extra.get("xfer_chunk_tokens", 2048)),
+                slots=range(self.tt_per_lane_max_num_seqs),
+            )
 
         # Reset prefill warmup flag so Phase 2 re-runs with tracing
         if hasattr(self.model, "already_warmed_up_prefill"):

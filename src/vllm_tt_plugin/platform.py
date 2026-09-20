@@ -700,6 +700,62 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
 
+def _validate_tt_kv_transfer_config(
+    vllm_config: "VllmConfig", *, is_lane_mode: bool
+) -> None:
+    """Guard a ``--kv-transfer-config`` (prefill/decode disaggregation,
+    PHASE2_DESIGN 6.4) against the TT configurations it cannot run on.
+
+    Runs after the scheduler class and the block-output/prefix-caching
+    resolution so it checks the RESOLVED config, on both connector roles.
+    """
+    if is_lane_mode:
+        raise ValueError(
+            "TT KV transfer (kv_transfer_config) does not support single-process "
+            "lane mode: TTLaneCoordinator runs its lanes without a connector. "
+            "Use data_parallel_size=1 with one engine per device."
+        )
+    scheduler_cls = vllm_config.scheduler_config.scheduler_cls
+    if scheduler_cls != TT_SCHEDULER_CLS:
+        raise ValueError(
+            "TT KV transfer requires the TT scheduler "
+            f"({TT_SCHEDULER_CLS}); resolved scheduler_cls={scheduler_cls!r}"
+        )
+    if is_tt_block_output_model(vllm_config):
+        raise ValueError(
+            "TT KV transfer does not support block-output models "
+            f"(output_tokens_per_step={get_tt_output_tokens_per_step(vllm_config)}): "
+            "their request validation rejects extra_args, which is how "
+            "kv_transfer_params arrive"
+        )
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError(
+            "TT KV transfer requires prefix caching off on both roles "
+            "(--no-enable-prefix-caching): the truncated producer request keeps "
+            "block hashes of the untruncated prompt"
+        )
+    if vllm_config.scheduler_config.async_scheduling:
+        raise ValueError(
+            "TT KV transfer requires synchronous scheduling: the connector step "
+            "hooks issue device work from the engine thread around a blocking "
+            "forward (disable async scheduling)"
+        )
+    bucket_trace = os.environ.get("QWEN36_PREFILL_BUCKET_TRACE", "1")
+    if bucket_trace != "1":
+        raise ValueError(
+            "TT KV transfer requires QWEN36_PREFILL_BUCKET_TRACE=1 (got "
+            f"{bucket_trace!r}): an eager prefill on the decode node clears the "
+            "GDN packed-history validity flag and is a request-time compile hazard"
+        )
+    extra_block = os.environ.get("QWEN36_PREFILL_BUCKET_EXTRA_BLOCK", "1")
+    if extra_block == "0":
+        raise ValueError(
+            "TT KV transfer requires QWEN36_PREFILL_BUCKET_EXTRA_BLOCK != 0: the "
+            "pad KV block that the consumer's paged_fill_cache page tables and "
+            "the producer's chunk tails rely on is allocated only under it"
+        )
+
+
 def _pin_v1_model_runner() -> None:
     """Keep the engine on vLLM's V1 model runner.
 
@@ -2011,6 +2067,10 @@ class TTPlatform(Platform):
             )
         else:
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
+
+        # ``getattr``: host tests hand this hook a SimpleNamespace config.
+        if getattr(vllm_config, "kv_transfer_config", None) is not None:
+            _validate_tt_kv_transfer_config(vllm_config, is_lane_mode=is_lane_mode)
 
         if not is_lane_mode:
             cls._standard_dp_mesh_grids = _load_standard_dp_mesh_grids(vllm_config)

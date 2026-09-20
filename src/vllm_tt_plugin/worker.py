@@ -424,8 +424,55 @@ class TTWorker(WorkerBase):
 
         Every standard-DP rank owns its own TT mesh/KV cache, while
         single-process lane mode has only one rank.
+
+        PD (PHASE2_DESIGN 6.1): with a ``--kv-transfer-config`` the WORKER-role
+        KVConnector is created here, before the KV caches, and attached to the
+        runner after them. NOT ``ensure_kv_transfer_initialized``: it
+        broadcasts the engine id over the TP group and the TT worker never
+        initializes torch.distributed. The module-level agent is still set so
+        ``has_kv_transfer_group()`` / ``get_kv_transfer_group()`` work.
         """
+        connector = None
+        ktc = self.vllm_config.kv_transfer_config
+        if ktc is not None and ktc.is_kv_transfer_instance:
+            from vllm.distributed.kv_transfer import kv_transfer_state
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory,
+            )
+            from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+
+            if kv_transfer_state._KV_CONNECTOR_AGENT is not None:
+                raise RuntimeError(
+                    "a worker-role KV connector already exists in this process; "
+                    "TTWorker.initialize_from_config must run once per engine"
+                )
+            connector = KVConnectorFactory.create_connector(
+                config=self.vllm_config,
+                role=KVConnectorRole.WORKER,
+                kv_cache_config=kv_cache_config,
+            )
+            kv_transfer_state._KV_CONNECTOR_AGENT = connector
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if connector is not None:
+            self.model_runner.attach_kv_connector(connector)
+
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        """RPC'd by ``EngineCore.__init__`` whenever a scheduler-role connector
+        exists (``WorkerBase`` has no default). v1 (shm transport) has no
+        out-of-band handshake, so the worker-role connector returns None; a
+        fabric transport (v2) returns its endpoint under ``(pp_rank, tp_rank)``.
+        """
+        from vllm.distributed.kv_transfer.kv_transfer_state import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+
+        if not has_kv_transfer_group():
+            return None
+        metadata = get_kv_transfer_group().get_handshake_metadata()
+        if metadata is None:
+            return None
+        return {(0, 0): metadata}
 
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
@@ -496,6 +543,13 @@ class TTWorker(WorkerBase):
         process ("Timed out while waiting for active ethernet core ... Try
         resetting the board").
         """
+        # PD: join the transport's janitor and unlink owned shm segments while
+        # the mesh is still open (the connector may hold device staging).
+        from vllm.distributed.kv_transfer.kv_transfer_state import (
+            ensure_kv_transfer_shutdown,
+        )
+
+        ensure_kv_transfer_shutdown()
         runner = getattr(self, "model_runner", None)
         if runner is not None:
             runner.shutdown()
