@@ -34,7 +34,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
     KVConnectorStats,
 )
-from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.request import RequestStatus
 
@@ -48,6 +47,7 @@ from vllm_tt_plugin.kv_transfer.metadata import (
     TTKVConnectorMetadata,
     TTKVWorkerMeta,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 
     from vllm_tt_plugin.kv_transfer.worker import TTKVWorker
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 # Environment knobs that change the exported bytes or how the consumer reads
 # them. ``(name, default)``; the default is what ``M/model_config.py`` setdefaults.

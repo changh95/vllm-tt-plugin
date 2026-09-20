@@ -32,7 +32,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_tt_plugin.kv_transfer.metadata import (
@@ -41,8 +40,9 @@ from vllm_tt_plugin.kv_transfer.metadata import (
     TTKVConnectorMetadata,
     TTKVWorkerMeta,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 
-logger = init_logger(__name__)
+logger = init_tt_logger(__name__)
 
 
 class LoadState(str, enum.Enum):
@@ -518,6 +518,13 @@ class TTKVWorker:
             if not job.reported:
                 report.add(r)  # KV_DONE/INSTALLED were reported already
             self._events_this_step = True
+            if job.state != LoadState.INSTALLED:
+                logger.info(
+                    "PD: load of %s aborted while %s (%d steps after admission)",
+                    r,
+                    job.state.value,
+                    self._step - job.step_admitted,
+                )
         for r, j in self._loads.items():
             if j.state in (LoadState.KV_DONE, LoadState.FAILED) and not j.reported:
                 j.reported = True
