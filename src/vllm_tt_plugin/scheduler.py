@@ -367,6 +367,33 @@ class TTScheduler(AsyncScheduler):
             or any(request.is_prefill_chunk for request in self.running)
         )
 
+    def _waiting_all_kv_imported(self) -> bool:
+        """Every request in ``waiting`` is a KV-connector import (remote prefill) and no
+        partial prefill is running, so the step can be the base scheduler's mixed
+        step: running decodes plus any import whose KV has landed (1 token), imports
+        still loading are skipped as usual."""
+        # vLLM keeps requests blocked on a remote KV load in the persistent
+        # ``skipped_waiting`` queue, not in ``waiting``; both feed the base scheduler's
+        # admission loop.
+        pending = list(self.waiting) + list(
+            getattr(self, "skipped_waiting", None) or []
+        )
+        if not pending:
+            return False
+        if any(request.is_prefill_chunk for request in self.running):
+            return False
+        for request in pending:
+            params = getattr(request, "kv_transfer_params", None)
+            if not params or not params.get("transfer_id"):
+                return False
+            if request.num_prompt_tokens <= 1:
+                return False
+            # No num_computed_tokens check: the base scheduler sets it (to N-1) only
+            # when it promotes the request out of WAITING_FOR_REMOTE_KVS inside
+            # schedule(); until then the request just gets skipped, which is what we
+            # want to happen inside the mixed decode step too.
+        return True
+
     def _take_preempted_requests_with_pending_outputs(self) -> RequestQueue | None:
         """Temporarily remove resumes that still own an in-flight output.
 
@@ -432,7 +459,17 @@ class TTScheduler(AsyncScheduler):
             result = super().schedule()
             return self._finalize_scheduler_output(result)
 
-        # Default mode:
+        # Default mode: Requests whose prefill happened on a remote prefill instance (KV
+        # connector, P/D disaggregation) arrive in ``waiting`` already computed up to
+        # their last prompt token; the runner executes that token as a decode row. Admit
+        # them INTO the decode batch (base scheduler: running + waiting in one step)
+        # instead of through the prefill-only path: that path evicts the running decodes
+        # from the persistent batch while their state slots stay on device, and a full-
+        # width decode step would advance those slots as padding rows with a garbage
+        # token.
+        if has_pending_prefill and self._waiting_all_kv_imported():
+            result = super().schedule()
+            return self._finalize_scheduler_output(result)
         # Prefer prefill whenever prefill work is pending, so new requests are
         # admitted and partial prefills advance.
         if has_pending_prefill:

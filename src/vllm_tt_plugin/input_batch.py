@@ -688,8 +688,19 @@ class InputBatch:
         their underlying group is narrower.
         """
         out: list[torch.Tensor] = []
+        row_idx = rows.tolist() if isinstance(rows, torch.Tensor) else list(rows)
         for bt in self.block_table.block_tables:
             bt_cpu = bt.get_cpu_tensor()[rows, :width].clone()
+            # Rows are recycled and vLLM's BlockTable only rewrites the first num_blocks
+            # entries, so the tail of a row can hold another (possibly live) request's
+            # block ids. The TT masked- bucket prefill treats a non-zero tail entry as
+            # the request's own block and fills its padding K/V there; zero the tail so
+            # it falls back to the dedicated pad block instead.
+            n_blocks = torch.as_tensor(
+                bt.num_blocks_per_row[row_idx], dtype=torch.int64
+            )
+            tail = torch.arange(bt_cpu.shape[1]).unsqueeze(0) >= n_blocks.unsqueeze(1)
+            bt_cpu[tail] = 0
             if bt_cpu.shape[1] < width:
                 pad = torch.zeros(
                     bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype

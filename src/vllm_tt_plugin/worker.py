@@ -10,6 +10,13 @@ from typing import TYPE_CHECKING, Any
 
 import ttnn
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.kv_transfer import kv_transfer_state as _kv_transfer_state
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
@@ -425,7 +432,32 @@ class TTWorker(WorkerBase):
         Every standard-DP rank owns its own TT mesh/KV cache, while
         single-process lane mode has only one rank.
         """
+        # KV connector (prefill/decode disaggregation): create it here like the GPU
+        # worker does, then hand it the runner so it can reach the TT model + mesh.
+        _tt_ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if has_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            bind = getattr(connector, "bind_tt_runner", None)
+            if bind is not None:
+                bind(self.model_runner)
+            else:
+                logger.warning(
+                    "KV connector %s has no bind_tt_runner; "
+                    "TT worker-side hooks inactive",
+                    type(connector).__name__,
+                )
+
+    def get_kv_connector_handshake_metadata(self):
+        """Engine RPC after KV-cache init (see EngineCore.__init__). The TT worker is
+        one process per engine (no torch PP/TP groups), so key the metadata as rank
+        (0, 0)."""
+        if not has_kv_transfer_group():
+            return None
+        metadata = get_kv_transfer_group().get_handshake_metadata()
+        if metadata is None:
+            return None
+        return {(0, 0): metadata}
 
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
@@ -449,6 +481,10 @@ class TTWorker(WorkerBase):
 
         start = time.perf_counter()
         self.model_runner.warmup_model()
+        if has_kv_transfer_group():
+            post_warmup = getattr(get_kv_transfer_group(), "post_warmup", None)
+            if post_warmup is not None:
+                post_warmup()
         elapsed = time.perf_counter() - start
 
         return CompilationTimes(language_model=elapsed, encoder=0.0)
@@ -816,6 +852,23 @@ def device_params_from_tt_config(tt_config, trace_mode):
         device_params["l1_small_size"] = tt_config["l1_small_size"]
 
     return device_params
+
+
+def _tt_ensure_kv_transfer_initialized(
+    vllm_config: VllmConfig, kv_cache_config
+) -> None:
+    """vLLM's ``ensure_kv_transfer_initialized`` first broadcasts the engine id over the
+    torch tensor-parallel group, which the TT worker never creates (TP is model-
+    internal, one worker process per engine). Create the worker-side connector
+    directly; the engine id in the config is already the one the scheduler side uses."""
+    cfg = vllm_config.kv_transfer_config
+    if cfg is None or not cfg.is_kv_transfer_instance:
+        return
+    if _kv_transfer_state._KV_CONNECTOR_AGENT is not None:
+        return
+    _kv_transfer_state._KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
+        config=vllm_config, role=KVConnectorRole.WORKER, kv_cache_config=kv_cache_config
+    )
 
 
 def get_mesh_grid(*args: Any, **kwargs: Any):

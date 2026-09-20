@@ -1,0 +1,727 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+"""TTMooncakeConnector: prefill/decode disaggregation for TT models over the Mooncake
+Transfer Engine.  Pull model, host-staged. The prefill instance
+(``kv_role=kv_producer``) prefills N-1 prompt tokens (the decoder recomputes the last
+one from the transferred state), then stages the request's paged-KV blocks and its
+model-internal per-slot state (the Qwen3.x GDN recurrent + conv state) into one
+contiguous host buffer registered with Mooncake. The decode instance
+(``kv_consumer``) learns the buffer's address over a ZMQ side channel, pulls it with
+``transfer_sync_read`` (same host: TCP; cross-host: RDMA), writes the KV blocks into
+its own paged cache, parks the state snapshot for the runner to write into the
+request's decode slot when the request gets one, and runs the last prompt token as an
+ordinary decode step.  vLLM plumbing follows the in-tree Mooncake/NIXL connectors
+(scheduler side: mamba/GDN prompt truncation, ``kv_transfer_params`` round trip
+through the proxy). The worker side is TT-specific: KV lives in ttnn tensors on a
+mesh the model owns, TP is model-internal (vLLM TP=1), and vLLM sees one
+FullAttentionSpec group; the model exposes ``export_kv_blocks`` /
+``import_kv_blocks`` and parks GDN snapshots under ``pd_gdn_capture`` (tt-metal
+``models/demos/blackhole/qwen36/tt/pd_transfer.py``).  Config (``--kv-transfer-
+config`` JSON)::  {"kv_connector": "TTMooncakeConnector", "kv_connector_module_path":
+"vllm_tt_plugin.kv_connector.tt_mooncake_connector", "kv_role": "kv_producer" |
+"kv_consumer", "kv_connector_extra_config": {"side_channel_host": "127.0.0.1",
+"side_channel_port": 18100, "mooncake_protocol": "tcp", "mooncake_device": ""}}  The
+producer's ``side_channel_host``/``side_channel_port`` are what it advertises to
+decoders in the returned ``kv_transfer_params``; a consumer needs no static port."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import queue
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import torch
+import zmq
+
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorMetadata,
+    KVConnectorRole,
+)
+from vllm_tt_plugin.logger import init_tt_logger
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.request import RequestStatus
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.forward_context import ForwardContext
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.request import Request
+
+logger = init_tt_logger(__name__)
+
+_DEFAULT_SIDE_CHANNEL_PORT = 18100
+_GET_POLL_S = 0.02
+_GET_TIMEOUT_S = 600.0
+
+
+# --------------------------------------------------------------------------------------
+# payload packing (host)
+# --------------------------------------------------------------------------------------
+
+
+def _dtype_name(t: torch.Tensor) -> str:
+    return str(t.dtype).replace("torch.", "")
+
+
+def pack_payload(kv, rec_snap, conv_snap, num_tokens: int, n_blocks: int, out: torch.Tensor | None = None):
+    """Pack one request's KV pairs (per attention layer) and GDN snapshot into one uint8
+    buffer.  Returns ``(buffer, header)``; ``header`` describes every tensor (name,
+    dtype, shape, offset). With ``out`` (a pooled buffer of at least the payload
+    size) the bytes are written into ``out`` and ``out`` is returned; use
+    ``payload_nbytes`` to size it."""
+    entries: list[dict[str, Any]] = []
+    tensors: list[torch.Tensor] = []
+    off = 0
+
+    def add(name, t):
+        nonlocal off
+        t = t.contiguous()
+        n = t.numel() * t.element_size()
+        entries.append({"name": name, "dtype": _dtype_name(t), "shape": list(t.shape), "offset": off, "nbytes": n})
+        tensors.append(t)
+        off += n
+
+    for li, (k, v) in enumerate(kv):
+        add(f"kv.{li}.k", k)
+        add(f"kv.{li}.v", v)
+    for li, rec in enumerate(rec_snap):
+        add(f"gdn.{li}.rec", rec)
+        for m, c in enumerate(conv_snap[li]):
+            add(f"gdn.{li}.conv{m}", c)
+    if out is not None:
+        if out.numel() < off:
+            raise ValueError(f"pooled buffer {out.numel()} B < payload {off} B")
+        buf = out
+    else:
+        buf = torch.empty(max(off, 64), dtype=torch.uint8)
+    for e, t in zip(entries, tensors):
+        buf[e["offset"] : e["offset"] + e["nbytes"]].copy_(t.view(-1).view(torch.uint8))
+    header = {
+        "num_tokens": int(num_tokens),
+        "n_blocks": int(n_blocks),
+        "n_attn_layers": len(kv),
+        "n_gdn_layers": len(rec_snap),
+        "n_conv": len(conv_snap[0]) if conv_snap else 0,
+        "nbytes": int(off),
+        "tensors": entries,
+    }
+    return buf, header
+
+
+def payload_nbytes(kv, rec_snap, conv_snap) -> int:
+    n = sum(k.numel() * k.element_size() + v.numel() * v.element_size() for k, v in kv)
+    n += sum(t.numel() * t.element_size() for t in rec_snap)
+    n += sum(c.numel() * c.element_size() for taps in conv_snap for c in taps)
+    return n
+
+
+class _HostBufferPool:
+    """Host uint8 buffers, page-faulted once and registered once with the Mooncake
+    engine, reused across requests (per-request allocate + register + first-touch
+    cost 20-30 ms and halved the TCP pull rate)."""
+
+    _MIN = 256 << 20
+    _STEP = 64 << 20
+
+    def __init__(self, engine, engine_lock: threading.Lock, name: str):
+        self.engine, self.engine_lock, self.name = engine, engine_lock, name
+        self._free: list[torch.Tensor] = []
+        self._lock = threading.Lock()
+        self.total = 0
+
+    def acquire(self, nbytes: int) -> torch.Tensor:
+        with self._lock:
+            fits = [i for i, b in enumerate(self._free) if b.numel() >= nbytes]
+            if fits:
+                i = min(fits, key=lambda j: self._free[j].numel())
+                return self._free.pop(i)  # by index: list.remove() would compare tensors element-wise
+        cap = max(self._MIN, -(-nbytes // self._STEP) * self._STEP)
+        b = torch.empty(cap, dtype=torch.uint8)
+        b.fill_(0)  # fault the pages in now, not inside the transfer
+        with self.engine_lock:
+            rc = self.engine.register_memory(b.data_ptr(), cap)
+        if rc != 0:
+            raise RuntimeError(f"register_memory({cap}) failed ({rc})")
+        self.total += cap
+        logger.info("[pd] %s buffer pool: +%.0f MiB (total %.1f GiB)", self.name, cap / 2**20, self.total / 2**30)
+        return b
+
+    def release(self, b: torch.Tensor) -> None:
+        with self._lock:
+            self._free.append(b)
+
+
+def payload_digest(buf: torch.Tensor, nbytes: int) -> str:
+    """Cheap content fingerprint: sha1 over every 4097th byte plus the length (for
+    alone-vs-concurrent determinism checks of a request's staged state)."""
+    import hashlib
+
+    sample = buf[:nbytes:4097].numpy().tobytes()
+    return hashlib.sha1(sample + nbytes.to_bytes(8, "little")).hexdigest()[:12]
+
+
+def unpack_payload(buf: torch.Tensor, header: dict[str, Any]):
+    """Inverse of ``pack_payload``: views into ``buf`` (no copies)."""
+    by_name = {}
+    for e in header["tensors"]:
+        dt = getattr(torch, e["dtype"])
+        by_name[e["name"]] = buf[e["offset"] : e["offset"] + e["nbytes"]].view(dt).view(*e["shape"])
+    kv = [(by_name[f"kv.{li}.k"], by_name[f"kv.{li}.v"]) for li in range(header["n_attn_layers"])]
+    rec = [by_name[f"gdn.{li}.rec"] for li in range(header["n_gdn_layers"])]
+    conv = [[by_name[f"gdn.{li}.conv{m}"] for m in range(header["n_conv"])] for li in range(header["n_gdn_layers"])]
+    return kv, rec, conv
+
+
+# --------------------------------------------------------------------------------------
+# scheduler <-> worker metadata
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class StageReq:
+    """Producer: one request whose state must be staged after this step's prefill."""
+
+    req_id: str
+    block_ids: list[int]
+    num_tokens: int
+
+
+@dataclass
+class RecvReq:
+    """Consumer: one request whose state must be pulled from a producer."""
+
+    req_id: str
+    block_ids: list[int]
+    remote_host: str
+    remote_port: int
+    transfer_id: str
+    num_tokens: int
+
+
+@dataclass
+class TTMooncakeConnectorMetadata(KVConnectorMetadata):
+    stage: list[StageReq] = field(default_factory=list)
+    recv: list[RecvReq] = field(default_factory=list)
+    # consumer requests aborted before their pull started: tell the producer to drop the
+    # staging
+    cancel: list[tuple[str, int, str]] = field(default_factory=list)  # (host, port, transfer_id)
+
+
+# --------------------------------------------------------------------------------------
+# connector
+# --------------------------------------------------------------------------------------
+
+
+class TTMooncakeConnector(KVConnectorBase_V1):
+    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole, kv_cache_config: "KVCacheConfig" = None):
+        super().__init__(vllm_config, role, kv_cache_config)
+        cfg = vllm_config.kv_transfer_config
+        if cfg is None:
+            raise ValueError("TTMooncakeConnector requires --kv-transfer-config")
+        self._is_producer = cfg.kv_role == "kv_producer"
+        self._is_consumer = cfg.kv_role == "kv_consumer"
+        if not (self._is_producer or self._is_consumer):
+            raise ValueError("TTMooncakeConnector needs kv_role kv_producer or kv_consumer (no kv_both yet)")
+        extra = cfg.kv_connector_extra_config or {}
+        self._side_host = str(extra.get("side_channel_host", "127.0.0.1"))
+        self._side_port = int(extra.get("side_channel_port", _DEFAULT_SIDE_CHANNEL_PORT))
+        self._protocol = str(extra.get("mooncake_protocol", "tcp"))
+        self._device_name = str(extra.get("mooncake_device", ""))
+        self._block_size = vllm_config.cache_config.block_size
+        self._scheduler: _SchedulerSide | None = None
+        self._worker: _WorkerSide | None = None
+        if role == KVConnectorRole.SCHEDULER:
+            self._scheduler = _SchedulerSide(self)
+        else:
+            self._worker = _WorkerSide(self)
+
+    # ---- TT-specific: the worker binds the runner once the model + KV caches exist
+    # ----
+    def _worker_side(self) -> "_WorkerSide":
+        if self._worker is None:
+            raise RuntimeError(f"TTMooncakeConnector role {self.role} has no worker side")
+        return self._worker
+
+    def _scheduler_side(self) -> "_SchedulerSide":
+        if self._scheduler is None:
+            raise RuntimeError(f"TTMooncakeConnector role {self.role} has no scheduler side")
+        return self._scheduler
+
+    def _meta(self) -> "TTMooncakeConnectorMetadata":
+        meta = self._get_connector_metadata()
+        if not isinstance(meta, TTMooncakeConnectorMetadata):
+            raise TypeError(f"unexpected connector metadata {type(meta).__name__}")
+        return meta
+
+    def bind_tt_runner(self, runner) -> None:
+        self._worker_side().bind_runner(runner)
+
+    def post_warmup(self) -> None:
+        """Called by the TT worker after the model's own warmup/trace capture (consumer:
+        pre-capture the per-slot GDN import traces so no request pays the compile +
+        capture)."""
+        self._worker_side().post_warmup()
+
+    # ---- worker side ----
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        pass  # TT KV caches are ttnn tensors owned by the model; see bind_tt_runner
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+        self._worker_side().start_step(self._meta())
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        pass
+
+    def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor, attn_metadata, **kwargs: Any) -> None:
+        pass
+
+    def wait_for_save(self):
+        self._worker_side().stage_after_step(self._meta())
+
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        return self._worker_side().take_finished(finished_req_ids)
+
+    def shutdown(self):
+        if self._worker is not None:
+            self._worker.shutdown()
+
+    # ---- scheduler side ----
+    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+        return self._scheduler_side().get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+        self._scheduler_side().update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
+        return self._scheduler_side().build_connector_meta(scheduler_output)
+
+    def request_finished(self, request: "Request", block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
+        return self._scheduler_side().request_finished(request, block_ids)
+
+    def update_connector_output(self, connector_output) -> None:
+        self._scheduler_side().update_connector_output(connector_output)
+
+
+# --------------------------------------------------------------------------------------
+# scheduler side
+# --------------------------------------------------------------------------------------
+
+
+class _SchedulerSide:
+    def __init__(self, c: TTMooncakeConnector):
+        self.c = c
+        self._to_stage: dict[str, StageReq] = {}
+        self._to_recv: dict[str, RecvReq] = {}
+        self._to_cancel: list[tuple[str, int, str]] = []
+        self._staged_params: dict[str, dict[str, Any]] = {}  # producer: req_id -> params handed to the proxy
+
+    @staticmethod
+    def _truncate_for_prefill(request: "Request") -> None:
+        """Producer: drop the last prompt token so the prefill computes h(N-1); the
+        decoder recomputes token N-1."""
+        params = request.kv_transfer_params
+        if params is None or params.get("_p_side_truncated") or request.num_prompt_tokens <= 1:
+            return
+        if request.prompt_token_ids is not None:
+            request.prompt_token_ids.pop()
+        elif request.prompt_embeds is not None:
+            request.prompt_embeds = request.prompt_embeds[:-1]
+        else:
+            return
+        request._all_token_ids.pop()
+        request.num_prompt_tokens -= 1
+        request.max_tokens = 1
+        params["_p_side_truncated"] = True
+
+    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+        params = request.kv_transfer_params
+        if not params:
+            return 0, False
+        if params.get("do_remote_prefill"):
+            if self.c._is_producer:
+                raise ValueError("a kv_producer instance received a do_remote_prefill request")
+            n = len(request.prompt_token_ids or [])
+            count = (n - 1 if n > 1 else n) - num_computed_tokens
+            if count > 0:
+                return count, True
+        if params.get("do_remote_decode") and self.c._is_producer:
+            self._truncate_for_prefill(request)
+        return 0, False
+
+    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+        params = request.kv_transfer_params
+        if not params:
+            return
+        if params.get("do_remote_prefill"):
+            needed = ("remote_host", "remote_port", "transfer_id", "num_tokens")
+            if all(k in params for k in needed):
+                block_ids = list(blocks.get_block_ids()[0]) if num_external_tokens > 0 else []
+                self._to_recv[request.request_id] = RecvReq(
+                    req_id=request.request_id,
+                    block_ids=block_ids,
+                    remote_host=str(params["remote_host"]),
+                    remote_port=int(params["remote_port"]),
+                    transfer_id=str(params["transfer_id"]),
+                    num_tokens=int(params["num_tokens"]),
+                )
+            else:
+                logger.warning("TTMooncakeConnector: incomplete kv_transfer_params %s; no transfer for %s", params, request.request_id)
+            params["do_remote_prefill"] = False  # one transfer per request
+        elif params.get("do_remote_decode") and self.c._is_producer:
+            self._to_stage[request.request_id] = StageReq(
+                req_id=request.request_id,
+                block_ids=list(blocks.get_block_ids()[0]),
+                num_tokens=int(request.num_prompt_tokens),
+            )
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
+        # Pending entries are re-shipped every step until the worker reports them in
+        # finished_sending / finished_recving (update_connector_output): the TT
+        # scheduler may build a prefill-only SchedulerOutput, drop it when it scheduled
+        # no tokens (a remote-KV request only transitions to WAITING_FOR_REMOTE_KVS) and
+        # schedule decode-only instead -- metadata handed out once and cleared would be
+        # lost with the discarded output. The worker de-duplicates.
+        meta = TTMooncakeConnectorMetadata()
+        meta.stage = list(self._to_stage.values())
+        meta.recv = list(self._to_recv.values())
+        meta.cancel = list(self._to_cancel)
+        self._to_cancel.clear()
+        return meta
+
+    def update_connector_output(self, connector_output) -> None:
+        for req_id in connector_output.finished_recving or ():
+            self._to_recv.pop(req_id, None)
+        for req_id in connector_output.finished_sending or ():
+            self._to_stage.pop(req_id, None)
+
+    def request_finished(self, request: "Request", block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
+        params = request.kv_transfer_params
+        if not params:
+            return False, None
+        self._to_recv.pop(request.request_id, None)
+        self._to_stage.pop(request.request_id, None)
+        if params.get("do_remote_prefill"):
+            # aborted before it was ever scheduled: nothing was allocated; tell the
+            # producer to drop its staging
+            if all(k in params for k in ("remote_host", "remote_port", "transfer_id")):
+                self._to_cancel.append((str(params["remote_host"]), int(params["remote_port"]), str(params["transfer_id"])))
+            params["do_remote_prefill"] = False
+            return False, None
+        if not params.get("do_remote_decode") or not self.c._is_producer:
+            return False, None
+        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+            # aborted / stopped early: the worker staged (or will stage) nothing useful;
+            # free now
+            return False, None
+        # The worker stages synchronously in wait_for_save of the prefill step and
+        # reports the request in finished_sending in that same step's output; the
+        # scheduler frees the blocks from that report.
+        out = {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "remote_host": self.c._side_host,
+            "remote_port": self.c._side_port,
+            "transfer_id": request.request_id,
+            "num_tokens": int(request.num_prompt_tokens),
+        }
+        return True, out
+
+
+# --------------------------------------------------------------------------------------
+# worker side
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class _Staged:
+    buf: torch.Tensor
+    addr: int
+    nbytes: int
+    header: dict[str, Any]
+    t_staged: float
+
+
+class _WorkerSide:
+    def __init__(self, c: TTMooncakeConnector):
+        self.c = c
+        self.runner = None
+        self.model = None  # the inner Qwen36Model
+        self.engine = None
+        self.rpc_port = 0
+        self._lock = threading.Lock()
+        self._engine_lock = threading.Lock()  # Mooncake TransferEngine calls are serialized
+        self._finished_sending: set[str] = set()
+        self._finished_recving: set[str] = set()
+        # de-dup sets for re-shipped metadata (pruned when the request finishes)
+        self._stage_done: set[str] = set()
+        self._recv_done: set[str] = set()
+        # producer
+        self._staged: dict[str, _Staged] = {}
+        self._zmq_thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        # consumer
+        self._pool: ThreadPoolExecutor | None = None
+        self._inflight: dict[str, RecvReq] = {}
+        self._fetched: "queue.Queue[tuple[RecvReq, torch.Tensor, dict[str, Any], float, float]]" = queue.Queue()
+        self._failed: "queue.Queue[tuple[RecvReq, BaseException]]" = queue.Queue()
+        self.stats = {"staged": 0, "staged_bytes": 0, "stage_ms": 0.0, "pulled": 0, "pulled_bytes": 0, "pull_ms": 0.0, "import_ms": 0.0}
+
+    # ---- binding ----
+    def bind_runner(self, runner) -> None:
+        from mooncake.engine import TransferEngine
+
+        self.runner = runner
+        wrapper = runner.model
+        inner = getattr(wrapper, "model", None)
+        self.model = inner[0] if isinstance(inner, (list, tuple)) else inner
+        if not hasattr(self.model, "prefill_paged_slots"):
+            raise TypeError(f"TTMooncakeConnector: model {type(self.model).__name__} has no prefill_paged_slots (needs the qwen36 TP model)")
+        self.engine = TransferEngine()
+        self.pool: _HostBufferPool | None = None
+        local_host = self.c._side_host if self.c._is_producer else "127.0.0.1"
+        rc = self.engine.initialize(local_host, "P2PHANDSHAKE", self.c._protocol, self.c._device_name)
+        if rc != 0:
+            raise RuntimeError(f"Mooncake TransferEngine.initialize failed ({rc})")
+        self.rpc_port = int(self.engine.get_rpc_port())
+        self.local_host = local_host
+        self.pool = _HostBufferPool(self.engine, self._engine_lock, "staging" if self.c._is_producer else "receive")
+        if self.c._is_producer:
+            # park each prefilled request's GDN snapshot under its slot; never write
+            # decode slots (P never decodes)
+            self.model.pd_gdn_capture = {}
+            self.model.pd_skip_gdn_slot_write = True
+            self._zmq_thread = threading.Thread(target=self._serve_side_channel, name="tt-pd-side-channel", daemon=True)
+            self._zmq_thread.start()
+            logger.info("TTMooncakeConnector producer: mooncake %s:%d, side channel %s:%d", local_host, self.rpc_port, self.c._side_host, self.c._side_port)
+        else:
+            self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tt-pd-pull")
+            runner.pd_pending_gdn = {}
+            logger.info("TTMooncakeConnector consumer: mooncake %s:%d", local_host, self.rpc_port)
+
+    def post_warmup(self):
+        if self.c._is_producer and os.environ.get("QWEN36_PD_EXPORT_WARMUP", "1") == "1":
+            from models.demos.blackhole.qwen36.tt import pd_transfer
+
+            pd_transfer.export_warmup(self.model, max_bucket=int(os.environ.get("QWEN36_PD_EXPORT_WARMUP_MAX", "256")))
+            return
+        if not self.c._is_consumer:
+            return
+        if os.environ.get("QWEN36_PD_GDN_IMPORT", "trace") != "trace" or os.environ.get("QWEN36_PD_GDN_PRECAPTURE", "1") != "1":
+            return
+        from models.demos.blackhole.qwen36.tt import pd_transfer
+
+        n_slots = int(getattr(self.runner, "tt_per_lane_max_num_seqs", 0) or 0)
+        t0 = time.perf_counter()
+        pd_transfer.get_traced_importer(self.model).precapture(range(n_slots))
+        logger.info("[pd] pre-captured %d GDN import traces in %.1f s", n_slots, time.perf_counter() - t0)
+
+    def shutdown(self):
+        self._stop.set()
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+
+    # ---- producer ----
+    def _serve_side_channel(self):
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.REP)
+        sock.bind(f"tcp://{self.c._side_host}:{self.c._side_port}")
+        sock.setsockopt(zmq.RCVTIMEO, 500)
+        while not self._stop.is_set():
+            try:
+                msg = sock.recv_json()
+            except zmq.Again:
+                continue
+            except Exception as e:  # noqa: BLE001
+                logger.warning("side channel recv failed: %s", e)
+                continue
+            op, tid = msg.get("op"), str(msg.get("transfer_id", ""))
+            if op == "GET":
+                with self._lock:
+                    st = self._staged.get(tid)
+                if st is None:
+                    sock.send_json({"status": "pending"})
+                else:
+                    sock.send_json({"status": "ok", "segment": f"{self.local_host}:{self.rpc_port}", "addr": st.addr, "nbytes": st.nbytes, "header": st.header})
+            elif op in ("DONE", "CANCEL"):
+                self._release(tid)
+                sock.send_json({"status": "ok"})
+            else:
+                sock.send_json({"status": "error", "msg": f"unknown op {op}"})
+        sock.close(0)
+        ctx.term()
+
+    def _release(self, tid: str):
+        with self._lock:
+            st = self._staged.pop(tid, None)
+        if st is not None:
+            self.pool.release(st.buf)
+
+    def stage_after_step(self, meta: TTMooncakeConnectorMetadata):
+        if not self.c._is_producer or not meta.stage:
+            return
+        from models.demos.blackhole.qwen36.tt import pd_transfer
+
+        for sr in meta.stage:
+            if sr.req_id in self._staged or sr.req_id in self._stage_done:
+                continue  # re-shipped until the scheduler sees finished_sending
+            t0 = time.perf_counter()
+            slot = self.runner._req_state_slot.get(sr.req_id)
+            cap = self.model.pd_gdn_capture.pop(slot, None) if slot is not None else None
+            if cap is None:
+                logger.error("TTMooncakeConnector: no GDN snapshot for %s (slot %s); request will not be transferable", sr.req_id, slot)
+                continue
+            rec_snap, conv_snap = cap
+            n_blocks = max(1, math.ceil(sr.num_tokens / self.c._block_size))
+            block_ids = sr.block_ids[:n_blocks]
+            if len(block_ids) < n_blocks:
+                logger.error("TTMooncakeConnector: %s has %d blocks for %d tokens", sr.req_id, len(sr.block_ids), sr.num_tokens)
+                continue
+            kv = pd_transfer.export_kv_blocks(self.model, block_ids)
+            t1 = time.perf_counter()
+            pooled = self.pool.acquire(payload_nbytes(kv, rec_snap, conv_snap))
+            buf, header = pack_payload(kv, rec_snap, conv_snap, sr.num_tokens, n_blocks, out=pooled)
+            addr, nbytes = buf.data_ptr(), int(header["nbytes"])
+            with self._lock:
+                self._staged[sr.req_id] = _Staged(buf, addr, nbytes, header, time.time())
+                self._finished_sending.add(sr.req_id)
+                self._stage_done.add(sr.req_id)
+            t2 = time.perf_counter()
+            self.stats["staged"] += 1
+            self.stats["staged_bytes"] += header["nbytes"]
+            self.stats["stage_ms"] += 1e3 * (t2 - t0)
+            logger.info(
+                "[pd] staged %s: %d tokens, %d blocks, %.1f MiB (export %.1f ms, pack+register %.1f ms) digest %s",
+                sr.req_id, sr.num_tokens, n_blocks, header["nbytes"] / 2**20, 1e3 * (t1 - t0), 1e3 * (t2 - t1),
+                payload_digest(buf, header["nbytes"]),
+            )
+        # garbage-collect stagings nobody pulled (decoder died / aborted upstream)
+        now = time.time()
+        with self._lock:
+            stale = [tid for tid, st in self._staged.items() if now - st.t_staged > _GET_TIMEOUT_S]
+        for tid in stale:
+            logger.warning("[pd] dropping staged %s: never pulled within %.0f s", tid, _GET_TIMEOUT_S)
+            self._release(tid)
+
+    # ---- consumer ----
+    def start_step(self, meta: TTMooncakeConnectorMetadata):
+        if self.c._is_consumer:
+            for rr in meta.recv:
+                if rr.req_id in self._inflight or rr.req_id in self._recv_done:
+                    continue  # re-shipped until the scheduler sees finished_recving
+                self._inflight[rr.req_id] = rr
+                self._pool.submit(self._pull, rr)
+            for host, port, tid in meta.cancel:
+                self._pool.submit(self._side_channel_call, host, port, {"op": "CANCEL", "transfer_id": tid})
+            self._drain_fetched()
+
+    @staticmethod
+    def _side_channel_call(host: str, port: int, msg: dict[str, Any], timeout_ms: int = 5000):
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        try:
+            sock.connect(f"tcp://{host}:{port}")
+            sock.send_json(msg)
+            return sock.recv_json()
+        finally:
+            sock.close(0)
+
+    def _pull(self, rr: RecvReq):
+        """Background: GET the staging descriptor, pull the bytes into a registered
+        local buffer."""
+        try:
+            t0 = time.perf_counter()
+            deadline = t0 + _GET_TIMEOUT_S
+            while True:
+                rep = self._side_channel_call(rr.remote_host, rr.remote_port, {"op": "GET", "transfer_id": rr.transfer_id})
+                if rep.get("status") == "ok":
+                    break
+                if rep.get("status") != "pending" or time.perf_counter() > deadline:
+                    raise RuntimeError(f"producer has no staging for {rr.transfer_id}: {rep}")
+                time.sleep(_GET_POLL_S)
+            t1 = time.perf_counter()
+            nbytes = int(rep["nbytes"])
+            buf = self.pool.acquire(nbytes)
+            addr = buf.data_ptr()
+            with self._engine_lock:
+                rc = self.engine.transfer_sync_read(rep["segment"], addr, int(rep["addr"]), nbytes)
+            if rc != 0:
+                self.pool.release(buf)
+                raise RuntimeError(f"transfer_sync_read failed ({rc})")
+            t2 = time.perf_counter()
+            self._side_channel_call(rr.remote_host, rr.remote_port, {"op": "DONE", "transfer_id": rr.transfer_id})
+            self._fetched.put((rr, buf, rep["header"], t1 - t0, t2 - t1))
+        except BaseException as e:  # noqa: BLE001
+            logger.exception("[pd] pull failed for %s", rr.req_id)
+            self._failed.put((rr, e))
+
+    def _drain_fetched(self):
+        """Main thread: write pulled KV into the paged cache, park the GDN snapshot,
+        report finished_recving."""
+        from models.demos.blackhole.qwen36.tt import pd_transfer
+
+        while True:
+            try:
+                rr, buf, header, t_wait, t_pull = self._fetched.get_nowait()
+            except queue.Empty:
+                break
+            t0 = time.perf_counter()
+            kv, rec, conv = unpack_payload(buf, header)
+            n_blocks = int(header["n_blocks"])
+            if len(rr.block_ids) < n_blocks:
+                logger.error("[pd] %s: %d local blocks for a %d-block payload; skipping import", rr.req_id, len(rr.block_ids), n_blocks)
+                self.pool.release(buf)
+            else:
+                pd_transfer.import_kv_blocks(self.model, rr.block_ids[:n_blocks], kv)
+                # keep the snapshot alive (views into the pooled buf) until the runner
+                # writes the decode slot; the runner calls the release when done
+                self.runner.pd_pending_gdn[rr.req_id] = (rec, conv, buf, lambda b=buf: self.pool.release(b))
+            t1 = time.perf_counter()
+            self._inflight.pop(rr.req_id, None)
+            with self._lock:
+                self._finished_recving.add(rr.req_id)
+                self._recv_done.add(rr.req_id)
+            self.stats["pulled"] += 1
+            self.stats["pulled_bytes"] += header["nbytes"]
+            self.stats["pull_ms"] += 1e3 * t_pull
+            self.stats["import_ms"] += 1e3 * (t1 - t0)
+            logger.info(
+                "[pd] pulled %s: %d tokens, %.1f MiB (wait %.1f ms, pull %.1f ms = %.2f GB/s, KV import %.1f ms) digest %s blocks %s",
+                rr.req_id, header["num_tokens"], header["nbytes"] / 2**20, 1e3 * t_wait, 1e3 * t_pull,
+                header["nbytes"] / max(t_pull, 1e-9) / 2**30, 1e3 * (t1 - t0), payload_digest(buf, header["nbytes"]),
+                rr.block_ids[:n_blocks],
+            )
+        while True:
+            try:
+                rr, err = self._failed.get_nowait()
+            except queue.Empty:
+                break
+            # Report it as received so the scheduler proceeds; the runner then prefills
+            # locally (the request's state slot has no import parked), which is slow but
+            # correct.
+            self._inflight.pop(rr.req_id, None)
+            with self._lock:
+                self._finished_recving.add(rr.req_id)
+                self._recv_done.add(rr.req_id)
+            logger.error("[pd] %s: transfer failed (%s); the decoder will prefill it locally", rr.req_id, err)
+
+    def take_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str] | None, set[str] | None]:
+        if self.c._is_consumer:
+            self._drain_fetched()
+        for req_id in finished_req_ids or ():
+            self._stage_done.discard(req_id)
+            self._recv_done.discard(req_id)
+        with self._lock:
+            s, r = self._finished_sending, self._finished_recving
+            self._finished_sending, self._finished_recving = set(), set()
+        return (s or None), (r or None)

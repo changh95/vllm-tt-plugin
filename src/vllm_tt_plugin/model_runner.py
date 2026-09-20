@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import deque
@@ -14,6 +15,10 @@ import regex as re
 import torch
 import ttnn
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -24,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -782,6 +788,112 @@ class TTModelRunner:
         # Refresh logits processors with batch state changes
         self.input_batch.refresh_logitsprocs()
 
+        # Prefill/decode disaggregation: requests whose state arrived from a prefill
+        # instance get their decode slot written now that they have a batch row.
+        self._pd_after_update_states(scheduler_output)
+
+    # ------------------------------------------------------------------
+    # Prefill/decode disaggregation (vllm_tt_plugin.kv_connector)
+    # ------------------------------------------------------------------
+    def _pd_connector(self):
+        return get_kv_transfer_group() if has_kv_transfer_group() else None
+
+    def _pd_begin_step(self, scheduler_output: SchedulerOutput):
+        """Mirror of KVConnectorModelRunnerMixin's step entry: bind metadata, start
+        loads."""
+        conn = self._pd_connector()
+        if conn is None:
+            return None
+        self._pd_scheduler_output = scheduler_output
+        conn.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        conn.start_load_kv(None)
+        return conn
+
+    def _pd_end_step(self, wait_for_save: bool = True) -> KVConnectorOutput | None:
+        """Mirror of the mixin's step exit: save (producer staging), collect finished
+        ids."""
+        conn = self._pd_connector()
+        if conn is None:
+            return None
+        so = getattr(self, "_pd_scheduler_output", None)
+        if wait_for_save:
+            conn.wait_for_save()
+        finished = set(so.finished_req_ids) if so is not None else set()
+        sending, recving = conn.get_finished(finished)
+        conn.clear_connector_metadata()
+        self._pd_imported_new = set()
+        return KVConnectorOutput(finished_sending=sending, finished_recving=recving)
+
+    def _pd_attach_output(self, out):
+        if not has_kv_transfer_group():
+            return out
+        kv_out = self._pd_end_step(wait_for_save=True)
+        if isinstance(out, ModelRunnerOutput):
+            if out is EMPTY_MODEL_RUNNER_OUTPUT:
+                out = ModelRunnerOutput.with_kv_conn_output_only(kv_out)
+            else:
+                out.kv_connector_output = kv_out
+        elif kv_out is not None and not kv_out.is_empty():
+            logger.warning(
+                "P/D: dropping KV connector output on a %s (async decode outputs are "
+                "not supported with the TT connector)",
+                type(out).__name__,
+            )
+        return out
+
+    def _pd_after_update_states(self, scheduler_output: SchedulerOutput) -> None:
+        """Consumer: write parked GDN snapshots into the decode slot of each newly added
+        request whose KV blocks the connector already filled."""
+        pending = getattr(self, "pd_pending_gdn", None)
+        if not pending:
+            return
+        from models.demos.blackhole.qwen36.tt import pd_transfer
+
+        inner = getattr(self.model, "model", None)
+        inner = inner[0] if isinstance(inner, (list, tuple)) else inner
+        imported = self.__dict__.setdefault("_pd_imported_new", set())
+        for req_id in list(pending):
+            if req_id not in self.input_batch.req_id_to_index:
+                continue
+            entry = pending.pop(req_id)
+            rec, conv = entry[0], entry[1]
+            release = entry[3] if len(entry) > 3 else None
+            slot = self._alloc_prefill_state_slots([req_id])[0]
+            t0 = time.perf_counter()
+            try:
+                pd_transfer.import_gdn_slot(inner, slot, rec, conv)
+            finally:
+                if release is not None:
+                    release()
+            if os.environ.get("QWEN36_PD_VERIFY", "0") == "1":
+                pd_transfer.verify_gdn_slot(inner, slot, rec, conv, tag=req_id)
+            imported.add(req_id)
+            # The Generator's device-sampling reset path keeps the DEVICE token/position
+            # for a row whose device position chain looks continuous with the host view,
+            # taking host tokens only for slots prefilled since the last decode. An
+            # imported request never prefilled here and an idle slot's device position
+            # drifts one per step, so it can collide with the prompt length: register
+            # the request's slot and row as freshly prefilled so its host token (the
+            # last prompt token) and position are authoritative on its first step. NOTE:
+            # the Generator indexes this set by decode BATCH ROW (in the standalone flow
+            # a prefill row equals its state slot), so register the row only --
+            # registering the state slot would force host tokens onto whatever request
+            # decodes at that row.
+            fresh = getattr(self.model, "_slots_prefilled_since_decode", None)
+            if fresh is None:
+                fresh = self.model._slots_prefilled_since_decode = set()
+            fresh.add(int(self.input_batch.req_id_to_index[req_id]))
+            st = self.requests.get(req_id)
+            if st is not None and getattr(st, "mrope_position_delta", None) is None:
+                st.mrope_position_delta = 0
+            logger.info(
+                "P/D: imported GDN state of %s into slot %d (%.1f ms); "
+                "first step runs as decode",
+                req_id,
+                slot,
+                1e3 * (time.perf_counter() - t0),
+            )
+
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
         """Validate the multimodal feature is an image."""
         if mm_feature.modality != "image":
@@ -1183,11 +1295,27 @@ class TTModelRunner:
             for req_id in cached_reqs.req_ids
             if req_id not in cached_reqs.resumed_req_ids
         )
+        # Requests imported from a prefill instance (P/D disaggregation) are complete up
+        # to their last prompt token and run that token as a decode row, never as
+        # prefill.
+        pd_imported = getattr(self, "_pd_imported_new", None) or ()
         is_prompt = (
-            len(scheduler_output.scheduled_new_reqs) > 0
+            any(
+                r.req_id not in pd_imported for r in scheduler_output.scheduled_new_reqs
+            )
             or bool(cached_reqs.resumed_req_ids)
             or has_chunked_continuation
         )
+        if is_prompt and pd_imported:
+            logger.warning(
+                "P/D: prefill step also contains %d imported request(s); they are "
+                "re-prefilled locally (correct, but the transfer was wasted)",
+                sum(
+                    1
+                    for r in scheduler_output.scheduled_new_reqs
+                    if r.req_id in pd_imported
+                ),
+            )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         if is_prompt:
@@ -1260,6 +1388,23 @@ class TTModelRunner:
                 # never read, so there is nothing to default in place.
 
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+        if pd_imported and not is_prompt:
+            # P/D diagnostics: what the imported request's first (decode) step feeds
+            for row, rid in enumerate(row_req_ids):
+                if rid in pd_imported:
+                    bt = block_tables[row]
+                    logger.info(
+                        "P/D first step: req %s row %d slot %s token %d pos %d "
+                        "num_tokens %d computed %d blocks %s",
+                        rid,
+                        row,
+                        self._req_state_slot.get(rid),
+                        int(input_tokens[row, 0]),
+                        int(input_positions[row]),
+                        int(input_batch.num_tokens[row]),
+                        int(input_batch.num_computed_tokens_cpu[row]),
+                        [int(b) for b in bt[: min(4, int((bt != 0).sum()))]],
+                    )
 
         tt_sampling_params = slice_tt_sampling_params(sample_params, req_indices)
         if not is_prompt and input_tokens.shape[0] > len(req_indices):
@@ -1677,6 +1822,10 @@ class TTModelRunner:
         if get_tt_step_plan(scheduler_output) is not None:
             return self._execute_lane_step(scheduler_output)
 
+        # Prefill/decode disaggregation: bind this step's connector metadata and start
+        # background KV loads before touching the persistent batch.
+        kv_conn = self._pd_begin_step(scheduler_output)
+
         # Decide whether the next build can remain one step host-stale before
         # mutating the persistent batch. On a transition, finalize pending work
         # now but defer applying it until ``build_model_input`` has processed
@@ -1692,6 +1841,12 @@ class TTModelRunner:
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = self.build_model_input(scheduler_output, None)
         if model_input is None:
+            if kv_conn is not None:
+                # Zero-token step: the engine still runs it so finished KV transfers get
+                # reported.
+                return ModelRunnerOutput.with_kv_conn_output_only(
+                    self._pd_end_step(wait_for_save=False)
+                )
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
@@ -1915,7 +2070,7 @@ class TTModelRunner:
         if not self._pending_samples:
             return None
         finish = self._pending_samples.popleft()
-        return finish(grammar_output)
+        return self._pd_attach_output(finish(grammar_output))
 
     def check_perform_device_sampling(
         self, is_decode: bool, has_structured_outputs: bool
