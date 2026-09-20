@@ -83,6 +83,9 @@ def make_transport(
         opts.pop("shm_dir", None)
         opts.pop("budget_bytes", None)
         opts.pop("checksum", None)
+        opts.setdefault(
+            "extra_config", extra if kv_transfer_config is not None else None
+        )
         return FabricSocketTransport(**opts)
     raise ValueError(f"unknown transport kind {kind!r} (shm | fabric)")
 
