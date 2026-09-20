@@ -133,6 +133,7 @@ class TTKVWorker:
         self._armed: dict[str, float] = {}
         # consumer
         self._loads: dict[str, LoadJob] = {}  # insertion order == FIFO
+        self._prev_slot_map: dict[str, int] | None = None  # for _log_slot_moves
         self._invalid_block_ids: set[int] = set()
         self._finished_now: set[str] = set()
         self._events_this_step: bool = False
@@ -170,11 +171,37 @@ class TTKVWorker:
             raise RuntimeError("TTKVWorker needs a connector or an xfer_id_fn")
         return self._xfer_id_fn(req_id)
 
-    def _release_quiet(self, xfer_id: str) -> None:
+    def _release_quiet(self, xfer_id: str, why: str = "") -> None:
         try:
             self.transport.release_remote(xfer_id)
+            logger.info("PD: released remote segment %s (%s)", xfer_id, why)
         except Exception:
             logger.exception("PD: release_remote(%s) raised", xfer_id)
+
+    def _log_slot_moves(self) -> None:
+        """Evidence line for every device-state-slot remap (batch condense /
+        promotion): the runner's ``_req_state_slot`` map is compared with the
+        snapshot taken at the previous step-begin; a request whose slot changed
+        was moved by ``remap_slots`` in the step in between. Cross-parity moves
+        (R4, fused-conv ``conv_hist_packed``) are marked."""
+        cur = getattr(self.runner, "_req_state_slot", None)
+        if not isinstance(cur, dict):
+            return
+        prev = self._prev_slot_map
+        self._prev_slot_map = dict(cur)
+        if prev is None:
+            return
+        moves = [(r, prev[r], s) for r, s in cur.items() if r in prev and prev[r] != s]
+        if not moves:
+            return
+        logger.info(
+            "PD: state slots remapped (step %d): %s",
+            self._step,
+            ", ".join(
+                f"{r} {a}->{b}{' cross-parity' if (a & 1) != (b & 1) else ''}"
+                for r, a, b in moves
+            ),
+        )
 
     def _others_live(self) -> bool:
         reqs = getattr(self.runner, "requests", None) or {}
@@ -207,6 +234,7 @@ class TTKVWorker:
         join = set(join_req_ids or ())
         if meta is None:
             meta = TTKVConnectorMetadata()
+        self._log_slot_moves()
         if self.is_producer:
             self._begin_producer(meta, finished)
         if self.is_consumer:
@@ -220,7 +248,14 @@ class TTKVWorker:
             s = self._pending_saves.pop(r, None)
             self._exports.pop(r, None)
             try:
-                self.transport.abandon(s.xfer_id if s is not None else self._xfer_id(r))
+                x = s.xfer_id if s is not None else self._xfer_id(r)
+                self.transport.abandon(x)
+                logger.info(
+                    "PD: export of %s abandoned (request finished without a "
+                    "remote decode: aborted/rejected); segment %s removed",
+                    r,
+                    x,
+                )
             except Exception:
                 logger.exception("PD: abandon(%s) raised", r)
         self._armed.update(meta.reqs_to_send)  # armed exactly once per id
@@ -229,13 +264,18 @@ class TTKVWorker:
         self, meta: TTKVConnectorMetadata, finished: set[str], join: set[str]
     ) -> None:
         for x in meta.to_release:
-            self._release_quiet(x)  # header -> RELEASED; idempotent
+            # header -> RELEASED; idempotent
+            self._release_quiet(
+                x, "scheduler release: demoted, rejected or aborted before the load"
+            )
         for r, m in meta.reqs_to_recv.items():
             if r in join:
                 raise RuntimeError(f"PD: {r} is both a fresh admission and a join id")
             if r in finished:
                 # aborted before we saw it: report once, never claim a slot
-                self._release_quiet(m.xfer.xfer_id)
+                self._release_quiet(
+                    m.xfer.xfer_id, f"{r} aborted before the load was recorded"
+                )
                 self._finished_now.add(r)
                 self._events_this_step = True
                 continue
@@ -302,6 +342,7 @@ class TTKVWorker:
                     continue  # retry next step
                 job.state = LoadState.PENDING_READY
                 self._step_progress = True
+                logger.info("PD: %s claimed state slot %d", r, slot)
             if job.state == LoadState.PENDING_READY:
                 expiry = job.meta.xfer.expiry
                 if expiry is not None and time.time() > float(expiry):
@@ -495,6 +536,12 @@ class TTKVWorker:
             if s is not None:  # aborted mid-step
                 try:
                     self.transport.abandon(s.xfer_id)
+                    logger.info(
+                        "PD: export of %s abandoned (aborted mid-step); "
+                        "segment %s removed",
+                        r,
+                        s.xfer_id,
+                    )
                 except Exception:
                     logger.exception("PD: abandon(%s) raised", r)
         done = {r for r in self._armed if r in self._exports and self._exports[r].done}

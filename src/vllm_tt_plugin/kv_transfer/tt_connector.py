@@ -853,12 +853,19 @@ class TTKVConnector(KVConnectorBase_V1, SupportsHMA):
     def _check_fused_conv(self, model: Any) -> None:
         """R4 / AM3: the consumer refuses a fused-conv GDN decode unless
         ``TT_PD_ALLOW_FUSED_CONV=1`` (milestone M2)."""
-        fused = [
-            dn
-            for dn in self._gdn_layers(model)
-            if getattr(dn, "_decode_fused_conv", False)
-        ]
-        if fused and os.environ.get("TT_PD_ALLOW_FUSED_CONV", "0") != "1":
+        layers = self._gdn_layers(model)
+        fused = [dn for dn in layers if getattr(dn, "_decode_fused_conv", False)]
+        allow = os.environ.get("TT_PD_ALLOW_FUSED_CONV", "0")
+        logger.info(
+            "PD consumer: %d/%d GDN layers run the fused-conv decode "
+            "(QWEN36_GDN_DECODE_FUSED=%s, TT_PD_ALLOW_FUSED_CONV=%s) -> %s",
+            len(fused),
+            len(layers),
+            os.environ.get("QWEN36_GDN_DECODE_FUSED", "<unset>"),
+            allow,
+            "M2 fused-conv decode node" if fused else "M1 composite decode node",
+        )
+        if fused and allow != "1":
             raise RuntimeError(
                 f"PD consumer: {len(fused)} GDN layers run the fused-conv decode "
                 "(conv_hist_packed parity remap is not PD-safe, R4). Run the decode "

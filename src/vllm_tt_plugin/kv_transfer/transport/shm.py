@@ -1365,9 +1365,12 @@ class ShmTransport(TTKVTransport):
             if st is not None:
                 st.close()
             self._inherited.pop(xfer_id, None)
+            removed = []
             for d in (self._tmp_dir(engine, hx), self._pub_dir(engine, hx)):
                 if os.path.isdir(d):
                     self._rmtree(d)  # a claimed segment belongs to the consumer: kept
+                    removed.append(os.path.basename(d))
+            logger.info("shm: abandoned %s (removed %s)", xfer_id, removed or "nothing")
 
     # -- consumer
     def open_get(self, desc: Any) -> GetHandle | None:
@@ -1507,7 +1510,14 @@ class ShmTransport(TTKVTransport):
             gs = self._gets.pop(h.xfer_id, None)
             if gs is None:
                 return  # never claimed / already finished: idempotent
-            self._drop_claim(gs, CONSUMED if ok else LOAD_FAILED)
+            status = CONSUMED if ok else LOAD_FAILED
+            self._drop_claim(gs, status)
+            logger.info(
+                "shm: segment %s %s; claim dir %s removed",
+                h.xfer_id,
+                STATUS_NAMES[status],
+                os.path.basename(gs.claim_dir),
+            )
 
     def release_remote(self, xfer_id: str) -> None:
         try:
@@ -1518,17 +1528,30 @@ class ShmTransport(TTKVTransport):
             gs = self._gets.pop(xfer_id, None)
             if gs is not None:
                 self._drop_claim(gs, RELEASED)
+                logger.info(
+                    "shm: released %s (our open claim dropped, dir removed)", xfer_id
+                )
                 return
             mine = self._claim_dir(engine, hx)
             if os.path.isdir(mine):  # claimed by us (e.g. an earlier instance): ours
                 self._rmtree(mine)
+                logger.info(
+                    "shm: released %s (stale claim dir of ours removed)", xfer_id
+                )
                 return
             pub = self._pub_dir(engine, hx)
             hp = self._find_header(pub) if os.path.isdir(pub) else None
             if hp is not None:
                 with contextlib.suppress(OSError):
                     write_status(hp, RELEASED)  # the producer's janitor unlinks it
+                logger.info(
+                    "shm: released %s (unclaimed segment marked RELEASED for the "
+                    "producer's janitor)",
+                    xfer_id,
+                )
+                return
             # missing (or still .tmp / foreign claim): nothing to do
+            logger.info("shm: released %s (no segment on disk: nothing to do)", xfer_id)
 
     # -- janitor (producer)
     def janitor_once(self, now: float | None = None) -> None:
@@ -1573,6 +1596,11 @@ class ShmTransport(TTKVTransport):
                     if status is None or status in TERMINAL_UNCLAIMED:
                         if self._retire(p):
                             self.stats["swept"] += 1
+                            logger.info(
+                                "shm janitor: swept %s (status %s)",
+                                n,
+                                STATUS_NAMES.get(status, status),
+                            )
                     elif expiry is not None and now > expiry and self._retire(p):
                         logger.warning("lease expired on %s: consumer never came", n)
                         self.stats["expired"] += 1
@@ -1593,6 +1621,11 @@ class ShmTransport(TTKVTransport):
                 if st.published and not _exists(st.xfer_hex):
                     st.close()
                     del self._puts[xid]
+                    logger.info(
+                        "shm janitor: segment %s gone (claimed and finished by the "
+                        "consumer, or swept); budget charge released",
+                        xid,
+                    )
             for xid in list(self._inherited):
                 if not _exists(parse_xfer_id(xid)[1]):
                     del self._inherited[xid]
