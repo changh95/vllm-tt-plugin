@@ -248,6 +248,19 @@ class Harness:
         await self.proxy.client_p.aclose()
         await self.proxy.client_d.aclose()
 
+    @property
+    def rid(self) -> str:
+        """The backend-facing id the proxy MINTED for the (single) request the
+        backends saw: never the client's ``X-Request-Id`` (``rid1``)."""
+        ids = self.p.header_ids + self.d.header_ids
+        assert ids, "no backend request yet"
+        base = ids[0]
+        for suffix in (P_LEG_SUFFIX, D_RETRY_SUFFIX):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+        assert len(base) == 32 and base != "rid1", base
+        return base
+
 
 def chat_body(**kw) -> dict:
     body = {
@@ -390,14 +403,14 @@ def test_chat_nonstream_two_legs_ids_params_and_passthrough():
         # P leg
         assert len(h.p.requests) == 1
         assert h.p.requests[0].url.path == "/v1/chat/completions"
-        assert h.p.header_ids == ["rid1" + P_LEG_SUFFIX]
+        assert h.p.header_ids == [h.rid + P_LEG_SUFFIX]
         bp = h.p.bodies[0]
         assert bp["stream"] is False and bp["max_tokens"] == 1
         assert "min_tokens" not in bp and "stream_options" not in bp
         assert bp["kv_transfer_params"] == PREFILL_KV_TRANSFER_PARAMS
         # D leg: original body + restored min_tokens + P's params, bare id.
         assert len(h.d.requests) == 1
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
         bd = h.d.bodies[0]
         assert bd["kv_transfer_params"] == P_PARAMS
         assert bd["min_tokens"] == 3
@@ -436,6 +449,53 @@ def test_generated_request_id_when_header_absent():
         run(h.aclose())
 
 
+def test_client_request_id_is_echoed_never_forwarded_and_reuse_is_safe():
+    """Audit minor: a client-chosen ``X-Request-Id`` used to be the engine id
+    of all three backend legs, so a reused id (concurrently, or inside P's
+    finished_sending window) hit ``Scheduler.add_request``'s duplicate-id
+    assert on a backend. The proxy now mints the backend id and only echoes
+    the client's."""
+    h = Harness()
+    h.p.handler = p_ok()
+    h.d.handler = d_json()
+
+    async def go():
+        return await asyncio.gather(
+            h.post("/chat/completions", chat_body(), rid="same"),
+            h.post("/chat/completions", chat_body(), rid="same"),
+        )
+
+    try:
+        r1, r2 = run(go())
+        assert r1.status_code == r2.status_code == 200
+        assert r1.headers["x-request-id"] == r2.headers["x-request-id"] == "same"
+        d_ids = h.d.header_ids
+        assert len(d_ids) == 2 and len(set(d_ids)) == 2, "distinct per request"
+        assert all(len(i) == 32 and i != "same" for i in d_ids)
+        assert sorted(h.p.header_ids) == sorted(i + P_LEG_SUFFIX for i in d_ids)
+        assert all("same" not in i for i in d_ids + h.p.header_ids)
+    finally:
+        run(h.aclose())
+
+
+def test_error_payloads_echo_the_client_request_id():
+    h = Harness()
+    h.p.handler = p_ok()
+
+    async def boom(request, i):
+        raise httpx.ConnectError("down", request=request)
+
+    h.d.handler = boom
+    try:
+        resp = run(h.post("/chat/completions", chat_body(), rid="mine"))
+        assert resp.status_code == 502
+        assert resp.headers["x-request-id"] == "mine"
+        assert resp.json()["request_id"] == "mine"
+        assert h.d.header_ids == [h.rid] and h.rid != "mine"
+    finally:
+        run(h.aclose())
+
+
 def test_client_supplied_kv_transfer_params_are_dropped():
     h = Harness()
     h.p.handler = p_ok()
@@ -465,7 +525,7 @@ def test_short_prompt_goes_straight_to_decode():
         resp = run(h.post("/chat/completions", body))
         assert resp.status_code == 200
         assert h.p.requests == []
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
         assert "kv_transfer_params" not in h.d.bodies[0]
         assert h.d.bodies[0] == body
     finally:
@@ -536,7 +596,7 @@ def test_streaming_passthrough_with_keepalives_during_prefill_leg():
         assert h.d.bodies[0]["kv_transfer_params"] == P_PARAMS
         assert h.d.bodies[0]["min_tokens"] == 1
         assert h.p.bodies[0]["stream"] is False
-        assert h.p.header_ids == ["rid1-p"] and h.d.header_ids == ["rid1"]
+        assert h.p.header_ids == [h.rid + "-p"] and h.d.header_ids == [h.rid]
     finally:
         run(h.aclose())
 
@@ -580,7 +640,7 @@ def test_prefill_without_params_falls_back_to_local_decode():
         resp = run(h.post("/chat/completions", chat_body(min_tokens=2)))
         assert resp.status_code == 200
         assert len(h.p.requests) == 1
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
         assert "kv_transfer_params" not in h.d.bodies[0]
         assert h.d.bodies[0]["min_tokens"] == 2
     finally:
@@ -630,7 +690,7 @@ def test_prefill_failure_with_local_fallback_decodes_without_params():
     try:
         resp = run(h.post("/chat/completions", chat_body(min_tokens=2)))
         assert resp.status_code == 200
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
         assert "kv_transfer_params" not in h.d.bodies[0]
         assert h.d.bodies[0]["min_tokens"] == 2
     finally:
@@ -669,8 +729,8 @@ def test_decode_500_retries_once_without_params_nonstream():
         resp = run(h.post("/chat/completions", chat_body(min_tokens=2)))
         assert resp.status_code == 200
         assert resp.json()["choices"][0]["message"]["content"] == "second"
-        assert h.p.header_ids == ["rid1-p"]
-        assert h.d.header_ids == ["rid1", "rid1" + D_RETRY_SUFFIX]
+        assert h.p.header_ids == [h.rid + "-p"]
+        assert h.d.header_ids == [h.rid, h.rid + D_RETRY_SUFFIX]
         assert h.d.bodies[0]["kv_transfer_params"] == P_PARAMS
         assert "kv_transfer_params" not in h.d.bodies[1]
         assert h.d.bodies[1]["min_tokens"] == 2
@@ -686,7 +746,7 @@ def test_decode_finish_reason_error_retries_nonstream():
         resp = run(h.post("/chat/completions", chat_body()))
         assert resp.status_code == 200
         assert resp.json()["choices"][0]["message"]["content"] == "second"
-        assert h.d.header_ids == ["rid1", "rid1-r1"]
+        assert h.d.header_ids == [h.rid, h.rid + "-r1"]
     finally:
         run(h.aclose())
 
@@ -698,7 +758,7 @@ def test_decode_retry_failure_is_passed_through_not_retried_again():
     try:
         resp = run(h.post("/chat/completions", chat_body()))
         assert resp.status_code == 500
-        assert h.d.header_ids == ["rid1", "rid1-r1"]
+        assert h.d.header_ids == [h.rid, h.rid + "-r1"]
     finally:
         run(h.aclose())
 
@@ -714,7 +774,7 @@ def test_decode_4xx_is_passed_through_without_retry():
     try:
         resp = run(h.post("/chat/completions", chat_body()))
         assert resp.status_code == 400
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
     finally:
         run(h.aclose())
 
@@ -726,7 +786,7 @@ def test_no_retry_when_no_params_were_sent():
         body = chat_body(messages=[{"role": "user", "content": "hi"}])
         resp = run(h.post("/chat/completions", body))
         assert resp.status_code == 500
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
     finally:
         run(h.aclose())
 
@@ -738,7 +798,7 @@ def test_retry_disabled_by_config():
     try:
         resp = run(h.post("/chat/completions", chat_body()))
         assert resp.status_code == 500
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
     finally:
         run(h.aclose())
 
@@ -755,7 +815,7 @@ def test_streaming_error_event_before_content_triggers_retry():
         assert resp.status_code == 200
         # Nothing from the failed first stream reaches the client.
         assert resp.content == b"".join(good)
-        assert h.d.header_ids == ["rid1", "rid1-r1"]
+        assert h.d.header_ids == [h.rid, h.rid + "-r1"]
         assert h.d.bodies[0]["kv_transfer_params"] == P_PARAMS
         assert "kv_transfer_params" not in h.d.bodies[1]
         assert h.d.bodies[1]["stream"] is True and h.d.bodies[1]["min_tokens"] == 2
@@ -773,7 +833,7 @@ def test_streaming_finish_reason_error_chunk_triggers_retry():
     try:
         resp = run(h.post("/chat/completions", chat_body(stream=True)))
         assert resp.content == b"".join(good)
-        assert h.d.header_ids == ["rid1", "rid1-r1"]
+        assert h.d.header_ids == [h.rid, h.rid + "-r1"]
     finally:
         run(h.aclose())
 
@@ -786,7 +846,7 @@ def test_streaming_500_status_triggers_retry():
     try:
         resp = run(h.post("/chat/completions", chat_body(stream=True)))
         assert resp.content == b"".join(good)
-        assert h.d.header_ids == ["rid1", "rid1-r1"]
+        assert h.d.header_ids == [h.rid, h.rid + "-r1"]
     finally:
         run(h.aclose())
 
@@ -799,7 +859,7 @@ def test_streaming_no_retry_after_first_content_chunk():
     try:
         resp = run(h.post("/chat/completions", chat_body(stream=True)))
         assert resp.content == b"".join(parts)
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
     finally:
         run(h.aclose())
 
@@ -814,7 +874,7 @@ def test_streaming_retry_buffer_timeout_flushes_and_passes_through():
     try:
         resp = run(h.post("/chat/completions", chat_body(stream=True)))
         assert resp.content == b"".join(parts)
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
     finally:
         run(h.aclose())
 
@@ -827,7 +887,7 @@ def test_streaming_retry_stream_error_is_passed_through_not_retried_again():
     try:
         resp = run(h.post("/chat/completions", chat_body(stream=True)))
         assert resp.content == b"".join(bad)
-        assert h.d.header_ids == ["rid1", "rid1-r1"]
+        assert h.d.header_ids == [h.rid, h.rid + "-r1"]
     finally:
         run(h.aclose())
 
@@ -844,7 +904,7 @@ def test_completions_stream_text_counts_as_content():
     try:
         resp = run(h.post("/completions", completion_body(stream=True)))
         assert resp.content == b"".join(parts)
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
     finally:
         run(h.aclose())
 
@@ -982,7 +1042,7 @@ def test_nonstream_client_disconnect_after_prefill_skips_decode_leg():
             )
         )
         assert resp.status_code == pd_proxy.CLIENT_CLOSED_REQUEST
-        assert h.p.header_ids == ["rid1-p"]
+        assert h.p.header_ids == [h.rid + "-p"]
         assert h.d.requests == []
     finally:
         run(h.aclose())
@@ -1006,7 +1066,7 @@ def test_nonstream_connected_client_proceeds_to_decode_leg():
             )
         )
         assert resp.status_code == 200
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
     finally:
         run(h.aclose())
 
@@ -1050,7 +1110,7 @@ def test_stream_client_disconnect_during_prefill_cancels_prefill_and_skips_decod
         received = run(go())
         assert received and all(c == b": keep-alive\n\n" for c in received)
         assert state["p_cancelled"] is True
-        assert h.p.header_ids == ["rid1-p"]
+        assert h.p.header_ids == [h.rid + "-p"]
         assert h.d.requests == []
     finally:
         run(h.aclose())
@@ -1099,7 +1159,7 @@ def test_stream_client_disconnect_during_decode_closes_upstream():
         received = run(go())
         assert b"".join(received) == role_chunk() + content_chunk("a")
         assert closed["value"] is True
-        assert h.d.header_ids == ["rid1"]
+        assert h.d.header_ids == [h.rid]
     finally:
         run(h.aclose())
 

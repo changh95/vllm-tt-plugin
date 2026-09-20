@@ -3,7 +3,11 @@
 """OpenAI-compatible prefill/decode disaggregation proxy (PHASE2_DESIGN.md 2.4).
 
 One client request becomes up to three backend requests, each with its own
-engine id derived from the ``X-Request-Id`` header the backend receives:
+engine id derived from the ``X-Request-Id`` header the backend receives. The
+proxy MINTS that id (``uuid4().hex``) for every client request: a client's own
+``X-Request-Id`` is only echoed back in the proxy's response header, error
+payloads and logs, never handed to P or D (a reused client id would hit
+``Scheduler.add_request``'s duplicate-id assert on a backend -- engine crash).
 
 * ``{rid}-p``  the prefill leg on P (``max_tokens=1``, ``stream=false``,
   ``kv_transfer_params`` with ``do_remote_decode``); P's one token is
@@ -409,6 +413,8 @@ class _RequestContext:
     body: dict[str, Any]
     headers: dict[str, str]
     stream: bool
+    # The client's own X-Request-Id, if it sent one: echoed, never forwarded.
+    client_rid: str | None = None
     t_start: float = field(default_factory=time.monotonic)
     estimate: int = 0
     route: str = "remote"
@@ -416,7 +422,14 @@ class _RequestContext:
     t_first_content: float | None = None
     restore: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def echo_rid(self) -> str:
+        """The id the CLIENT sees (its own X-Request-Id when it sent one)."""
+        return self.client_rid or self.rid
+
     def log(self, level: int, event: str, **kv: Any) -> None:
+        if self.client_rid is not None:
+            kv = {"client_rid": self.client_rid, **kv}
         extra = " ".join(f"{k}={v}" for k, v in kv.items())
         logger.log(level, "rid=%s api=%s event=%s %s", self.rid, self.api, event, extra)
 
@@ -469,11 +482,23 @@ class PDProxy:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def request_id(headers: Mapping[str, str]) -> str:
+    def client_request_id(headers: Mapping[str, str]) -> str | None:
+        """The client's own ``X-Request-Id`` (echo only), or None."""
         for key, value in headers.items():
             if key.lower() == "x-request-id" and value:
                 return value
+        return None
+
+    @staticmethod
+    def mint_request_id() -> str:
+        """The backend-facing id: fresh per client request, never client-chosen."""
         return uuid.uuid4().hex
+
+    @classmethod
+    def request_id(cls, headers: Mapping[str, str]) -> str:
+        """The id to ECHO to the client: its own header when present, else a
+        fresh one. Not what the backends receive (see ``mint_request_id``)."""
+        return cls.client_request_id(headers) or cls.mint_request_id()
 
     async def handle(
         self,
@@ -487,9 +512,11 @@ class PDProxy:
         cancelling the response generator on disconnect."""
         if api not in _API_PATHS:
             raise ValueError(f"unsupported api {api!r}")
-        rid = self.request_id(headers)
+        client_rid = self.client_request_id(headers)
+        rid = self.mint_request_id()  # backend legs: {rid}-p, {rid}, {rid}-r1
+        echo = client_rid or rid
         if not isinstance(body, dict):
-            return self._error_response(rid, "request body must be a JSON object", 400)
+            return self._error_response(echo, "request body must be a JSON object", 400)
         if "kv_transfer_params" in body:
             # Clients must not steer D at a foreign segment (R16); D validates
             # anyway, but drop it here so the P leg sees a clean body.
@@ -501,12 +528,13 @@ class PDProxy:
             body=body,
             headers=self._forward_headers(headers),
             stream=bool(body.get("stream", False)),
+            client_rid=client_rid,
         )
         try:
             validate_request(api, body)
         except ProxyRequestError as e:
             ctx.log(logging.INFO, "rejected", status=e.status_code, reason=str(e))
-            return self._error_response(rid, str(e), e.status_code, e.err_type)
+            return self._error_response(echo, str(e), e.status_code, e.err_type)
 
         ctx.estimate = self.token_counter.estimate(api, body)
         remote = ctx.estimate >= self.config.min_remote_tokens
@@ -524,7 +552,7 @@ class PDProxy:
                 self._stream_pipeline(ctx, do_prefill=remote),
                 media_type="text/event-stream",
                 headers={
-                    "X-Request-Id": rid,
+                    "X-Request-Id": echo,
                     "Cache-Control": "no-cache",
                     "X-Accel-Buffering": "no",
                 },
@@ -635,7 +663,7 @@ class PDProxy:
         if do_prefill:
             params, err = await self._run_prefill(ctx)
             if err is not None:
-                return self._error_response(ctx.rid, err, 502, "BadGateway")
+                return self._error_response(ctx.echo_rid, err, 502, "BadGateway")
             if is_disconnected is not None and await is_disconnected():
                 # 2.4 step 3: no D leg; P's segment leaks until the lease.
                 ctx.log(
@@ -666,7 +694,7 @@ class PDProxy:
             content=resp.content,
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "application/json"),
-            headers={"X-Request-Id": ctx.rid},
+            headers={"X-Request-Id": ctx.echo_rid},
         )
 
     async def _decode_post(
@@ -681,14 +709,14 @@ class PDProxy:
         except httpx.TimeoutException as e:
             ctx.log(logging.ERROR, "decode_timeout", error=f"{type(e).__name__}")
             return self._error_response(
-                ctx.rid, "decode node timed out", 504, "GatewayTimeout"
+                ctx.echo_rid, "decode node timed out", 504, "GatewayTimeout"
             )
         except httpx.HTTPError as e:
             ctx.log(
                 logging.ERROR, "decode_transport_error", error=f"{type(e).__name__}:{e}"
             )
             return self._error_response(
-                ctx.rid,
+                ctx.echo_rid,
                 f"decode node unreachable: {type(e).__name__}",
                 502,
                 "BadGateway",
@@ -740,7 +768,7 @@ class PDProxy:
                     raise
                 params, err = p_task.result()
                 if err is not None:
-                    yield _sse_error_event(err, 502, "BadGateway", ctx.rid)
+                    yield _sse_error_event(err, 502, "BadGateway", ctx.echo_rid)
                     yield SSE_DONE
                     return
 
@@ -776,7 +804,7 @@ class PDProxy:
         except httpx.TimeoutException:
             ctx.log(logging.ERROR, "decode_timeout")
             yield _sse_error_event(
-                "decode node timed out", 504, "GatewayTimeout", ctx.rid
+                "decode node timed out", 504, "GatewayTimeout", ctx.echo_rid
             )
             yield SSE_DONE
             return
@@ -788,7 +816,7 @@ class PDProxy:
                 f"decode node unreachable: {type(e).__name__}",
                 502,
                 "BadGateway",
-                ctx.rid,
+                ctx.echo_rid,
             )
             yield SSE_DONE
             return
@@ -812,7 +840,7 @@ class PDProxy:
                 f"decode node returned HTTP {resp.status_code}: {snippet}",
                 resp.status_code,
                 "BadGateway" if resp.status_code >= 500 else "BadRequestError",
-                ctx.rid,
+                ctx.echo_rid,
             )
             yield SSE_DONE
             return
