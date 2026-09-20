@@ -70,6 +70,28 @@ def _dtype_name(t: torch.Tensor) -> str:
     return str(t.dtype).replace("torch.", "")
 
 
+def _check_gdn_snapshot(rec_snap, conv_snap) -> None:
+    """The GDN snapshot is the device-major pair the model's
+    ``_snapshot_gdn_scratch_host`` produces: ``rec`` ``[n_dev, L, Nv, Dk, Dv]`` and
+    ``taps`` ``[n_dev, L, K, C]``."""
+    if not (isinstance(rec_snap, torch.Tensor) and isinstance(conv_snap, torch.Tensor)):
+        raise TypeError(
+            "GDN snapshot must be a (rec, taps) tensor pair; got "
+            f"{type(rec_snap).__name__}, {type(conv_snap).__name__}"
+        )
+    if rec_snap.dim() != 5 or conv_snap.dim() != 4:
+        shapes = f"{tuple(rec_snap.shape)} and {tuple(conv_snap.shape)}"
+        raise ValueError(
+            "GDN snapshot: expected rec [n_dev, L, Nv, Dk, Dv] and "
+            f"taps [n_dev, L, K, C], got {shapes}"
+        )
+    if rec_snap.shape[:2] != conv_snap.shape[:2]:
+        raise ValueError(
+            "GDN snapshot: rec and taps disagree on [n_dev, L]: "
+            f"{tuple(rec_snap.shape[:2])} vs {tuple(conv_snap.shape[:2])}"
+        )
+
+
 def pack_payload(
     kv,
     rec_snap,
@@ -82,7 +104,10 @@ def pack_payload(
     buffer.  Returns ``(buffer, header)``; ``header`` describes every tensor (name,
     dtype, shape, offset). With ``out`` (a pooled buffer of at least the payload
     size) the bytes are written into ``out`` and ``out`` is returned; use
-    ``payload_nbytes`` to size it."""
+    ``payload_nbytes`` to size it. The GDN snapshot travels as two tensors,
+    ``gdn.rec`` ``[n_dev, L, Nv, Dk, Dv]`` and ``gdn.taps`` ``[n_dev, L, K, C]``
+    (device-major: one memcpy each here, one borrowed upload each on the decoder)."""
+    _check_gdn_snapshot(rec_snap, conv_snap)
     entries: list[dict[str, Any]] = []
     tensors: list[torch.Tensor] = []
     off = 0
@@ -106,10 +131,8 @@ def pack_payload(
     for li, (k, v) in enumerate(kv):
         add(f"kv.{li}.k", k)
         add(f"kv.{li}.v", v)
-    for li, rec in enumerate(rec_snap):
-        add(f"gdn.{li}.rec", rec)
-        for m, c in enumerate(conv_snap[li]):
-            add(f"gdn.{li}.conv{m}", c)
+    add("gdn.rec", rec_snap)
+    add("gdn.taps", conv_snap)
     if out is not None:
         if out.numel() < off:
             raise ValueError(f"pooled buffer {out.numel()} B < payload {off} B")
@@ -122,8 +145,8 @@ def pack_payload(
         "num_tokens": int(num_tokens),
         "n_blocks": int(n_blocks),
         "n_attn_layers": len(kv),
-        "n_gdn_layers": len(rec_snap),
-        "n_conv": len(conv_snap[0]) if conv_snap else 0,
+        "n_gdn_layers": int(rec_snap.shape[1]),
+        "n_conv": int(conv_snap.shape[2]),
         "nbytes": int(off),
         "tensors": entries,
     }
@@ -131,9 +154,10 @@ def pack_payload(
 
 
 def payload_nbytes(kv, rec_snap, conv_snap) -> int:
+    _check_gdn_snapshot(rec_snap, conv_snap)
     n = sum(k.numel() * k.element_size() + v.numel() * v.element_size() for k, v in kv)
-    n += sum(t.numel() * t.element_size() for t in rec_snap)
-    n += sum(c.numel() * c.element_size() for taps in conv_snap for c in taps)
+    n += rec_snap.numel() * rec_snap.element_size()
+    n += conv_snap.numel() * conv_snap.element_size()
     return n
 
 
@@ -190,7 +214,9 @@ def payload_digest(buf: torch.Tensor, nbytes: int) -> str:
 
 
 def unpack_payload(buf: torch.Tensor, header: dict[str, Any]):
-    """Inverse of ``pack_payload``: views into ``buf`` (no copies)."""
+    """Inverse of ``pack_payload``: views into ``buf`` (no copies). Returns
+    ``(kv, rec, taps)`` with the GDN pair in the device-major layout ``pack_payload``
+    documents."""
     by_name = {}
     for e in header["tensors"]:
         dt = getattr(torch, e["dtype"])
@@ -201,12 +227,14 @@ def unpack_payload(buf: torch.Tensor, header: dict[str, Any]):
         (by_name[f"kv.{li}.k"], by_name[f"kv.{li}.v"])
         for li in range(header["n_attn_layers"])
     ]
-    rec = [by_name[f"gdn.{li}.rec"] for li in range(header["n_gdn_layers"])]
-    conv = [
-        [by_name[f"gdn.{li}.conv{m}"] for m in range(header["n_conv"])]
-        for li in range(header["n_gdn_layers"])
-    ]
-    return kv, rec, conv
+    if "gdn.rec" not in by_name or "gdn.taps" not in by_name:
+        names = sorted(n for n in by_name if n.startswith("gdn."))
+        raise ValueError(
+            "payload GDN snapshot is not the device-major (gdn.rec, gdn.taps) pair; "
+            f"got {names[:4]}{'...' if len(names) > 4 else ''} (producer/consumer "
+            "version mismatch?)"
+        )
+    return kv, by_name["gdn.rec"], by_name["gdn.taps"]
 
 
 # --------------------------------------------------------------------------------------
@@ -751,6 +779,9 @@ class _WorkerSide:
                 )
                 continue
             rec_snap, conv_snap = cap
+            # the model reads snapshots into pooled host buffers; give them back once
+            # the bytes are in the staging buffer (or the request cannot be staged)
+            release_snapshot = getattr(self.model, "pd_gdn_snapshot_release", None)
             n_blocks = max(1, math.ceil(sr.num_tokens / self.c._block_size))
             block_ids = sr.block_ids[:n_blocks]
             if len(block_ids) < n_blocks:
@@ -760,6 +791,8 @@ class _WorkerSide:
                     len(sr.block_ids),
                     sr.num_tokens,
                 )
+                if release_snapshot is not None:
+                    release_snapshot(rec_snap, conv_snap)
                 continue
             kv = pd_transfer.export_kv_blocks(self.model, block_ids)
             t1 = time.perf_counter()
@@ -767,6 +800,8 @@ class _WorkerSide:
             buf, header = pack_payload(
                 kv, rec_snap, conv_snap, sr.num_tokens, n_blocks, out=pooled
             )
+            if release_snapshot is not None:
+                release_snapshot(rec_snap, conv_snap)
             addr, nbytes = buf.data_ptr(), int(header["nbytes"])
             with self._lock:
                 self._staged[sr.req_id] = _Staged(

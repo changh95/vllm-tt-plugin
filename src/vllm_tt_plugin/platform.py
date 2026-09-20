@@ -21,6 +21,7 @@ from vllm_tt_plugin.config import (
     require_tt_output_tokens_per_step,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_stable_decode_slots,
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
 )
@@ -1819,6 +1820,19 @@ class TTPlatform(Platform):
                 model_class.__module__,
             )
             vllm_config.scheduler_config.async_scheduling = False
+
+        # Models whose decode state lives in per-slot device buffers (e.g. a
+        # recurrent state indexed by batch row) declare `stable_decode_slots`.
+        # The worker then pins each request to one persistent-batch row for its
+        # lifetime (row == device slot, finished rows become pad rows) instead of
+        # condensing the batch, so it never has to move device state between
+        # slots. Stored on the config for the worker; see config.py.
+        stable_decode_slots = (
+            model_capabilities.get("stable_decode_slots", False)
+            if model_capabilities
+            else False
+        )
+        store_tt_stable_decode_slots(vllm_config, stable_decode_slots)
 
         # Single-execute models (Galaxy generators, GPT-OSS under user-row
         # sharding) run one shared device execute on the full mesh, so

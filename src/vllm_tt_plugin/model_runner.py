@@ -50,6 +50,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    get_tt_stable_decode_slots,
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.input_batch import (
@@ -60,6 +61,7 @@ from vllm_tt_plugin.input_batch import (
     apply_cached_req_state_update,
     build_cached_request_state,
     clone_torch_generator,
+    select_live_decode_rows,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
@@ -248,7 +250,10 @@ class TTModelRunner:
 
         # req_id -> device slot holding its per-slot state (GDN recurrent/conv, seed
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
-        # request's ROW, not its state.
+        # request's ROW, not its state. With ``InputBatch.stable_rows`` a request
+        # keeps its row for life, so this map is the identity (slot == row) and the
+        # decode remap is always None; the connector and the release hooks still
+        # read it, so it is kept populated.
         self._req_state_slot: dict[str, int] = {}
         self._pending_state_slot_settle: dict[str, int] | None = None
 
@@ -417,7 +422,18 @@ class TTModelRunner:
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
+                # A model with per-slot decode state keeps each request on one
+                # row (its device slot) for life, so ``_req_state_slot`` is the
+                # identity and no remap is ever sent (see ``InputBatch``).
+                stable_rows=get_tt_stable_decode_slots(self.vllm_config),
             )
+            if self.input_batch.stable_rows:
+                logger.info(
+                    "TTModelRunner: stable decode rows over %d slots (model declares "
+                    "stable_decode_slots): rows are device slots, the batch never "
+                    "condenses and no slot_remap is issued",
+                    max_num_reqs,
+                )
 
         # The block tables in the persistent input batch have
         # max_num_blocks_per_req = cdiv(max_model_len, block_size) but this
@@ -715,23 +731,37 @@ class TTModelRunner:
         # the request's slot from the ownership map before it is dropped.
         self._release_dead_state_slots(scheduler_output)
 
-        # Remove the unscheduled requests from the persistent batch.
-        # NOTE(woosuk): The unscheduled requests are either preempted requests
-        # or running requests that are not scheduled in this step. We remove
-        # them from the persistent batch but keep their cached states since
-        # they will be scheduled again sometime in the future.
-        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
-        cached_req_ids = self.input_batch.req_id_to_index.keys()
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
-        # NOTE(woosuk): The persistent batch optimization assumes that
-        # consecutive batches contain mostly the same requests. If batches
-        # have low request overlap (e.g., alternating between two distinct
-        # sets of requests), this optimization becomes very inefficient.
-        for req_id in unscheduled_req_ids:
-            req_index = self.input_batch.remove_request(req_id)
-            assert req_index is not None
-            removed_req_indices.append(req_index)
-            persistent_batch_layout_changed = True
+        if self.input_batch.stable_rows:
+            # A row is the request's device state slot, held for its whole
+            # lifetime: being left out of a step (as every running decode is on
+            # a prefill step) changes nothing. Only preemption frees the row --
+            # ``_preempt_request`` freed the KV and reset ``num_computed_tokens``,
+            # so the resume re-prefills from zero into whatever row it gets
+            # then -- in the same pass that ``_release_dead_state_slots`` dropped
+            # its slot claim above.
+            for req_id in scheduler_output.preempted_req_ids or ():
+                req_index = self.input_batch.remove_request(req_id)
+                if req_index is not None:
+                    removed_req_indices.append(req_index)
+                    persistent_batch_layout_changed = True
+        else:
+            # Remove the unscheduled requests from the persistent batch.
+            # NOTE(woosuk): The unscheduled requests are either preempted
+            # requests or running requests that are not scheduled in this step.
+            # We remove them from the persistent batch but keep their cached
+            # states since they will be scheduled again sometime in the future.
+            scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+            cached_req_ids = self.input_batch.req_id_to_index.keys()
+            unscheduled_req_ids = cached_req_ids - scheduled_req_ids
+            # NOTE(woosuk): The persistent batch optimization assumes that
+            # consecutive batches contain mostly the same requests. If batches
+            # have low request overlap (e.g., alternating between two distinct
+            # sets of requests), this optimization becomes very inefficient.
+            for req_id in unscheduled_req_ids:
+                req_index = self.input_batch.remove_request(req_id)
+                assert req_index is not None
+                removed_req_indices.append(req_index)
+                persistent_batch_layout_changed = True
 
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
@@ -771,12 +801,19 @@ class TTModelRunner:
         removed_req_indices = sorted(removed_req_indices, reverse=True)
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
-            # Fill the empty index, or append to the end.
-            req_index = removed_req_indices.pop() if removed_req_indices else None
+            # Fill the empty index, or append to the end. A stable-row batch
+            # picks its own lowest free row: a row freed in an earlier step is
+            # still a gap here, and this step's freed rows are only some of them.
+            req_index = (
+                None
+                if self.input_batch.stable_rows
+                else (removed_req_indices.pop() if removed_req_indices else None)
+            )
             self.input_batch.add_request(req_state, req_index)
             persistent_batch_layout_changed = True
 
-        # Condense the batched states if there are empty indices.
+        # Condense the batched states if there are empty indices (a no-op for
+        # stable rows, whose freed rows stay pad rows).
         if removed_req_indices:
             self.input_batch.condense(removed_req_indices)
             persistent_batch_layout_changed = True
@@ -1040,6 +1077,12 @@ class TTModelRunner:
         off-batch requests own. Prefers its own row (where it decodes), so the
         steady state moves nothing.
 
+        Stable rows: the slot IS the request's persistent-batch row, held for
+        its lifetime, so the map stays the identity and ``_decode_state_slot_remap``
+        never has anything to move. A live off-batch holder on that row is a
+        broken invariant (the batch placed two requests on one slot), not a
+        reason to pick another slot.
+
         Exhaustion is unreachable: holders and prefills are disjoint and both count
         against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
         stopped describing the device, and nothing on the host can recover it, so fail
@@ -1058,6 +1101,19 @@ class TTModelRunner:
             if req_id not in prefilling and req_id in self.requests
         }
         slots: list[int] = []
+        if self.input_batch.stable_rows:
+            for req_id in row_req_ids:
+                slot = int(self.input_batch.req_id_to_index[req_id])
+                if slot in held:
+                    raise RuntimeError(
+                        f"stable row {slot} of prefilling request {req_id!r} is the "
+                        "state slot of another live request: "
+                        f"map={self._req_state_slot}"
+                    )
+                held.add(slot)
+                self._req_state_slot[req_id] = slot
+                slots.append(slot)
+            return slots
         for row, req_id in enumerate(row_req_ids):
             if row not in held:
                 slot = row
@@ -1078,11 +1134,19 @@ class TTModelRunner:
             slots.append(slot)
         return slots
 
-    def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
+    def _decode_state_slot_remap(
+        self, row_req_ids: list[str | None]
+    ) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
         ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
         means identity, so skip it. The resulting ownership map remains pending
-        until ``decode_forward`` accepts the submission."""
+        until ``decode_forward`` accepts the submission.
+
+        Stable rows: ``row_req_ids`` spans every row (``None`` for pad rows) and
+        every live request owns exactly its row (``_alloc_prefill_state_slots``),
+        so the result is always the identity; a mismatch means the ownership map
+        stopped describing the device, and moving state to "fix" it would only
+        hide that, so it raises instead."""
         n_slots = self.tt_per_lane_max_num_seqs
         # More decode rows than slots means the batch cannot be described at all, so
         # truncating would just drop a request's state silently.
@@ -1091,6 +1155,19 @@ class TTModelRunner:
                 f"{len(row_req_ids)} decode row(s) exceed the {n_slots} device state "
                 "slots"
             )
+        if self.input_batch.stable_rows:
+            off_row = {
+                req_id: self._req_state_slot.get(req_id)
+                for row, req_id in enumerate(row_req_ids)
+                if req_id is not None and self._req_state_slot.get(req_id) != row
+            }
+            if off_row:
+                raise RuntimeError(
+                    "stable-row decode: request state is not at its row "
+                    f"(req -> slot) {off_row}; rows={row_req_ids}, "
+                    f"map={self._req_state_slot}"
+                )
+            return None
         want: list[int] = []
         for req_id in row_req_ids:
             slot = self._req_state_slot.get(req_id)
@@ -1208,55 +1285,6 @@ class TTModelRunner:
         batch_num_reqs = input_batch.num_reqs
         assert batch_num_reqs > 0
 
-        # The whole local batch.
-        req_indices = list(range(batch_num_reqs))
-        num_reqs = len(req_indices)
-
-        # Pad decode to the per-rank wire capacity, which outside lane mode is
-        # the whole engine capacity.
-        decode_pad_to = self.tt_per_lane_max_num_seqs
-
-        # Models that declare ``tt_supported_decode_batch_sizes`` (e.g. Gemma4)
-        # may pad only to the nearest supported size >= num_reqs, so B=1 is not
-        # forced through a B=max graph.
-        #
-        # A model must declare only the buckets it has actually captured a decode
-        # trace for on this instance: padding to a bucket with no captured trace
-        # leaves the device in an undefined state. There is deliberately no
-        # separate "warmed" list to fall back from -- a bucket that is not warmed
-        # is not supported.
-        decode_buckets = getattr(
-            getattr(self, "model", None), "tt_supported_decode_batch_sizes", None
-        )
-        if decode_buckets:
-            decode_pad_to = next(
-                (
-                    int(b)
-                    for b in sorted(int(x) for x in decode_buckets)
-                    if int(b) >= num_reqs and int(b) <= self.tt_per_lane_max_num_seqs
-                ),
-                self.tt_per_lane_max_num_seqs,
-            )
-
-        # Second dim of each block table is (ceil(max_model_len / block_size)).
-        # Slice/pad to ``self.max_num_blocks_per_req``: slicing handles
-        # over-wide tables when the total KV-cache limit is tighter than
-        # ``ceil(max_model_len / block_size)``, and padding handles
-        # under-wide ones from hybrid kv-cache groups whose native
-        # block-table widths differ after upstream page-size unification.
-        target_width = self.max_num_blocks_per_req
-        block_tables_per_group = input_batch.block_tables_for_rows(
-            req_indices, target_width
-        )
-
-        # Group-0 view kept on TTModelInput.block_tables for back-compat with
-        # the single-tensor consumers (decode_forward page_table arg). Hybrid
-        # models additionally consume ``block_tables_per_group`` via the
-        # ``page_tables_per_group`` kwarg in submit_prefill / submit_decode; the
-        # legacy generator_vllm wrappers strip it on the way through and raise
-        # loudly if the list has more than one entry.
-        block_tables = block_tables_per_group[0]
-
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -1316,6 +1344,68 @@ class TTModelRunner:
                     if r.req_id in pd_imported
                 ),
             )
+
+        # The rows this step is built over: the whole front-packed batch, or --
+        # for stable rows -- the scheduled requests' rows (prefill) / the rows
+        # through the highest live row with gaps as pad rows (decode).
+        req_indices = input_batch.step_rows(num_scheduled, is_prompt)
+        num_reqs = len(req_indices)
+
+        # Pad decode to the per-rank wire capacity, which outside lane mode is
+        # the whole engine capacity.
+        decode_pad_to = self.tt_per_lane_max_num_seqs
+
+        # Models that declare ``tt_supported_decode_batch_sizes`` (e.g. Gemma4)
+        # may pad only to the nearest supported size >= num_reqs, so B=1 is not
+        # forced through a B=max graph.
+        #
+        # A model must declare only the buckets it has actually captured a decode
+        # trace for on this instance: padding to a bucket with no captured trace
+        # leaves the device in an undefined state. There is deliberately no
+        # separate "warmed" list to fall back from -- a bucket that is not warmed
+        # is not supported.
+        decode_buckets = getattr(
+            getattr(self, "model", None), "tt_supported_decode_batch_sizes", None
+        )
+        if decode_buckets:
+            decode_pad_to = next(
+                (
+                    int(b)
+                    for b in sorted(int(x) for x in decode_buckets)
+                    if int(b) >= num_reqs and int(b) <= self.tt_per_lane_max_num_seqs
+                ),
+                self.tt_per_lane_max_num_seqs,
+            )
+
+        # Second dim of each block table is (ceil(max_model_len / block_size)).
+        # Slice/pad to ``self.max_num_blocks_per_req``: slicing handles
+        # over-wide tables when the total KV-cache limit is tighter than
+        # ``ceil(max_model_len / block_size)``, and padding handles
+        # under-wide ones from hybrid kv-cache groups whose native
+        # block-table widths differ after upstream page-size unification.
+        target_width = self.max_num_blocks_per_req
+        if input_batch.stable_rows and not is_prompt:
+            # Rows through the highest live row; a pad row's vLLM block table
+            # still lists its dead request's blocks, so zero the gaps.
+            block_tables_per_group = input_batch.slot_block_tables(
+                input_batch.occupied_rows(),
+                zero_gaps=True,
+                total=num_reqs,
+                width=target_width,
+            )
+        else:
+            block_tables_per_group = input_batch.block_tables_for_rows(
+                req_indices, target_width
+            )
+
+        # Group-0 view kept on TTModelInput.block_tables for back-compat with
+        # the single-tensor consumers (decode_forward page_table arg). Hybrid
+        # models additionally consume ``block_tables_per_group`` via the
+        # ``page_tables_per_group`` kwarg in submit_prefill / submit_decode; the
+        # legacy generator_vllm wrappers strip it on the way through and raise
+        # loudly if the list has more than one entry.
+        block_tables = block_tables_per_group[0]
+
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         if is_prompt:
@@ -1345,11 +1435,12 @@ class TTModelRunner:
             ]
             decode_layout_changed = False
         else:
-            positions_np = input_batch.num_tokens[req_indices] - 1
-            input_positions = torch.from_numpy(positions_np)
-            input_tokens = input_batch.token_ids_cpu_tensor[
-                req_indices, positions_np
-            ].view(-1, 1)
+            # Each row's last token at ``num_tokens - 1``; a stable-row gap is a
+            # pad row (token 0, position -1), the same shape as the tail padding
+            # below.
+            input_tokens, input_positions = input_batch.decode_tokens_and_positions(
+                req_indices
+            )
             prompt_lens = None
             # Record whether the padded decode layout changed since the previous
             # decode. The controller translates this lifecycle fact into either
@@ -1387,7 +1478,9 @@ class TTModelRunner:
                 # defaults. The persistent ``input_batch.sampling`` tail is
                 # never read, so there is nothing to default in place.
 
-        row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+        # ``None`` marks a stable-row pad row; every gap-tolerant consumer
+        # (grammar reorder, slot remap, output selection) skips it.
+        row_req_ids: list[str | None] = [input_batch._req_ids[i] for i in req_indices]
         if pd_imported and not is_prompt:
             # P/D diagnostics: what the imported request's first (decode) step feeds
             for row, rid in enumerate(row_req_ids):
@@ -1426,7 +1519,14 @@ class TTModelRunner:
         has_structured = has_structured_outputs(
             self.requests, scheduler_output, bitmask
         )
-        if bitmask is not None:
+        if bitmask is not None and input_batch.stable_rows:
+            # Stable rows sample on the host over the whole grid (see
+            # ``_host_sample_stable_rows``), so the mask is laid out by
+            # persistent row too.
+            bitmask = input_batch.slot_grammar_bitmask(
+                grammar_output, input_batch.max_num_reqs
+            )
+        elif bitmask is not None:
             # Using torch tensor instead of numpy array for consistency
             # because we need it as tensor for gather.
             bitmask = torch.from_numpy(bitmask)
@@ -1502,9 +1602,17 @@ class TTModelRunner:
         # (lane-local 0..num_reqs-1). ``req_indices`` is ``range(num_reqs)`` for
         # non-lane builds, so the remaps below are the identity there and only
         # do real work for lane builds.
+        #
+        # Stable rows are the exception: the per-row logits-processor state is
+        # keyed by persistent row over the whole grid, so the host sampler runs
+        # over the grid and rebuilds these from the batch at sample time
+        # (``_host_sample_stable_rows`` / ``build_merged_sampling_metadata``,
+        # as the lane batch does). Building step-local copies here would be
+        # dead work, and pre-advancing the generators would draw twice.
         allowed_token_ids_mask = None
         if (
-            not input_batch.no_allowed_token_ids
+            not input_batch.stable_rows
+            and not input_batch.no_allowed_token_ids
             and input_batch.sampling.allowed_token_ids_mask is not None
         ):
             # Gather already reindexes to lane-local rows.
@@ -1514,19 +1622,21 @@ class TTModelRunner:
 
         # Re-key the bad-words dict (req_index -> token id lists) to lane-local
         # rows. ``condense`` keeps the source keys aligned with active rows.
-        src_bad_words = input_batch.sampling.bad_words_token_ids
-        bad_words_token_ids = {
-            local: src_bad_words[g]
-            for local, g in enumerate(req_indices)
-            if g in src_bad_words
-        }
+        bad_words_token_ids: dict[int, list[list[int]]] = {}
+        if not input_batch.stable_rows:
+            src_bad_words = input_batch.sampling.bad_words_token_ids
+            bad_words_token_ids = {
+                local: src_bad_words[g]
+                for local, g in enumerate(req_indices)
+                if g in src_bad_words
+            }
 
         # Builtin/custom logits processors hold per-row state over the whole
         # local batch, so the host sampler reuses them as-is.
         logitsprocs = input_batch.sampling.logitsprocs
 
         generators: dict[int, torch.Generator] = {}
-        if not perform_device_sampling:
+        if not perform_device_sampling and not input_batch.stable_rows:
             generators = self._build_host_generators(
                 input_batch, req_indices, intermediate_prefill_mask
             )
@@ -1544,7 +1654,9 @@ class TTModelRunner:
         prefill_empty_slots = None
         slot_remap = None
         if is_prompt:
-            prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
+            prefill_empty_slots = self._alloc_prefill_state_slots(
+                cast(list[str], row_req_ids)
+            )
         else:
             # Advances the ownership map to the post-gather layout, so the returned
             # remap has to reach the device: dropping it would leave the map claiming
@@ -1887,6 +1999,11 @@ class TTModelRunner:
 
         if lane_total is not None:
             return self.lane_batch.slot_grammar_bitmask(grammar_output, lane_total)
+        if self.input_batch.stable_rows:
+            # Sampled over the grid by persistent row (``_host_sample_stable_rows``).
+            return self.input_batch.slot_grammar_bitmask(
+                grammar_output, self.input_batch.max_num_reqs
+            )
 
         assert model_input.row_req_ids is not None
 
@@ -1950,13 +2067,24 @@ class TTModelRunner:
         sampled_token_ids_per_dp, logprobs_per_dp = self._sample_sync_forward(fwd)
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
-        logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
 
         row_req_ids = fwd.model_input.row_req_ids
 
         assert row_req_ids is not None
 
         is_prefill = not fwd.is_decode and fwd.model_input.prompt_lens is not None
+
+        # Decode output rows: the front-packed batch rows (``req_ids=None`` below
+        # keeps the vectorized state write), or -- for a stable-row grid, built
+        # through its highest live row -- the live rows picked out of the pad rows.
+        decode_req_ids: list[str] | None = None
+        if not is_prefill and self.input_batch.stable_rows:
+            sampled_token_ids, logprobs_tensors, decode_req_ids = (
+                select_live_decode_rows(
+                    row_req_ids, sampled_token_ids, logprobs_tensors
+                )
+            )
+        logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
 
         if is_prefill:
             intermediate_mask = fwd.model_input.intermediate_prefill_mask
@@ -1971,22 +2099,28 @@ class TTModelRunner:
                     defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
+        if is_prefill:
+            # A prefill build never has pad rows.
+            prefill_req_ids = cast(list[str], row_req_ids)
+            if TTModelRunner._uses_async_scheduler(self):
+                return self.defer_state_apply_and_build_runner_output(
+                    sampled_token_ids, logprobs, req_ids=prefill_req_ids
+                )
+            return self.apply_and_build_runner_output(
+                sampled_token_ids, logprobs, req_ids=prefill_req_ids
+            )
         if TTModelRunner._uses_async_scheduler(self):
             return self.defer_state_apply_and_build_runner_output(
                 sampled_token_ids,
                 logprobs,
                 req_ids=(
-                    row_req_ids
-                    if is_prefill
-                    else list(self.input_batch.req_ids[: self.input_batch.num_reqs])
+                    decode_req_ids
+                    if decode_req_ids is not None
+                    else self.input_batch.live_req_ids()
                 ),
             )
         return self.apply_and_build_runner_output(
-            sampled_token_ids,
-            logprobs,
-            # Only a prefill build can filter rows. Decode rows are the front-packed
-            # batch rows, so it keeps the vectorized state write.
-            req_ids=row_req_ids if is_prefill else None,
+            sampled_token_ids, logprobs, req_ids=decode_req_ids
         )
 
     def _build_chunked_prefill_output(
@@ -2177,8 +2311,19 @@ class TTModelRunner:
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
-            # Store rope_deltas for each prefilled request
-            for i, req_id in enumerate(self.input_batch.req_ids):
+            # Store rope_deltas for each prefilled request, in forward-row order.
+            # ``row_req_ids`` rather than the batch: a stable-row batch keeps
+            # unscheduled decodes (and pad rows) resident during a prefill.
+            row_req_ids = model_input.row_req_ids
+            if row_req_ids is None:
+                raise RuntimeError(
+                    "request-specific RoPE needs the prefill build's row_req_ids"
+                )
+            for i, req_id in enumerate(row_req_ids):
+                if req_id is None:
+                    raise RuntimeError(
+                        f"prefill row {i} has no request: rows={row_req_ids}"
+                    )
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
             self.async_decode.note_prefill_submitted()
             return tt_out
@@ -2326,6 +2471,13 @@ class TTModelRunner:
                 )
                 next_token_ids = torch.zeros(sz, dtype=torch.int32)
                 logprobs_per_dp.append(None)
+            elif not perform_device_sampling and self.input_batch.stable_rows:
+                # Per-row sampling state is keyed by persistent row over the
+                # grid, so sample the grid and keep this step's rows.
+                next_token_ids, stable_logprobs = self._host_sample_stable_rows(
+                    tt_out, model_input, is_decode=is_decode, num_rows=sz
+                )
+                logprobs_per_dp.append(stable_logprobs)
             elif not perform_device_sampling:
                 logits = tt_out[rows, -1, :]
 
@@ -2501,6 +2653,80 @@ class TTModelRunner:
 
         return sampled_token_ids_per_dp, logprobs_per_dp
 
+    def _host_sample_stable_rows(
+        self,
+        tt_out: torch.Tensor,
+        model_input: TTModelInput,
+        *,
+        is_decode: bool,
+        num_rows: int,
+    ) -> tuple[torch.Tensor, LogprobsTensors | None]:
+        """Host-sample one stable-row step over the whole slot grid.
+
+        The builtin/custom logits processors (``min_p``, ``logit_bias``,
+        ``min_tokens``, ...) hold their state at each request's persistent row
+        and are sized to the grid (``InputBatch.sampling_rows``), so the logits
+        they are applied to must be the grid too: a prefill's ``[n, vocab]``
+        output is scattered onto the scheduled requests' rows, a decode's
+        (possibly bucketed) prefix is padded to the grid, the sampler runs once
+        over every row with metadata built by persistent row
+        (``build_merged_sampling_metadata``, which hands it only the scheduled
+        rows' generators), and this step's rows are picked out of the result.
+        Returns ``(sampled_token_ids[num_rows, k], logprobs)`` in forward-row
+        order, pad rows included for a decode.
+        """
+        batch = self.input_batch
+        row_req_ids = model_input.row_req_ids
+        if row_req_ids is None or len(row_req_ids) != num_rows:
+            raise RuntimeError(
+                "stable-row host sampling needs one request id per forward row: "
+                f"rows={num_rows} row_req_ids={row_req_ids}"
+            )
+        if is_decode:
+            # ``step_rows`` builds a decode over ``[0, highest live row]``.
+            step_rows = list(range(num_rows))
+        else:
+            # A prefill is sampled in the step that built it, so each row's
+            # request still sits where the input was gathered from.
+            step_rows = []
+            for req_id in row_req_ids:
+                row = batch.req_id_to_index.get(req_id) if req_id is not None else None
+                if row is None:
+                    raise RuntimeError(
+                        f"prefill row's request {req_id!r} has no row in the "
+                        f"stable-row batch: rows={batch.req_id_to_index}"
+                    )
+                step_rows.append(row)
+        total = batch.max_num_reqs
+        logits = batch.grid_host_logits(tt_out, step_rows, is_decode, total)
+        bitmask = model_input.grammar_bitmask[0]
+        if bitmask is not None:
+            if bitmask.shape[0] != total:
+                raise RuntimeError(
+                    "stable-row grammar bitmask must span the grid: "
+                    f"{bitmask.shape[0]} rows != {total}"
+                )
+            self.apply_grammar_bitmask(logits, bitmask)
+        intermediate_rows: list[int] = []
+        mask = model_input.intermediate_prefill_mask
+        if not is_decode and mask is not None:
+            intermediate_rows = [
+                row
+                for row, is_intermediate in zip(step_rows, mask.tolist(), strict=True)
+                if is_intermediate
+            ]
+        sampling_metadata = batch.build_merged_sampling_metadata(
+            step_rows, non_sampling_rows=intermediate_rows
+        )
+        sampler_output = self.host_sampler(
+            logits=logits, sampling_metadata=sampling_metadata
+        )
+        rows_t = torch.as_tensor(step_rows, dtype=torch.long)
+        return (
+            sampler_output.sampled_token_ids[rows_t],
+            batch.select_logprobs_rows(sampler_output.logprobs_tensors, step_rows),
+        )
+
     def apply_grammar_bitmask(
         self, logits: torch.Tensor, grammar_bitmask: torch.Tensor
     ) -> None:
@@ -2594,6 +2820,14 @@ class TTModelRunner:
         max_model_len = self.model_config.max_model_len
 
         if not use_captured_req_ids:
+            if self.input_batch.stable_rows:
+                # The vectorized write below assumes rows ``[0, num_reqs)``; a
+                # stable-row grid has gaps, so callers resolve rows by request.
+                raise RuntimeError(
+                    "stable-row batch: sampled tokens need explicit req_ids, rows "
+                    "are not front-packed "
+                    f"(occupied={self.input_batch.occupied_rows()})"
+                )
             rows = np.arange(num_reqs)
             start_idxs = self.input_batch.num_tokens[rows]
             end_idxs = start_idxs + num_out_tokens

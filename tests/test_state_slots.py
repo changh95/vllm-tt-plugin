@@ -26,9 +26,11 @@ def _runner(slots=SLOTS):
     """Fake runner: the state-slot map, the live-request set and the slot capacity."""
     return SimpleNamespace(
         tt_per_lane_max_num_seqs=slots,
+        input_batch=SimpleNamespace(stable_rows=False),
         _req_state_slot={},
         _pending_state_slot_settle=None,
         requests={},
+        _pd_after_update_states=lambda scheduler_output: None,
     )
 
 
@@ -221,7 +223,9 @@ def test_preemption_releases_its_state_slot():
     r.encoder_cache = {}
     r._decode_layout_changed_since_last_decode = False
     r.input_batch = SimpleNamespace(
-        req_id_to_index={"KEEP": 0}, refresh_logitsprocs=lambda: None
+        stable_rows=False,
+        req_id_to_index={"KEEP": 0},
+        refresh_logitsprocs=lambda: None,
     )
     r._release_dead_state_slots = lambda so: _release(
         r, finished=so.finished_req_ids, preempted=so.preempted_req_ids
@@ -293,3 +297,88 @@ def test_a_decoding_request_without_a_slot_raises():
     _prefill(r, ["A"])
     with pytest.raises(RuntimeError, match="'GHOST' has no device state slot"):
         _decode(r, ["A", "GHOST"])
+
+
+# --------------------------------------------------------------------------
+# Stable rows (``model_capabilities["stable_decode_slots"]``): a request's row IS
+# its slot for life, so the map is the identity and no remap is ever issued.
+# --------------------------------------------------------------------------
+
+
+def _stable_runner(slots=SLOTS):
+    """Fake runner over a stable-row batch: the batch's ``req_id_to_index`` is
+    the only placement the slot functions consult."""
+    r = _runner(slots)
+    r.input_batch = SimpleNamespace(stable_rows=True, req_id_to_index={})
+    return r
+
+
+def _place(r, req_id, row):
+    r.input_batch.req_id_to_index[req_id] = row
+
+
+def _grid(r, slots=SLOTS):
+    """Decode row layout of a stable-row batch: ``None`` at every pad row."""
+    by_row = {row: rid for rid, row in r.input_batch.req_id_to_index.items()}
+    return [by_row.get(row) for row in range(slots)]
+
+
+def _finish(r, *req_ids):
+    _release(r, finished=set(req_ids))
+    for req_id in req_ids:
+        r.requests.pop(req_id)
+        r.input_batch.req_id_to_index.pop(req_id)
+
+
+def test_stable_rows_never_issue_a_remap_across_finish_import_finish():
+    """The decode-instance churn pattern: finishes open holes in the middle of the
+    batch, imports fill the lowest hole, and every decode in between must be the
+    identity -- the GDN state never moves, so ``_remap_gdn_slots`` is never called."""
+    r = _stable_runner()
+    for row in range(SLOTS):
+        _place(r, f"r{row}", row)
+    assert _prefill(r, [f"r{row}" for row in range(SLOTS)]) == list(range(SLOTS))
+    assert _decode(r, _grid(r)) is None
+
+    # Two finishes leave pad rows 2 and 5 between live rows: no condense, no move.
+    _finish(r, "r2", "r5")
+    assert _grid(r)[2] is None and _grid(r)[5] is None
+    assert _decode(r, _grid(r)) is None, "pad rows in the middle are not a remap"
+
+    # A P/D import lands on the lowest free row and takes THAT slot, not the
+    # list-index slot 0 the front-packed policy would pick.
+    _place(r, "imp", 2)
+    assert _prefill(r, ["imp"]) == [2]
+    assert _decode(r, _grid(r)) is None
+
+    # Row 0 finishing does not pull anyone down either.
+    _finish(r, "r0")
+    assert _decode(r, _grid(r)) is None
+    assert r._req_state_slot == dict(r.input_batch.req_id_to_index), (
+        "the ownership map must stay the identity over the batch rows"
+    )
+    # Nothing was ever staged for settlement: there is no post-gather layout.
+    assert r._pending_state_slot_settle is None
+
+
+def test_stable_rows_refuse_a_row_another_live_request_still_owns():
+    """Two live requests on one slot is a broken batch, not a reason to pick a
+    different slot: state would silently be written over a decoding request."""
+    r = _stable_runner()
+    _place(r, "A", 3)
+    assert _prefill(r, ["A"]) == [3]
+    _place(r, "B", 3)  # the batch put B on A's row
+    with pytest.raises(RuntimeError, match="state slot of another live request"):
+        _prefill(r, ["B"])
+
+
+def test_stable_rows_decode_raises_instead_of_gathering_off_row_state():
+    """Under stable rows a request whose state is not at its row means the map
+    stopped describing the device; moving state to match would hide that."""
+    r = _stable_runner()
+    _place(r, "A", 0)
+    r._req_state_slot["A"] = 3
+    r.requests["A"] = None
+    with pytest.raises(RuntimeError, match="not at its row"):
+        _decode(r, _grid(r))
+    assert r._req_state_slot == {"A": 3}, "fails before writing"

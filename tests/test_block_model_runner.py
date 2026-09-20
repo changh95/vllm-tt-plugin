@@ -19,6 +19,7 @@ def _runner(width: int, *, num_tokens: int = 0, max_model_len: int = 32):
         SimpleNamespace(
             _output_tokens_per_step=width,
             input_batch=SimpleNamespace(
+                stable_rows=False,
                 num_reqs=1,
                 req_ids=["req-0"],
                 num_tokens=np.array([num_tokens], dtype=np.int32),
@@ -73,6 +74,7 @@ def _captured_runner(width: int, num_tokens: tuple[int, int]):
         _output_tokens_per_step=width,
         requests={"a": state_a, "b": state_b},
         input_batch=SimpleNamespace(
+            stable_rows=False,
             req_id_to_index={"a": 0, "b": 1},
             num_tokens=np.array(num_tokens, dtype=np.int32),
             token_ids_cpu=np.zeros((2, 32), dtype=np.int32),
@@ -154,6 +156,7 @@ def test_update_states_releases_model_request_before_removing_row(
 
     class InputBatchSpy:
         def __init__(self):
+            self.stable_rows = False
             self.req_id_to_index = {"req-0": 3}
 
         def remove_request(self, req_id):

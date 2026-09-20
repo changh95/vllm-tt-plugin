@@ -13,7 +13,7 @@ import torch
 import ttnn
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
 
-from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
+from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL, select_live_decode_rows
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.structured_output import has_structured_outputs
@@ -324,16 +324,14 @@ class TTAsyncDecodeController:
 
         ``req_ids`` is the merged output order: the lane path passes its
         scheduled slots' requests (sparse rows), so the index map is built from
-        their position. ``None`` takes the condensed front-packed batch, whose
-        ``req_id_to_index`` already equals that position map.
+        their position. ``None`` takes the batch's live rows in row order (the
+        whole condensed front-packed batch, or a stable-row grid minus its pad
+        rows); either way the index map is that position.
         """
         runner = self.runner
         if req_ids is None:
-            num_reqs = runner.input_batch.num_reqs
-            req_ids = list(runner.input_batch.req_ids[:num_reqs])
-            req_id_to_index = dict(runner.input_batch.req_id_to_index)
-        else:
-            req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
+            req_ids = runner.input_batch.live_req_ids()
+        req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
         return SubmittedStepContext(
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
@@ -659,6 +657,23 @@ class TTAsyncDecodeController:
             )
             sampled_token_ids = sampled_token_ids_per_dp[0]
             logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
+            if self.runner.input_batch.stable_rows:
+                # Built over rows ``[0, highest live row]`` with pad rows in the
+                # gaps; keep the live rows, which are the ``context.req_ids``
+                # captured at submit in the same row order.
+                row_req_ids = model_input.row_req_ids
+                if row_req_ids is None:
+                    raise RuntimeError("stable-row decode build lacks row_req_ids")
+                sampled_token_ids, logprobs_tensors, live_req_ids = (
+                    select_live_decode_rows(
+                        row_req_ids, sampled_token_ids, logprobs_tensors
+                    )
+                )
+                if live_req_ids != context.req_ids:
+                    raise RuntimeError(
+                        "stable-row decode rows drifted between submit and read: "
+                        f"submitted={context.req_ids} read={live_req_ids}"
+                    )
             logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
         return CompletedDecodeStep(
             sampled_token_ids=sampled_token_ids,
@@ -845,19 +860,21 @@ class TTAsyncDecodeController:
 
         enc_dec_kwargs: dict[str, Any] = {}
         if runner.request_specific_rope:
+            # Live rows in row order: the front-packed batch, or a stable-row
+            # grid without its pad rows (which have no request to read).
+            live_req_ids = runner.input_batch.live_req_ids()
             if model_input.decode_layout_changed or any(
-                req_id not in runner.previous_req_ids
-                for req_id in runner.input_batch.req_ids
+                req_id not in runner.previous_req_ids for req_id in live_req_ids
             ):
                 enc_dec_kwargs = {
                     "rope_deltas_all_users": [
                         runner.requests[req_id].mrope_position_delta
-                        for req_id in runner.input_batch.req_ids
+                        for req_id in live_req_ids
                     ]
                 }
             else:
                 enc_dec_kwargs = {"rope_deltas_all_users": None}
-            runner.previous_req_ids = set(runner.input_batch.req_ids)
+            runner.previous_req_ids = set(live_req_ids)
 
         enable_trace = runner.trace_mode in ["all", "decode_only"]
         tt_out = runner.model.decode_forward(

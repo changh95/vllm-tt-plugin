@@ -260,6 +260,7 @@ def test_state_slot_ownership_commits_only_after_accepted_decode():
         kv_caches=object(),
         request_specific_rope=False,
         tt_per_lane_max_num_seqs=2,
+        input_batch=SimpleNamespace(stable_rows=False),
         _req_state_slot={"a": 1, "b": 0},
         _pending_state_slot_settle=None,
         _decode_layout_changed_since_last_decode=True,
@@ -326,6 +327,7 @@ def test_prefill_layout_trace_and_capability_force_input_reload():
 def test_transition_applies_drained_token_before_host_authoritative_reload():
     request_state = SimpleNamespace(output_token_ids=[])
     input_batch = SimpleNamespace(
+        stable_rows=False,
         req_id_to_index={"request": 0},
         num_tokens=np.array([3], dtype=np.int32),
         token_ids_cpu=np.zeros((1, 8), dtype=np.int32),

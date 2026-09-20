@@ -39,6 +39,7 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
 # get_tt_data_parallel_size.
 _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 _OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
+_STABLE_DECODE_SLOTS_KEY = "_tt_stable_decode_slots"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -120,6 +121,38 @@ def store_tt_output_tokens_per_step(
         additional = {}
         vllm_config.additional_config = additional
     additional[_OUTPUT_TOKENS_PER_STEP_KEY] = output_tokens_per_step
+
+
+def get_tt_stable_decode_slots(vllm_config: "VllmConfig") -> bool:
+    """Whether the persistent batch pins each request to one row for its lifetime.
+
+    Resolved from ``model_capabilities["stable_decode_slots"]`` by
+    ``TTPlatform.check_and_update_config`` and stored on the serializable config
+    (see ``store_tt_stable_decode_slots``). Default ``False``: the front-packed
+    batch that condenses rows on every finish.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_STABLE_DECODE_SLOTS_KEY, False))
+
+
+def store_tt_stable_decode_slots(vllm_config: "VllmConfig", enabled: bool) -> None:
+    """Record whether the model keeps per-slot decode state on the config.
+
+    A model whose decode state lives in per-slot device buffers (for example a
+    recurrent state indexed by batch row) declares ``stable_decode_slots``; the
+    worker then builds a stable-row ``InputBatch`` whose rows are the device
+    slots, so no slot remap is ever needed. Written into ``additional_config``
+    like ``store_tt_lane_count`` so the worker subprocess observes it.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            f"model_capabilities['stable_decode_slots'] must be a bool, got {enabled!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_STABLE_DECODE_SLOTS_KEY] = enabled
 
 
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:

@@ -74,7 +74,9 @@ def test_sample_tokens_pops_fifo_and_passes_grammar_through():
         seen.append((tag, grammar_output))
         return tag
 
-    runner = SimpleNamespace(_pending_samples=deque())
+    runner = SimpleNamespace(
+        _pending_samples=deque(), _pd_attach_output=lambda out: out
+    )
     runner._pending_samples.append(partial(finisher, "first"))
     runner._pending_samples.append(partial(finisher, "second"))
 
@@ -125,7 +127,7 @@ def test_reorder_grammar_bitmask_lane_path_delegates_to_slot_reorder():
 def test_reorder_grammar_bitmask_non_dp_path_uses_front_packed_reorder():
     """Non-DP (``lane_total=None``) reorders against the build's own rows."""
     # Two requests, only req-1 structured; batch_length comes from input_tokens.
-    runner = SimpleNamespace()
+    runner = SimpleNamespace(input_batch=SimpleNamespace(stable_rows=False))
     grammar = GrammarOutput(
         structured_output_request_ids=["req-1"],
         grammar_bitmask=np.array([[5, 6]], dtype=np.int32),
@@ -146,13 +148,43 @@ def test_reorder_grammar_bitmask_non_dp_path_uses_front_packed_reorder():
     assert torch.all(result[0] == -1)
 
 
+def test_reorder_grammar_bitmask_stable_rows_spans_the_grid_by_persistent_row():
+    """Stable rows host-sample over the whole slot grid, so the mask is laid out
+    by persistent row and sized to the grid, not to the forward's rows: a
+    prefill of req-2 alone at row 2 still yields a 4-row mask with its
+    bitmask at row 2."""
+    calls: list[tuple] = []
+    sentinel = torch.tensor([[7, 7]] * 4, dtype=torch.int32)
+
+    def slot_grammar_bitmask(grammar_output, batch_length):
+        calls.append((grammar_output, batch_length))
+        return sentinel
+
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            stable_rows=True, max_num_reqs=4, slot_grammar_bitmask=slot_grammar_bitmask
+        )
+    )
+    grammar = _grammar(1)
+    model_input = _model_input(
+        input_tokens=torch.zeros((1, 1), dtype=torch.int32), row_req_ids=["req-2"]
+    )
+
+    result = TTModelRunner._reorder_grammar_bitmask(
+        runner, grammar, model_input, lane_total=None
+    )
+
+    assert result is sentinel
+    assert calls == [(grammar, 4)]
+
+
 def test_reorder_grammar_bitmask_non_dp_path_ignores_filtered_rows():
     """A prefill build drops mixed-in decode rows; the reorder must follow the
     forward's rows, not the persistent batch's.
     """
     # Persistent batch req-0..req-3, forward kept req-0 and req-2. Under a
     # ``range(num_reqs)`` reorder req-2 lands past the end of a 2-row tensor.
-    runner = SimpleNamespace()
+    runner = SimpleNamespace(input_batch=SimpleNamespace(stable_rows=False))
     grammar = GrammarOutput(
         structured_output_request_ids=["req-1", "req-2"],
         grammar_bitmask=np.array([[1, 2], [5, 6]], dtype=np.int32),
@@ -270,6 +302,7 @@ def test_finish_front_packed_sync_applies_grammar_before_sampling():
         return SimpleNamespace(sampled=sampled, logprobs=logprobs)
 
     runner = SimpleNamespace(
+        input_batch=SimpleNamespace(stable_rows=False),
         _apply_grammar_to_input=apply_grammar,
         _sample_sync_forward=sample_sync,
         apply_and_build_runner_output=build_output,
@@ -303,7 +336,9 @@ def test_v0_sync_decode_defers_state_under_upstream_async_scheduler():
         # Contract-v0 standard DP disables device async decode, but the engine
         # still uses AsyncScheduler placeholder accounting.
         async_decode_scheduling=False,
-        input_batch=SimpleNamespace(req_ids=["req-0"], num_reqs=1),
+        input_batch=SimpleNamespace(
+            stable_rows=False, req_ids=["req-0"], live_req_ids=lambda: ["req-0"]
+        ),
         _apply_grammar_to_input=apply_grammar,
         _sample_sync_forward=sample_sync,
         defer_state_apply_and_build_runner_output=defer_output,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -113,6 +114,28 @@ def clone_torch_generator(generator: torch.Generator) -> torch.Generator:
     return clone
 
 
+def select_live_decode_rows(
+    row_req_ids: list[str | None],
+    sampled_token_ids: torch.Tensor,
+    logprobs_tensors: LogprobsTensors | None,
+) -> tuple[torch.Tensor, LogprobsTensors | None, list[str]]:
+    """Pick the live rows out of a stable-row decode result.
+
+    A stable-row decode is built over the rows ``[0, highest live row]`` of
+    the slot grid (``row_req_ids[i] is None`` marks a pad row, whose sampled
+    token is greedy garbage). Returns the sampled tokens, logprobs and request ids of
+    the live rows, in row order, ready for the per-request state apply.
+    """
+    rows = [row for row, req_id in enumerate(row_req_ids) if req_id is not None]
+    req_ids = [cast(str, row_req_ids[row]) for row in rows]
+    rows_t = torch.as_tensor(rows, dtype=torch.long)
+    return (
+        sampled_token_ids[rows_t],
+        InputBatch.select_logprobs_rows(logprobs_tensors, rows),
+        req_ids,
+    )
+
+
 class SamplingInputBatch:
     # Default values for padding sampling parameters in decode mode.
     DEFAULTS = {
@@ -198,7 +221,27 @@ class SamplingInputBatch:
 
 
 class InputBatch:
-    """Persistent input batch, based on InputBatch for GPU/TPU backends."""
+    """Persistent input batch, based on InputBatch for GPU/TPU backends.
+
+    Two row layouts:
+
+    * Front-packed (``stable_rows=False``, the default): live requests occupy
+      rows ``[0, num_reqs)``. ``remove_request`` leaves a hole that ``condense``
+      fills by moving the highest live row down, so a request's row changes
+      over its lifetime and per-slot device state has to be moved with it
+      (``TTModelRunner._decode_state_slot_remap``).
+    * Stable rows (``stable_rows=True``): the rows are a fixed slot grid of
+      ``max_num_reqs`` and **a request's row is its device state slot** for its
+      whole lifetime. ``remove_request`` turns the row into a pad row (token 0,
+      position -1, empty page table, neutral sampling defaults) that the model
+      already tolerates as decode padding, ``condense`` is a no-op, and a new
+      request takes the lowest free row. Live rows are therefore not
+      front-packed: consumers index by ``occupied_rows()`` / ``live_req_ids()``
+      and the per-row sampling state spans every row (``sampling_rows``).
+      Selected by ``model_capabilities["stable_decode_slots"]`` (see
+      ``config.get_tt_stable_decode_slots``); ``TTLaneInputBatch`` always uses
+      it, since a lane slot is likewise a device slot.
+    """
 
     def __init__(
         self,
@@ -211,14 +254,18 @@ class InputBatch:
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
         output_tokens_per_step: int = 1,
+        stable_rows: bool = False,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.vocab_size = vocab_size
         self.disable_logprobs = disable_logprobs
         self.output_tokens_per_step = output_tokens_per_step
+        self.stable_rows = stable_rows
 
-        self._req_ids: list[str | None] = []
+        # Stable rows are a fixed slot grid: pre-size so a request can occupy
+        # any row, with gaps, instead of always appending at ``num_reqs``.
+        self._req_ids: list[str | None] = [None] * max_num_reqs if stable_rows else []
         self.req_id_to_index: dict[str, int] = {}
         # Sampling fast-path bookkeeping (track by req_id like GPUInputBatch).
         # These are used to answer common "batch-wide" queries in O(1).
@@ -252,15 +299,18 @@ class InputBatch:
             max_num_blocks=[cdiv(max_model_len, bs) for bs in block_sizes],
         )
 
-        self.req_output_token_ids: list[list[int] | None] = []
+        self.req_output_token_ids: list[list[int] | None] = (
+            [None] * max_num_reqs if stable_rows else []
+        )
 
         # Sampling-related.
         self.sampling = SamplingInputBatch(max_num_reqs, logitsprocs=logitsprocs)
 
         # Condense-move remap: remap[i] = j means slot i's data came from slot j.
-        # ``condense`` is the only writer and ``TTLaneInputBatch`` overrides it to a
-        # no-op, so ``pop_slot_remap``'s one caller always reads the identity; the
-        # non-lane path resets it and uses ``_req_state_slot``, which subsumes it.
+        # ``condense`` is the only writer and is a no-op for stable rows, so
+        # ``pop_slot_remap``'s one caller (the lane decode build) always reads the
+        # identity; the front-packed path resets it and uses ``_req_state_slot``,
+        # which subsumes it.
         self._slot_remap = torch.arange(max_num_reqs, dtype=torch.int32)
 
     def reset_slot_remap(self) -> None:
@@ -284,6 +334,72 @@ class InputBatch:
         return len(self.req_id_to_index)
 
     @property
+    def sampling_rows(self) -> int:
+        """Rows the per-row sampling state (logits processors, logprobs) spans:
+        the front-packed prefix ``[0, num_reqs)``, or every row of a stable
+        grid, whose live rows can sit anywhere and whose pad rows carry neutral
+        defaults."""
+        return self.max_num_reqs if self.stable_rows else self.num_reqs
+
+    def occupied_rows(self) -> list[int]:
+        """Rows holding a live request, ascending. For a front-packed batch this
+        is ``range(num_reqs)`` outside a state update."""
+        return [row for row, rid in enumerate(self._req_ids) if rid is not None]
+
+    def live_req_ids(self) -> list[str]:
+        """Request ids of the live rows, in row order."""
+        return [rid for rid in self._req_ids if rid is not None]
+
+    def first_free_row(self) -> int:
+        """Lowest row holding no request (stable rows), raising when full."""
+        for row, rid in enumerate(self._req_ids):
+            if rid is None:
+                return row
+        raise RuntimeError(
+            f"no free row in the stable-row batch: {self.num_reqs} live requests "
+            f"fill all {self.max_num_reqs} rows; admission is the scheduler's job"
+        )
+
+    def step_rows(self, scheduled_req_ids: Iterable[str], is_prompt: bool) -> list[int]:
+        """Persistent rows this step's model input is built over, ascending.
+
+        Front-packed: the whole batch ``[0, num_reqs)`` -- ``_update_states``
+        evicted every request the step did not schedule, so the batch IS the
+        step. Stable rows keep unscheduled requests resident (their rows are
+        their device slots), so a prefill covers only the scheduled requests'
+        rows, and a decode covers the rows ``[0, highest live row]`` with gaps
+        as pad rows: that prefix is the width a decode-bucketing model reads
+        back (its bucket covers the highest live row, not the grid), so it is
+        the most rows the runner may index in the output; the rows above it are
+        pad rows the runner's tail padding fills. The device advances every row
+        it is given, so a resident request the scheduler left out of a decode
+        step would desync and is an error.
+        """
+        if not self.stable_rows:
+            return list(range(self.num_reqs))
+        scheduled_rows: list[int] = []
+        for req_id in scheduled_req_ids:
+            row = self.req_id_to_index.get(req_id)
+            if row is None:
+                raise RuntimeError(
+                    f"scheduled request {req_id!r} has no row in the stable-row "
+                    f"batch: rows={self.req_id_to_index}"
+                )
+            scheduled_rows.append(row)
+        scheduled_rows.sort()
+        if is_prompt:
+            return scheduled_rows
+        occupied = self.occupied_rows()
+        unscheduled = sorted(set(occupied) - set(scheduled_rows))
+        if unscheduled:
+            raise RuntimeError(
+                "decode step leaves resident request(s) unscheduled; the device "
+                "would advance their rows anyway: "
+                f"rows={unscheduled} ids={[self._req_ids[r] for r in unscheduled]}"
+            )
+        return list(range(occupied[-1] + 1)) if occupied else []
+
+    @property
     def all_greedy(self) -> bool:
         """True iff all active requests are greedy (temperature == 0.0)."""
         return len(self.random_reqs) == 0
@@ -303,12 +419,28 @@ class InputBatch:
         req_index: int | None = None,
     ) -> None:
         if req_index is None:
-            req_index = self.num_reqs
+            req_index = self.first_free_row() if self.stable_rows else self.num_reqs
         assert req_index < self.max_num_reqs, (
             f"req_index={req_index} >= max_num_reqs={self.max_num_reqs}"
         )
 
         req_id = request.req_id
+        if self.stable_rows:
+            occupant = self._req_ids[req_index]
+            if occupant is not None and occupant != req_id:
+                raise ValueError(
+                    f"row {req_index} is already occupied by {occupant!r}; cannot "
+                    f"place {req_id!r} there (stable rows never move a request)"
+                )
+            # If this row was freed earlier in the same step it is still in the
+            # logitsproc batch-update ``removed`` list. Drop it so the reused row
+            # is recorded only as an ``added`` update, not both -- mirroring
+            # upstream ``gpu_input_batch._register_add_request``'s
+            # ``pop_removed()`` so the builtin logits processors do not first set
+            # then clear the new request's per-row state.
+            builder = self.sampling.batch_update_builder
+            if req_index in builder._removed:
+                builder._removed.remove(req_index)
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
             self.req_output_token_ids.append(request.output_token_ids)
@@ -462,7 +594,12 @@ class InputBatch:
             )
 
     def remove_request(self, req_id: str) -> int | None:
-        """This method must always be followed by a call to condense()."""
+        """Free a request's row.
+
+        Front-packed: leaves a hole, so this must always be followed by a call
+        to ``condense()``. Stable rows: the row becomes a pad row in place
+        (``_reset_slot``) and ``condense`` is a no-op.
+        """
 
         req_index = self.req_id_to_index.pop(req_id, None)
         if req_index is None:
@@ -486,14 +623,38 @@ class InputBatch:
         if self.sampling.allowed_token_ids_mask is not None:
             self.sampling.allowed_token_ids_mask[req_index] = False
 
+        if self.stable_rows:
+            self._reset_slot(req_index)
         return req_index
+
+    def _reset_slot(self, row: int) -> None:
+        """Turn a freed stable row into a pad row: ``num_tokens == 0`` makes
+        ``decode_tokens_and_positions`` emit token 0 at position -1, and the
+        neutral sampling defaults keep the row from perturbing the batch-wide
+        sampling flags (``all_greedy`` / ``no_penalties``) or sampling an
+        invalid value. ``remove_request`` already cleared the generator,
+        bad-words and allowed-token-ids entries."""
+        sampling = self.sampling
+        for name, default in sampling.DEFAULTS.items():
+            getattr(sampling, name)[row] = default
+        self.num_tokens[row] = 0
+        self.num_prompt_tokens[row] = 0
+        self.num_computed_tokens_cpu[row] = 0
 
     def condense(self, empty_req_indices: list[int]) -> None:
         """Move non-empty requests down into lower, empty indices.
 
+        No-op for stable rows: a request's row is its device state slot, so
+        moving the highest live request into a hole would shift its state (and,
+        in lane mode, cross a lane boundary). Freed rows stay pad rows, reused
+        in place by later requests, so live requests never move and the seed
+        manager's / GDN ``slot_remap`` stays the identity.
+
         Args:
             empty_req_indices: empty batch indices, sorted descending.
         """
+        if self.stable_rows:
+            return
         num_reqs = self.num_reqs
         if num_reqs == 0:
             # The batched states are empty.
@@ -585,10 +746,16 @@ class InputBatch:
 
     @property
     def max_num_logprobs(self) -> int | None:
-        """Returns the max logprobs across requests, or None if none need logprobs."""
+        """Returns the max logprobs across requests, or None if none need logprobs.
+
+        Computed over ``sampling_rows``: for stable rows that is every row, since
+        live rows are not front-packed; pad rows carry the
+        ``LOGPROBS_NONE_SENTINEL`` default (the minimum), so the max over all
+        rows equals the max over the live rows.
+        """
         if self.num_reqs == 0:
             return None
-        max_val = int(self.sampling.num_logprobs[: self.num_reqs].max().item())
+        max_val = int(self.sampling.num_logprobs[: self.sampling_rows].max().item())
         if max_val < 0:
             return None
         return max_val
@@ -599,12 +766,20 @@ class InputBatch:
         return len(self.sampling.has_allowed_token_ids) == 0
 
     def refresh_logitsprocs(self) -> None:
-        """Update logits processors with batch state changes."""
+        """Update logits processors with batch state changes.
+
+        The batch size handed to the processors is ``sampling_rows``: for stable
+        rows every processor's per-row state spans the whole slot grid, matching
+        the grid-wide logits the runner's host sampler runs over
+        (``TTModelRunner._host_sample_stable_rows``).
+        """
 
         # For non-pooling models - generate and apply logitsprocs update;
         # reset batch update tracking.
         # Update sampling metadata if batch state is changed.
-        batch_update = self.sampling.batch_update_builder.get_and_reset(self.num_reqs)
+        batch_update = self.sampling.batch_update_builder.get_and_reset(
+            self.sampling_rows
+        )
         for logit_proc in self.sampling.logitsprocs.all:
             logit_proc.update_state(batch_update)
 
@@ -709,303 +884,90 @@ class InputBatch:
             out.append(bt_cpu)
         return out
 
-    def advance_generators(self, req_indices: list[int] | None = None) -> None:
-        # This relies on the fact, that for a torch all_gather_object,
-        # the local object is also copied,
-        # so the original object is not modified.
-        # Otherwise, the generator at local_rank 0
-        # would get out of sync with the others.
-        #
-        # ``req_indices`` restricts advancement to the build's own requests.
-        # Each generator belongs to a single request, so lane-DP (which calls
-        # this once per lane) passes the lane's indices to advance every
-        # generator exactly once per step rather than once per lane. ``None``
-        # advances all generators (whole-batch build, called once per step).
-        if req_indices is None:
-            generators = list(self.sampling.generators.values())
-        else:
-            generators = [
-                self.sampling.generators[i]
-                for i in req_indices
-                if i in self.sampling.generators
-            ]
-        for generator in generators:
-            # Sample once from the generator to advance its state.
-            torch.rand(1, generator=generator)
+    def slot_block_tables(
+        self, rows: list[int], zero_gaps: bool, total: int, width: int
+    ) -> list[torch.Tensor]:
+        """Per-group block tables for ``rows`` (one row per slot), each padded
+        to ``width`` (``max_num_blocks_per_req``). When ``zero_gaps`` is set,
+        rows of ``range(total)`` not in ``rows`` are zeroed: a freed row's
+        vLLM block table still lists the dead request's blocks, and a pad row
+        must carry none."""
+        occupied = set(rows)
+        sel = list(range(total)) if zero_gaps else rows
+        out = self.block_tables_for_rows(sel, width)
+        if zero_gaps and len(occupied) < total:
+            gap = torch.ones(total, dtype=torch.bool)
+            gap[list(occupied)] = False
+            for bt_cpu in out:
+                bt_cpu[gap] = 0
+        return [bt.contiguous() for bt in out]
 
+    def decode_tokens_and_positions(
+        self, rows: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Last token and its position per row: ``[n, 1]`` and ``[n]`` int32.
 
-class TTLaneInputBatch(InputBatch):
-    """Persistent input batch for single-process multi-lane (lane-DP) execution.
+        A row holding no request (``num_tokens == 0``) is a pad row and reads
+        token 0 at position -1: the paged-KV update and SDPA decode kernels skip
+        a user at position -1 and the seed manager deactivates it, so the row
+        is inert on device.
+        """
+        idx = np.asarray(rows, dtype=np.int64)
+        num_tokens = self.num_tokens[idx]
+        positions = (num_tokens - 1).astype(np.int32)
+        tokens = np.zeros((len(rows), 1), dtype=np.int32)
+        live = num_tokens > 0
+        tokens[live, 0] = self.token_ids_cpu[idx[live], positions[live]]
+        return torch.from_numpy(tokens), torch.from_numpy(positions)
 
-    One engine process drives ``num_lanes`` data-parallel KV-cache replicas
-    ("lanes") that execute in lockstep against a single gathered device batch.
-    This batch owns the lane layout so the model runner does not: it lays the
-    persistent rows out as ``num_lanes`` contiguous chunks of ``per_lane`` rows
-    and binds each request to a stable row for its whole lifetime.
-
-    Layout: lane ``l`` owns rows ``[l * per_lane, (l + 1) * per_lane)``. A
-    request placed at lane-local slot ``s`` lives at persistent row
-    ``l * per_lane + s``. **That persistent row IS the request's device decode
-    slot**, so the merged device input is the batch's own row layout -- no
-    scatter, and no separate ``req_id -> slot`` map. ``max_num_reqs`` is
-    ``num_lanes * per_lane`` (the global ``max_num_seqs`` in lane mode).
-
-    Stable slots: a request never moves once placed. Removing a request leaves
-    its row as an empty gap to be reused by a later request in the same lane.
-    There is no condense (``condense`` is a no-op): keeping every live request
-    pinned to its row keeps the on-device per-slot seed RNG correct and makes
-    the seed manager's ``slot_remap`` the identity. Gaps are reset to neutral
-    sampling defaults so they cannot perturb batch-wide flags (``all_greedy`` /
-    ``no_penalties``) or sample an invalid value.
-
-    Merged host sampling: because rows are the device slots and gaps carry
-    neutral defaults, the runner samples the whole ``max_num_reqs`` slot batch
-    in one call against one :class:`SamplingMetadata` built here over every row
-    (``build_merged_sampling_metadata``). The builtin/custom logits processors
-    keep per-row state over this full slot batch (``refresh_logitsprocs`` passes
-    ``max_num_reqs`` as the batch size), exactly like a normal single-engine
-    vLLM batch -- so there is no per-lane slicing, no per-lane generator/penalty
-    remap, and custom logits processors work unchanged. Pad rows sample greedy
-    garbage that the runner drops when reading back the occupied rows.
-    """
-
-    def __init__(
-        self,
-        num_lanes: int,
-        per_lane: int,
-        max_model_len: int,
-        max_num_batched_tokens: int,
-        vocab_size: int,
-        block_sizes: list[int],
-        kernel_block_sizes: list[int],
-        logitsprocs: LogitsProcessors | None = None,
-        disable_logprobs: bool = False,
-        output_tokens_per_step: int = 1,
-    ):
-        if num_lanes < 1 or per_lane < 1:
-            raise ValueError(
-                f"num_lanes and per_lane must be >= 1, got num_lanes={num_lanes}, "
-                f"per_lane={per_lane}"
-            )
-        self.num_lanes = num_lanes
-        self.per_lane = per_lane
-        super().__init__(
-            max_num_reqs=num_lanes * per_lane,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=max_num_batched_tokens,
-            vocab_size=vocab_size,
-            block_sizes=block_sizes,
-            kernel_block_sizes=kernel_block_sizes,
-            logitsprocs=logitsprocs,
-            disable_logprobs=disable_logprobs,
-            output_tokens_per_step=output_tokens_per_step,
+    @staticmethod
+    def select_logprobs_rows(
+        logprobs_tensors: LogprobsTensors | None, rows: list[int]
+    ) -> LogprobsTensors | None:
+        """Keep ``rows`` of a full-width per-row logprobs result, in order."""
+        if logprobs_tensors is None:
+            return None
+        rows_t = torch.as_tensor(rows, dtype=torch.long)
+        return LogprobsTensors(
+            logprob_token_ids=logprobs_tensors.logprob_token_ids[rows_t],
+            logprobs=logprobs_tensors.logprobs[rows_t],
+            selected_token_ranks=logprobs_tensors.selected_token_ranks[rows_t],
         )
-        # Rows are a fixed slot grid (lane-chunked), not a front-packed list:
-        # pre-size so a request can occupy any slot in its lane's chunk, with
-        # gaps, instead of always appending at ``num_reqs``.
-        self._req_ids = [None] * self.max_num_reqs
-        self.req_output_token_ids = [None] * self.max_num_reqs
 
-    # ------------------------------------------------------------------
-    # Lane geometry / membership
-    # ------------------------------------------------------------------
+    def grid_host_logits(
+        self, tt_out: Any, scheduled_rows: list[int], is_decode: bool, total: int
+    ) -> torch.Tensor:
+        """Full ``[total, vocab]`` slot logits for host sampling.
 
-    def lane_of(self, req_id: str) -> int:
-        """Return the lane a request is bound to.
-
-        Derived from the request's row: lane ``l`` owns the contiguous chunk
-        ``[l * per_lane, (l + 1) * per_lane)``, so the row alone determines the
-        lane and no separate ``req_id -> lane`` map is needed.
+        Decode logits are slot-indexed (row i is slot i) and cover at least the
+        rows the step was built over: a decode-bucketing model returns only the
+        prefix through the highest live row, so the tail is zero-padded to the
+        grid. Prefill logits cover only the scheduled requests (row order), so
+        scatter them onto their slot rows. Either way the unscheduled / gap
+        rows are sampled harmlessly and dropped.
         """
-        return self.req_id_to_index[req_id] // self.per_lane
-
-    def occupied_rows(self) -> list[int]:
-        """Persistent rows holding a live request, in ascending (lane-major,
-        slot) order. This is the canonical merged order used for output."""
-        return [row for row, rid in enumerate(self._req_ids) if rid is not None]
-
-    # ------------------------------------------------------------------
-    # Placement (stable lane-local slots)
-    # ------------------------------------------------------------------
-
-    def add_request_to_row(self, request: "CachedRequestState", row: int) -> int:
-        """Materialize a scheduler-owned stable row assignment.
-
-        :class:`~vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` owns slot
-        allocation (which lane, which free row); this batch only places the
-        request at the row the coordinator already chose.
-        """
-        if not (0 <= row < self.max_num_reqs):
-            raise ValueError(f"row {row} out of range [0, {self.max_num_reqs})")
-        if self._req_ids[row] is not None and self._req_ids[row] != request.req_id:
-            raise ValueError(f"row {row} is already occupied")
-        # If this row was freed earlier in the same step it is still in the
-        # logitsproc batch-update ``removed`` list. Drop it so the reused row is
-        # recorded only as an ``added`` update, not both -- mirroring upstream
-        # ``gpu_input_batch._register_add_request``'s ``pop_removed()`` so the
-        # builtin logits processors do not first set then clear the new
-        # request's per-row state.
-        builder = self.sampling.batch_update_builder
-        if row in builder._removed:
-            builder._removed.remove(row)
-        super().add_request(request, row)
-        return row
-
-    def remove_request(self, req_id: str) -> int | None:
-        row = super().remove_request(req_id)
-        if row is not None:
-            self._reset_slot(row)
-        return row
-
-    def _reset_slot(self, row: int) -> None:
-        """Reset a freed row to neutral defaults so a gap never perturbs the
-        merged batch's sampling. ``super().remove_request`` already clears the
-        generator, bad-words and allowed-token-ids entries; this also resets the
-        per-row sampling tensors and token counts (so the row reads as an empty,
-        greedy, no-penalty request until it is reused)."""
-        sampling = self.sampling
-        for name, default in sampling.DEFAULTS.items():
-            getattr(sampling, name)[row] = default
-        self.num_tokens[row] = 0
-        self.num_prompt_tokens[row] = 0
-        self.num_computed_tokens_cpu[row] = 0
-
-    def condense(self, empty_req_indices: list[int]) -> None:
-        """No-op: lane slots are stable.
-
-        The base class condenses by moving the highest live request into the
-        lowest empty index. That would move requests across lane boundaries and
-        shift their device slots, corrupting the on-device per-slot seed RNG.
-        Lane mode instead leaves freed rows as gaps (reused in place by later
-        requests in the same lane), so live requests never move and the seed
-        manager's ``slot_remap`` stays the identity.
-        """
-        return
-
-    # ------------------------------------------------------------------
-    # State update (lane step plan -> batch + request map)
-    # ------------------------------------------------------------------
-
-    def apply_step_plan(
-        self,
-        scheduler_output: "SchedulerOutput",
-        plan: "TTStepPlan",
-        requests: dict[str, CachedRequestState],
-        encoder_cache: dict,
-    ) -> bool:
-        """Apply one lane step plan to this batch and the runner's request map.
-
-        The lane-DP counterpart of ``TTModelRunner._update_states``. Here a row
-        is the request's device state slot, so the request holds it for its
-        whole lifetime: being left out of a step -- as every running decode is
-        on a prefill step -- changes nothing, and ``condense`` is a no-op. A row
-        comes back only when its contents stop being authoritative: on finish,
-        and on preemption, which freed the KV and reset ``num_computed_tokens``
-        so the resume re-prefills from zero into whatever row it is given then.
-        A preempted request's ``CachedRequestState`` stays in ``requests`` for
-        that resume.
-
-        ``requests`` (the runner's canonical ``req_id -> CachedRequestState``
-        map) and ``encoder_cache`` are mutated in place. Placement rows come
-        from ``plan.req_id_to_row`` -- the scheduler owns slot allocation, this
-        batch only materializes it. Returns whether the decode layout changed
-        (a placement or a freed slot), which the caller uses to reset the device
-        decode batch.
-        """
-        layout_changed = False
-
-        # Finished requests release their slot.
-        for req_id in scheduler_output.finished_req_ids:
-            requests.pop(req_id, None)
-            if self.remove_request(req_id) is not None:
-                layout_changed = True
-
-        # Preempted requests release their row, in the same step as the
-        # coordinator returns it to the lane's free list
-        # (``TTLaneCoordinator._build_step_plan``). Both must give it up
-        # together, or the next ``add_request_to_row`` places a newcomer on top
-        # of the occupant still sitting here. ``preempted_req_ids`` is typed
-        # optional, hence the ``or ()``.
-        for req_id in scheduler_output.preempted_req_ids or ():
-            if self.remove_request(req_id) is not None:
-                layout_changed = True
-
-        # Free cached encoder outputs.
-        for mm_hash in scheduler_output.free_encoder_mm_hashes:
-            encoder_cache.pop(mm_hash, None)
-
-        req_ids_to_add: list[str] = []
-        for new_req_data in scheduler_output.scheduled_new_reqs:
-            req_id = new_req_data.req_id
-            requests[req_id] = build_cached_request_state(new_req_data)
-            req_ids_to_add.append(req_id)
-
-        # Running / resumed requests.
-        req_data = scheduler_output.scheduled_cached_reqs
-        for i, req_id in enumerate(req_data.req_ids):
-            req_state = requests[req_id]
-            num_computed_tokens = req_data.num_computed_tokens[i]
-            new_block_ids = req_data.new_block_ids[i]
-            resumed_from_preemption = req_id in req_data.resumed_req_ids
-            apply_cached_req_state_update(
-                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
-            )
-            if resumed_from_preemption:
-                # A resume re-places the request wherever the coordinator's free
-                # list sent it, which is rarely the row it left. That row went
-                # back when the preemption was reported, so this removal only
-                # covers a resume whose preemption never was, keeping the
-                # request off two rows at once.
-                if self.remove_request(req_id) is not None:
-                    layout_changed = True
-                req_ids_to_add.append(req_id)
-                continue
-            req_index = self.req_id_to_index.get(req_id)
-            if req_index is None:
-                req_ids_to_add.append(req_id)
-                continue
-            self.num_computed_tokens_cpu[req_index] = num_computed_tokens
-            if new_block_ids is not None:
-                self.block_table.append_row(new_block_ids, req_index)
-
-        # Place new / resumed requests at scheduler-owned stable rows.
-        for req_id in req_ids_to_add:
-            self.add_request_to_row(requests[req_id], plan.req_id_to_row[req_id])
-            layout_changed = True
-
-        self.refresh_logitsprocs()
-        return layout_changed
+        logits = tt_out[:, -1, :] if tt_out.dim() == 3 else tt_out
+        if is_decode:
+            needed = max(scheduled_rows) + 1 if scheduled_rows else 0
+            if logits.shape[0] < needed:
+                raise RuntimeError(
+                    f"decode output of {logits.shape[0]} row(s) does not reach the "
+                    f"step's rows: needed={needed} rows={scheduled_rows}"
+                )
+            if logits.shape[0] >= total:
+                return logits[:total]
+            full = torch.zeros((total, logits.shape[-1]), dtype=logits.dtype)
+            full[: logits.shape[0]] = logits
+            return full
+        full = torch.zeros((total, logits.shape[-1]), dtype=logits.dtype)
+        full[torch.as_tensor(scheduled_rows, dtype=torch.long)] = logits[
+            : len(scheduled_rows)
+        ]
+        return full
 
     # ------------------------------------------------------------------
     # Sampling layout (merged, over the full slot batch)
     # ------------------------------------------------------------------
-
-    @property
-    def max_num_logprobs(self) -> int | None:
-        """Max logprobs across live requests, or None if none need logprobs.
-
-        Computed over every slot row rather than ``[:num_reqs]`` because live
-        rows are not front-packed; gap rows carry the ``LOGPROBS_NONE_SENTINEL``
-        default (the minimum value), so the max over all rows equals the max
-        over the live rows.
-        """
-        if self.num_reqs == 0:
-            return None
-        max_val = int(self.sampling.num_logprobs[: self.max_num_reqs].max().item())
-        if max_val < 0:
-            return None
-        return max_val
-
-    def refresh_logitsprocs(self) -> None:
-        """Apply batch state changes to logits processors over the full slot
-        batch. Passes ``max_num_reqs`` (not ``num_reqs``) as the batch size so
-        each processor's per-row state spans every slot, matching the full slot
-        logits the runner samples."""
-        batch_update = self.sampling.batch_update_builder.get_and_reset(
-            self.max_num_reqs
-        )
-        for logit_proc in self.sampling.logitsprocs.all:
-            logit_proc.update_state(batch_update)
 
     def build_merged_sampling_metadata(
         self,
@@ -1107,33 +1069,6 @@ class TTLaneInputBatch(InputBatch):
             logitsprocs=sampling.logitsprocs,
         )
 
-    # ------------------------------------------------------------------
-    # Per-row tensor views (the lane batch owns its own slicing/padding)
-    # ------------------------------------------------------------------
-
-    def slot_block_tables(
-        self, rows: list[int], zero_gaps: bool, total: int, width: int
-    ) -> list[torch.Tensor]:
-        """Per-group block tables for ``rows`` (one row per slot), each padded
-        to ``width`` (``max_num_blocks_per_req``). When ``zero_gaps`` is set,
-        rows of ``range(total)`` not in ``rows`` are zeroed (empty decode slots
-        carry no blocks)."""
-        occupied = set(rows)
-        sel = list(range(total)) if zero_gaps else rows
-        out = self.block_tables_for_rows(sel, width)
-        if zero_gaps and len(occupied) < total:
-            gap = torch.ones(total, dtype=torch.bool)
-            gap[list(occupied)] = False
-            for bt_cpu in out:
-                bt_cpu[gap] = 0
-        return [bt.contiguous() for bt in out]
-
-    def slot_sampling_params(self, rows: list[int]) -> TTSamplingParams:
-        """Slice the slot-ordered sampling tensors to ``rows``."""
-        return slice_tt_sampling_params(
-            self.sampling, torch.as_tensor(rows, dtype=torch.long)
-        )
-
     def slot_grammar_bitmask(
         self, grammar_output: "GrammarOutput | None", batch_length: int
     ) -> torch.Tensor | None:
@@ -1151,6 +1086,236 @@ class TTLaneInputBatch(InputBatch):
             structured_output_request_ids=grammar_output.structured_output_request_ids,
             row_req_ids=self.req_ids[:batch_length],
             batch_length=batch_length,
+        )
+
+    def advance_generators(self, req_indices: list[int] | None = None) -> None:
+        # This relies on the fact, that for a torch all_gather_object,
+        # the local object is also copied,
+        # so the original object is not modified.
+        # Otherwise, the generator at local_rank 0
+        # would get out of sync with the others.
+        #
+        # ``req_indices`` restricts advancement to the build's own requests.
+        # Each generator belongs to a single request, so lane-DP (which calls
+        # this once per lane) passes the lane's indices to advance every
+        # generator exactly once per step rather than once per lane. ``None``
+        # advances all generators (whole-batch build, called once per step).
+        if req_indices is None:
+            generators = list(self.sampling.generators.values())
+        else:
+            generators = [
+                self.sampling.generators[i]
+                for i in req_indices
+                if i in self.sampling.generators
+            ]
+        for generator in generators:
+            # Sample once from the generator to advance its state.
+            torch.rand(1, generator=generator)
+
+
+class TTLaneInputBatch(InputBatch):
+    """Persistent input batch for single-process multi-lane (lane-DP) execution.
+
+    One engine process drives ``num_lanes`` data-parallel KV-cache replicas
+    ("lanes") that execute in lockstep against a single gathered device batch.
+    This batch owns the lane layout so the model runner does not: it lays the
+    persistent rows out as ``num_lanes`` contiguous chunks of ``per_lane`` rows
+    and binds each request to a stable row for its whole lifetime.
+
+    Layout: lane ``l`` owns rows ``[l * per_lane, (l + 1) * per_lane)``. A
+    request placed at lane-local slot ``s`` lives at persistent row
+    ``l * per_lane + s``. **That persistent row IS the request's device decode
+    slot**, so the merged device input is the batch's own row layout -- no
+    scatter, and no separate ``req_id -> slot`` map. ``max_num_reqs`` is
+    ``num_lanes * per_lane`` (the global ``max_num_seqs`` in lane mode).
+
+    Stable slots: a request never moves once placed. Removing a request leaves
+    its row as an empty gap to be reused by a later request in the same lane.
+    There is no condense (``condense`` is a no-op): keeping every live request
+    pinned to its row keeps the on-device per-slot seed RNG correct and makes
+    the seed manager's ``slot_remap`` the identity. Gaps are reset to neutral
+    sampling defaults so they cannot perturb batch-wide flags (``all_greedy`` /
+    ``no_penalties``) or sample an invalid value.
+
+    Merged host sampling: because rows are the device slots and gaps carry
+    neutral defaults, the runner samples the whole ``max_num_reqs`` slot batch
+    in one call against one :class:`SamplingMetadata` built here over every row
+    (``build_merged_sampling_metadata``). The builtin/custom logits processors
+    keep per-row state over this full slot batch (``refresh_logitsprocs`` passes
+    ``max_num_reqs`` as the batch size), exactly like a normal single-engine
+    vLLM batch -- so there is no per-lane slicing, no per-lane generator/penalty
+    remap, and custom logits processors work unchanged. Pad rows sample greedy
+    garbage that the runner drops when reading back the occupied rows.
+    """
+
+    def __init__(
+        self,
+        num_lanes: int,
+        per_lane: int,
+        max_model_len: int,
+        max_num_batched_tokens: int,
+        vocab_size: int,
+        block_sizes: list[int],
+        kernel_block_sizes: list[int],
+        logitsprocs: LogitsProcessors | None = None,
+        disable_logprobs: bool = False,
+        output_tokens_per_step: int = 1,
+    ):
+        if num_lanes < 1 or per_lane < 1:
+            raise ValueError(
+                f"num_lanes and per_lane must be >= 1, got num_lanes={num_lanes}, "
+                f"per_lane={per_lane}"
+            )
+        self.num_lanes = num_lanes
+        self.per_lane = per_lane
+        super().__init__(
+            max_num_reqs=num_lanes * per_lane,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            vocab_size=vocab_size,
+            block_sizes=block_sizes,
+            kernel_block_sizes=kernel_block_sizes,
+            logitsprocs=logitsprocs,
+            disable_logprobs=disable_logprobs,
+            output_tokens_per_step=output_tokens_per_step,
+            # Rows are a fixed slot grid (lane-chunked): a request can occupy
+            # any slot in its lane's chunk, with gaps, and never moves.
+            stable_rows=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Lane geometry / membership
+    # ------------------------------------------------------------------
+
+    def lane_of(self, req_id: str) -> int:
+        """Return the lane a request is bound to.
+
+        Derived from the request's row: lane ``l`` owns the contiguous chunk
+        ``[l * per_lane, (l + 1) * per_lane)``, so the row alone determines the
+        lane and no separate ``req_id -> lane`` map is needed.
+        """
+        return self.req_id_to_index[req_id] // self.per_lane
+
+    # ------------------------------------------------------------------
+    # Placement (stable lane-local slots)
+    # ------------------------------------------------------------------
+
+    def add_request_to_row(self, request: "CachedRequestState", row: int) -> int:
+        """Materialize a scheduler-owned stable row assignment.
+
+        :class:`~vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` owns slot
+        allocation (which lane, which free row); this batch only places the
+        request at the row the coordinator already chose. The stable-row
+        ``add_request`` rejects an occupied row and reconciles the logitsproc
+        batch update for a row freed earlier in the same step.
+        """
+        if not (0 <= row < self.max_num_reqs):
+            raise ValueError(f"row {row} out of range [0, {self.max_num_reqs})")
+        self.add_request(request, row)
+        return row
+
+    # ------------------------------------------------------------------
+    # State update (lane step plan -> batch + request map)
+    # ------------------------------------------------------------------
+
+    def apply_step_plan(
+        self,
+        scheduler_output: "SchedulerOutput",
+        plan: "TTStepPlan",
+        requests: dict[str, CachedRequestState],
+        encoder_cache: dict,
+    ) -> bool:
+        """Apply one lane step plan to this batch and the runner's request map.
+
+        The lane-DP counterpart of ``TTModelRunner._update_states``. Here a row
+        is the request's device state slot, so the request holds it for its
+        whole lifetime: being left out of a step -- as every running decode is
+        on a prefill step -- changes nothing, and ``condense`` is a no-op. A row
+        comes back only when its contents stop being authoritative: on finish,
+        and on preemption, which freed the KV and reset ``num_computed_tokens``
+        so the resume re-prefills from zero into whatever row it is given then.
+        A preempted request's ``CachedRequestState`` stays in ``requests`` for
+        that resume.
+
+        ``requests`` (the runner's canonical ``req_id -> CachedRequestState``
+        map) and ``encoder_cache`` are mutated in place. Placement rows come
+        from ``plan.req_id_to_row`` -- the scheduler owns slot allocation, this
+        batch only materializes it. Returns whether the decode layout changed
+        (a placement or a freed slot), which the caller uses to reset the device
+        decode batch.
+        """
+        layout_changed = False
+
+        # Finished requests release their slot.
+        for req_id in scheduler_output.finished_req_ids:
+            requests.pop(req_id, None)
+            if self.remove_request(req_id) is not None:
+                layout_changed = True
+
+        # Preempted requests release their row, in the same step as the
+        # coordinator returns it to the lane's free list
+        # (``TTLaneCoordinator._build_step_plan``). Both must give it up
+        # together, or the next ``add_request_to_row`` places a newcomer on top
+        # of the occupant still sitting here. ``preempted_req_ids`` is typed
+        # optional, hence the ``or ()``.
+        for req_id in scheduler_output.preempted_req_ids or ():
+            if self.remove_request(req_id) is not None:
+                layout_changed = True
+
+        # Free cached encoder outputs.
+        for mm_hash in scheduler_output.free_encoder_mm_hashes:
+            encoder_cache.pop(mm_hash, None)
+
+        req_ids_to_add: list[str] = []
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            req_id = new_req_data.req_id
+            requests[req_id] = build_cached_request_state(new_req_data)
+            req_ids_to_add.append(req_id)
+
+        # Running / resumed requests.
+        req_data = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(req_data.req_ids):
+            req_state = requests[req_id]
+            num_computed_tokens = req_data.num_computed_tokens[i]
+            new_block_ids = req_data.new_block_ids[i]
+            resumed_from_preemption = req_id in req_data.resumed_req_ids
+            apply_cached_req_state_update(
+                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+            )
+            if resumed_from_preemption:
+                # A resume re-places the request wherever the coordinator's free
+                # list sent it, which is rarely the row it left. That row went
+                # back when the preemption was reported, so this removal only
+                # covers a resume whose preemption never was, keeping the
+                # request off two rows at once.
+                if self.remove_request(req_id) is not None:
+                    layout_changed = True
+                req_ids_to_add.append(req_id)
+                continue
+            req_index = self.req_id_to_index.get(req_id)
+            if req_index is None:
+                req_ids_to_add.append(req_id)
+                continue
+            self.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            if new_block_ids is not None:
+                self.block_table.append_row(new_block_ids, req_index)
+
+        # Place new / resumed requests at scheduler-owned stable rows.
+        for req_id in req_ids_to_add:
+            self.add_request_to_row(requests[req_id], plan.req_id_to_row[req_id])
+            layout_changed = True
+
+        self.refresh_logitsprocs()
+        return layout_changed
+
+    # ------------------------------------------------------------------
+    # Per-row tensor views (the lane batch owns its own slicing/padding)
+    # ------------------------------------------------------------------
+
+    def slot_sampling_params(self, rows: list[int]) -> TTSamplingParams:
+        """Slice the slot-ordered sampling tensors to ``rows``."""
+        return slice_tt_sampling_params(
+            self.sampling, torch.as_tensor(rows, dtype=torch.long)
         )
 
     # ------------------------------------------------------------------
@@ -1193,13 +1358,10 @@ class TTLaneInputBatch(InputBatch):
         total = plan.capacity
         occupied = lane_batch.occupied_rows()
 
-        num_tokens = lane_batch.num_tokens
-        positions_np = num_tokens[:total].astype(np.int32) - 1  # gaps -> -1
-        input_positions = torch.from_numpy(positions_np)
-        tokens_np = np.zeros((total, 1), dtype=np.int32)
-        for row in occupied:
-            tokens_np[row, 0] = lane_batch.token_ids_cpu[row, num_tokens[row] - 1]
-        input_tokens = torch.from_numpy(tokens_np)
+        # Gaps read token 0 at position -1.
+        input_tokens, input_positions = lane_batch.decode_tokens_and_positions(
+            list(range(total))
+        )
 
         block_tables_per_group = lane_batch.slot_block_tables(
             occupied, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
@@ -1414,7 +1576,7 @@ class TTLaneInputBatch(InputBatch):
 
         # Host sampling over the full slot batch.
         total = self.max_num_reqs
-        logits = self._host_logits(tt_out, scheduled_rows, is_decode, total)
+        logits = self.grid_host_logits(tt_out, scheduled_rows, is_decode, total)
         bitmask = model_input.grammar_bitmask[0]
         if bitmask is not None:
             runner.apply_grammar_bitmask(logits, bitmask)
@@ -1428,35 +1590,11 @@ class TTLaneInputBatch(InputBatch):
         logprobs = self._host_logprobs(sampler_output.logprobs_tensors, scheduled_rows)
         return sampled.to(torch.int32), logprobs
 
-    def _host_logits(
-        self, tt_out: Any, scheduled_rows: list[int], is_decode: bool, total: int
-    ) -> torch.Tensor:
-        """Full ``[total, vocab]`` slot logits for host sampling.
-
-        Decode logits already cover every slot. Prefill logits cover only the
-        scheduled requests (row order), so scatter them onto their slot rows;
-        the unscheduled / gap rows are sampled harmlessly and dropped.
-        """
-        logits = tt_out[:, -1, :] if tt_out.dim() == 3 else tt_out
-        if is_decode:
-            return logits
-        full = torch.zeros((total, logits.shape[-1]), dtype=logits.dtype)
-        full[torch.as_tensor(scheduled_rows, dtype=torch.long)] = logits[
-            : len(scheduled_rows)
-        ]
-        return full
-
     def _host_logprobs(
         self, logprobs_tensors: LogprobsTensors | None, scheduled_rows: list[int]
     ) -> LogprobsLists | None:
-        if logprobs_tensors is None:
-            return None
-        rows_t = torch.as_tensor(scheduled_rows, dtype=torch.long)
-        return LogprobsTensors(
-            logprob_token_ids=logprobs_tensors.logprob_token_ids[rows_t],
-            logprobs=logprobs_tensors.logprobs[rows_t],
-            selected_token_ranks=logprobs_tensors.selected_token_ranks[rows_t],
-        ).tolists()
+        selected = self.select_logprobs_rows(logprobs_tensors, scheduled_rows)
+        return None if selected is None else selected.tolists()
 
     def _device_logprobs(
         self,
