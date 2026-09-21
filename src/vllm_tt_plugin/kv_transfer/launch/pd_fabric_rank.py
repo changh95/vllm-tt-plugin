@@ -61,13 +61,21 @@ its mesh; the MPI job ends when both ranks have exited and MPI finalizes at
 interpreter exit), releases the engine lock, and returns non-zero only for a real
 failure.
 
-``TT_PD_FABRIC_PUMP=1`` (``install_pump_hook`` + ``install_idle_pump_hook``) adds
-plan item I4 as a shim: every ``TTKVWorker.end_step`` ends with ``transport.pump()``
-AND an idle engine pumps every second from its input-queue wait, so an orphaned
-export (D leg never arrives) is drained by the consumer at lease expiry instead of
-parking the producer's CQ until the next request that names an xfer (D5; V7
-measurement; without the idle half the 07:25 ``bogus_xfer`` orphan killed P after
-the 600 s device timeout because D had gone idle).
+``TT_PD_FABRIC_PUMP`` (default on; ``install_idle_ticker``) is the idle-engine half
+of the fabric transport's claim-gated send protocol (D5 fix, ``transport/fabric.py``):
+``TTKVWorker.end_step`` pumps the transport after every step, but an idle
+``EngineCoreProc`` blocks in ``input_queue.get()`` and steps nothing, and the plugin
+has no thread that may touch the device (``model_runner`` rejects async decode with a
+connector for that reason) nor a handle to wake the engine thread.  The ticker is a
+host-only thread that, while the engine is idle and a registered transport reports
+``wants_pump()`` (a published export waiting for its claim / a claim waiting for its
+drain), registers a one-shot idle-state callback and puts vLLM's own
+``EngineCoreRequestType.WAKEUP`` sentinel on the input queue -- the engine thread wakes,
+runs the callback (``transport.pump()``: the producer enqueues the sends of a claimed
+export, the consumer drains) and blocks again.  Without it a lone request's claim would
+wait for the producer's next step (= the lease, then D recomputes).  It wraps
+``EngineCoreProc.run_busy_loop`` (start / stop around the loop) and raises at install
+when the vLLM in use lacks any attribute it relies on.
 
 ``--dry-run`` builds and prints the resolved config without MPI, ttnn or a device.
 Fallback if this shape fails on hardware: F2 (single engine, ``create_socket_pair`` on
@@ -82,6 +90,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -574,148 +583,178 @@ def install_dist_cleanup_patch(
     return cleanup_dist_env_tt
 
 
-def install_pump_hook(
-    worker_cls: Any = None, enabled: bool | None = None
-) -> Callable[..., Any] | None:
-    """Plan item I4 as a launch-layer shim (env ``TT_PD_FABRIC_PUMP=1``): after every
-    ``TTKVWorker.end_step`` call ``transport.pump()`` when the transport has one.
-
-    Why: over the fabric the producer's sends of an export PARK its CQ0 until the
-    consumer posts the matching recvs, and the consumer enters transport code only
-    for a request that names an xfer (``open_get`` / ``release_remote``).  An export
-    whose D leg never arrives (client gone during the P leg, proxy died, D leg lost)
-    therefore parks P until the consumer's NEXT such request -- and every later
-    proxy request needs P first: the pair is stuck (D5, PHASE3_RESULTS v2 V7).
-    ``FabricSocketTransport.pump()`` drains released / lease-expired orphans at the
-    channel head (consumer) and reclaims finished exports (producer); calling it once
-    per step bounds the stall by LEASE + one step.  The proper home is
-    ``TTKVWorker.end_step`` itself (p3_needed_patches.md I4); until that lands the
-    rank wraps the method here.  Idempotent; returns the wrapper (None when off).
-    The shm transport has no ``pump`` -> the wrapper is a no-op there."""
-    if enabled is None:
-        enabled = os.environ.get("TT_PD_FABRIC_PUMP", "0") == "1"
-    if not enabled:
-        return None
-    if worker_cls is None:
-        from vllm_tt_plugin.kv_transfer.worker import (  # noqa: PLC0415
-            TTKVWorker as worker_cls,
-        )
-    orig = getattr(worker_cls, "end_step", None)
-    if orig is None:
-        raise RuntimeError(
-            "TTKVWorker has no end_step: the per-step seam moved; re-check "
-            "pd_fabric_rank.install_pump_hook"
-        )
-    if getattr(orig, "_pd_fabric_wrapped", False):
-        return orig
-
-    def end_step_pd(self: Any, *args: Any, **kwargs: Any) -> Any:
-        try:
-            return orig(self, *args, **kwargs)
-        finally:
-            pump = getattr(getattr(self, "transport", None), "pump", None)
-            if pump is not None:
-                try:
-                    pump()
-                except Exception:  # noqa: BLE001 - never take the step down with it
-                    log.exception("pd_fabric_rank: transport.pump() raised")
-
-    end_step_pd._pd_fabric_wrapped = True  # type: ignore[attr-defined]
-    end_step_pd._pd_fabric_orig = orig  # type: ignore[attr-defined]
-    worker_cls.end_step = end_step_pd
-    log.info("pd_fabric_rank: TT_PD_FABRIC_PUMP=1: transport.pump() after every step")
-    return end_step_pd
+IDLE_TICK_S = 0.005  # default period of install_idle_ticker (TT_PD_FABRIC_IDLE_TICK_S)
 
 
-IDLE_PUMP_S = 1.0  # idle-tick period of install_idle_pump_hook
+class IdleTicker:
+    """Host-only thread: while ``core`` is idle and a transport wants a pump, make
+    the ENGINE THREAD run ``pump()`` of every registered transport.
+
+    Mechanism (both vLLM-side pieces exist for exactly this purpose: the WAKEUP
+    sentinel wakes an idle engine for shutdown, the one-shot idle-state callbacks
+    complete ``pause_scheduler``): append ``_on_idle`` to
+    ``core._idle_state_callbacks`` and ``put_nowait((WAKEUP, None))`` on
+    ``core.input_queue``; ``_process_input_queue`` returns from ``get``, handles the
+    no-op sentinel, re-enters its idle loop and calls the callbacks on the engine
+    thread.  Never more than one callback is armed at a time; a busy engine (steps
+    pump by themselves via ``TTKVWorker.end_step``) is left alone.  ``wants_pump``
+    is a host-only check the transports make under their own lock."""
+
+    def __init__(
+        self,
+        core: Any,
+        *,
+        transports: Callable[[], list[Any]],
+        wakeup: Any,
+        period_s: float = IDLE_TICK_S,
+    ) -> None:
+        for attr in ("input_queue", "_idle_state_callbacks", "has_work", "is_running"):
+            if not hasattr(core, attr):
+                raise RuntimeError(
+                    f"EngineCoreProc has no {attr}: the idle seam moved; re-check "
+                    "pd_fabric_rank.IdleTicker"
+                )
+        self._core = core
+        self._transports = transports
+        self._wakeup = wakeup
+        self.period_s = float(period_s)
+        self._stop = threading.Event()
+        self._armed = False
+        self._thread: threading.Thread | None = None
+        self.ticks = 0  # wake-ups sent
+        self.pumps = 0  # pumps run on the engine thread
+
+    def _wants(self) -> bool:
+        for t in self._transports():
+            fn = getattr(t, "wants_pump", None)
+            try:
+                if fn is not None and fn():
+                    return True
+            except Exception:  # noqa: BLE001 - a host check must not kill the tick
+                log.exception("pd_fabric_rank: %r.wants_pump() raised", t)
+        return False
+
+    def _on_idle(self, engine: Any) -> None:  # engine thread
+        self._armed = False
+        self.pumps += 1
+        for t in self._transports():
+            pump = getattr(t, "pump", None)
+            if pump is None:
+                continue
+            try:
+                pump()
+            except Exception:  # noqa: BLE001 - never take the engine loop down
+                log.exception("pd_fabric_rank: idle transport.pump() raised")
+
+    def tick_once(self) -> bool:
+        """One tick (also called by the loop): arm + wake when due; True if woken."""
+        core = self._core
+        if not core.is_running() or core.has_work() or self._armed:
+            return False
+        if not self._wants():
+            return False
+        self._armed = True
+        core._idle_state_callbacks.append(self._on_idle)
+        core.input_queue.put_nowait((self._wakeup, None))
+        self.ticks += 1
+        return True
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.period_s):
+            try:
+                if not self._core.is_running():
+                    return
+                self.tick_once()
+            except Exception:  # noqa: BLE001 - keep ticking
+                log.exception("pd_fabric_rank: idle ticker iteration raised")
+
+    def start(self) -> IdleTicker:
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._run, name="tt_pd_fabric_idle_tick", daemon=True
+            )
+            self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
 
 
-def install_idle_pump_hook(
+def install_idle_ticker(
     proc_cls: Any = None,
     enabled: bool | None = None,
-    period_s: float = IDLE_PUMP_S,
-    pump_all: Callable[[], Any] | None = None,
+    period_s: float | None = None,
+    transports: Callable[[], list[Any]] | None = None,
+    wakeup: Any = None,
 ) -> Callable[..., Any] | None:
-    """The other half of the I4 shim (same gate ``TT_PD_FABRIC_PUMP=1``): pump the
-    started fabric transports while the engine is IDLE.
-
-    ``install_pump_hook`` runs ``transport.pump()`` after every step, but an idle
-    engine does not step: ``EngineCoreProc._process_input_queue`` blocks in
-    ``input_queue.get(block=True)`` until a request arrives.  That is exactly the
-    orphan deadlock seen on 2026-09-21 07:25 (chips 0,3, drill ``bad_params`` case
-    ``bogus_xfer``): D demoted the request to a local prefill without ever naming the
-    genuine xfer, went idle, the 80 sends of that export stayed parked on P's CQ0,
-    the next P leg hung behind them and after TT_METAL_OPERATION_TIMEOUT_SECONDS
-    (600 s) P died with "Timeout, potential hang detected, the device is
-    unrecoverable" -- while D would have drained the orphan at lease expiry had it
-    entered transport code once.  This wrapper replaces the blocking wait of the
-    idle loop with ``input_queue.get(timeout=period_s)`` and calls ``pump_all``
-    (default: ``pump()`` of every transport in ``fabric_socket.registered_transports``)
-    on every timeout, on the engine thread (the only thread that may issue device
-    ops), so an orphan is drained <= LEASE + ``period_s`` after its publish and the
-    producer's CQ unparks.  Everything else of the original method is kept (idle
-    callbacks, aborts-queue drain, request handling, the non-blocking tail); an
-    engine with ``process_input_queue_block`` False (DP shape) falls through to the
-    original.  Idempotent; returns the wrapper (None when off).  Raises when the
-    vLLM in use has no such method or attributes (the seam moved: re-check here)."""
+    """Wrap ``EngineCoreProc.run_busy_loop`` so an ``IdleTicker`` runs for the
+    lifetime of the busy loop (module docstring).  Gate ``TT_PD_FABRIC_PUMP`` (unset
+    or "1" = on; "0" = off, debug only: claim-gated sends then wait for the
+    producer's next STEP); period ``TT_PD_FABRIC_IDLE_TICK_S`` (default
+    ``IDLE_TICK_S``).  Idempotent; returns the wrapper (None when off).  Raises when
+    the vLLM in use has no ``run_busy_loop`` / ``WAKEUP`` (the seam moved)."""
     if enabled is None:
-        enabled = os.environ.get("TT_PD_FABRIC_PUMP", "0") == "1"
+        enabled = os.environ.get("TT_PD_FABRIC_PUMP", "1") != "0"
     if not enabled:
+        log.warning(
+            "pd_fabric_rank: TT_PD_FABRIC_PUMP=0: no idle ticker; a claimed export "
+            "is sent at the producer's next step only (debug knob)"
+        )
         return None
+    if period_s is None:
+        period_s = float(os.environ.get("TT_PD_FABRIC_IDLE_TICK_S", IDLE_TICK_S))
+    if period_s <= 0:
+        raise ValueError(f"TT_PD_FABRIC_IDLE_TICK_S must be > 0 (got {period_s})")
     if proc_cls is None:
         from vllm.v1.engine.core import EngineCoreProc as proc_cls  # noqa: PLC0415
-    orig = getattr(proc_cls, "_process_input_queue", None)
+    if wakeup is None:
+        from vllm.v1.engine import EngineCoreRequestType  # noqa: PLC0415
+
+        wakeup = getattr(EngineCoreRequestType, "WAKEUP", None)
+        if wakeup is None:
+            raise RuntimeError(
+                "EngineCoreRequestType has no WAKEUP sentinel: the idle seam moved; "
+                "re-check pd_fabric_rank.install_idle_ticker"
+            )
+    orig = getattr(proc_cls, "run_busy_loop", None)
     if orig is None:
         raise RuntimeError(
-            "EngineCoreProc has no _process_input_queue: the idle loop moved; "
-            "re-check pd_fabric_rank.install_idle_pump_hook"
+            "EngineCoreProc has no run_busy_loop: the busy-loop seam moved; re-check "
+            "pd_fabric_rank.install_idle_ticker"
         )
     if getattr(orig, "_pd_fabric_wrapped", False):
         return orig
-    if pump_all is None:
+    if transports is None:
 
-        def pump_all() -> None:
+        def transports() -> list[Any]:
             from vllm_tt_plugin.kv_transfer.transport.fabric_socket import (  # noqa: PLC0415
                 registered_transports,
             )
 
-            for t in registered_transports():
-                pump = getattr(t, "pump", None)
-                if pump is not None:
-                    pump()
+            return registered_transports()
 
-    def _process_input_queue_pd(self: Any) -> Any:
-        if not getattr(self, "process_input_queue_block", True):
-            return orig(self)  # non-blocking shape: the step loop pumps
-        import queue as _queue  # noqa: PLC0415
+    def run_busy_loop_pd(self: Any, *args: Any, **kwargs: Any) -> Any:
+        ticker = IdleTicker(
+            self, transports=transports, wakeup=wakeup, period_s=period_s
+        ).start()
+        self._pd_fabric_idle_ticker = ticker
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            ticker.stop()
 
-        while not self.has_work() and self.is_running():
-            self._notify_idle_state_callbacks()
-            if self.input_queue.empty():
-                with self.aborts_queue.mutex:
-                    self.aborts_queue.queue.clear()
-            try:
-                req = self.input_queue.get(timeout=period_s)
-            except _queue.Empty:
-                try:
-                    pump_all()
-                except Exception:  # noqa: BLE001 - never take the loop down with it
-                    log.exception("pd_fabric_rank: idle transport.pump() raised")
-                continue
-            self._handle_client_request(*req)
-        while not self.input_queue.empty():
-            req = self.input_queue.get_nowait()
-            self._handle_client_request(*req)
-
-    _process_input_queue_pd._pd_fabric_wrapped = True  # type: ignore[attr-defined]
-    _process_input_queue_pd._pd_fabric_orig = orig  # type: ignore[attr-defined]
-    proc_cls._process_input_queue = _process_input_queue_pd
+    run_busy_loop_pd._pd_fabric_wrapped = True  # type: ignore[attr-defined]
+    run_busy_loop_pd._pd_fabric_orig = orig  # type: ignore[attr-defined]
+    proc_cls.run_busy_loop = run_busy_loop_pd
     log.info(
-        "pd_fabric_rank: TT_PD_FABRIC_PUMP=1: idle engine pumps the fabric transport "
-        "every %.1f s",
-        period_s,
+        "pd_fabric_rank: idle ticker on (TT_PD_FABRIC_PUMP): an idle engine pumps "
+        "the fabric transport every %.1f ms while it has work pending",
+        period_s * 1e3,
     )
-    return _process_input_queue_pd
+    return run_busy_loop_pd
 
 
 def run_headless_engine(
@@ -940,8 +979,7 @@ def _main_locked(
         enable_fabric=not args.no_fabric_wrapper,
     )
     install_dist_cleanup_patch()
-    install_pump_hook()
-    install_idle_pump_hook()
+    install_idle_ticker()
 
     from vllm.v1.engine.core import EngineCoreProc
     from vllm.v1.executor.abstract import UniProcExecutor

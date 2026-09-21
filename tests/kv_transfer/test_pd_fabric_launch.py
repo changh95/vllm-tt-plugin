@@ -1053,16 +1053,42 @@ def test_launch_modules_do_not_import_ttnn_or_vllm_at_import_time():
 # --------------------------------------------------------------------------- #
 # per-pair isolation: tag-scoped paths / ids and the engine identity lock
 # --------------------------------------------------------------------------- #
-def test_pool_below_prefill_bucket_trace_is_refused():
-    """P_POOL=1024 (18 KV blocks) under a 2048-token (32-block) bucket trace hung both
-    tiny fabric pairs of 2026-09-21 in the decode warm-up (DRAM overrun by the fixed-
-    width fill); the launch config refuses pools below chunk_tokens + one pad block."""
+def test_pool_guard_uses_the_largest_traced_bucket_not_chunk_tokens():
+    """P_POOL=1024 (18 KV blocks) under the 2048-token (32-block) bucket trace hung
+    both tiny fabric pairs of 2026-09-21 in the decode warm-up (DRAM overrun by the
+    fixed-width fill).  The guard is keyed to the model's largest TRACED bucket
+    (QWEN36_PREFILL_BUCKET_TRACE, "1" = every bucket -> 2048), not to the transfer
+    CHUNK_TOKENS (audit major): a smaller chunk must not admit a pool the warm-up
+    overruns."""
     with pytest.raises(ValueError, match="P_POOL=1024 .* would write past the KV pool"):
         lc.PairSettings(ctx=512, p_pool=1024, d_pool=4096)
     with pytest.raises(ValueError, match="D_POOL=2048 "):
         lc.PairSettings(ctx=512, p_pool=4096, d_pool=2048)
     assert lc.PairSettings(ctx=2048, p_pool=2112, d_pool=4096).p_pool == 2112
-    assert lc.PairSettings(chunk_tokens=1024, p_pool=1088, d_pool=1088).p_pool == 1088
+    # the false negative the first guard enshrined: CHUNK_TOKENS=1024 does not shrink
+    # the 2048-token bucket trace
+    with pytest.raises(ValueError, match="P_POOL=1088 .* 2048-token prefill bucket"):
+        lc.PairSettings(chunk_tokens=1024, p_pool=1088, d_pool=1088)
+    assert lc.PairSettings(chunk_tokens=1024, p_pool=2112, d_pool=2112).p_pool == 2112
+    assert lc.PairSettings(chunk_tokens=4096, p_pool=2112, d_pool=2112).p_pool == 2112
+    # the gate, parsed as masked_bucket_trace.parse_bucket_trace_gate parses it
+    assert lc.largest_traced_prefill_bucket("1") == 2048
+    assert lc.largest_traced_prefill_bucket("all") == 2048
+    assert lc.largest_traced_prefill_bucket(None) == 2048  # platform.py requires it on
+    assert lc.largest_traced_prefill_bucket("128,256") == 256
+    assert lc.PairSettings(p_pool=320, d_pool=320, bucket_trace_gate="128,256").p_pool
+    with pytest.raises(ValueError, match="P_POOL=320 .* 512-token"):
+        lc.PairSettings(p_pool=320, d_pool=4096, bucket_trace_gate="512,128")
+    with pytest.raises(ValueError, match="not one of"):
+        lc.largest_traced_prefill_bucket("4096")
+    with pytest.raises(ValueError, match="not a bucket"):
+        lc.largest_traced_prefill_bucket("big")
+    # from_env reads the gate the launch script exports
+    env = {"QWEN36_PREFILL_BUCKET_TRACE": "128", "P_POOL": "192", "D_POOL": "4096"}
+    assert lc.PairSettings.from_env(env).p_pool == 192
+    with pytest.raises(ValueError, match="2048-token"):
+        lc.PairSettings.from_env({"P_POOL": "192", "D_POOL": "4096"})
+    assert lc.PREFILL_MASK_BUCKETS == (128, 256, 512, 1024, 2048)
 
 
 def test_tag_scopes_every_per_pair_path_and_id():
@@ -1364,50 +1390,154 @@ def test_install_mesh_hooks_close_shuts_down_transports_before_mesh_close(
         )
 
 
-def test_install_pump_hook_calls_transport_pump_after_end_step(monkeypatch):
-    """I4 shim: off by default; on, end_step runs first and pump() follows even when
-    end_step raises; a transport without pump (shm) is a no-op; idempotent."""
-    log: list = []
+class _IdleProc:
+    """The shape of vLLM 0.26.0's EngineCoreProc idle loop the ticker relies on:
+    ``input_queue`` (blocking get), one-shot ``_idle_state_callbacks`` run at the
+    top of every idle iteration, ``has_work`` / ``is_running``."""
 
-    class Transport:
-        def pump(self):
-            log.append("pump")
+    def __init__(self):
+        import queue
 
-    class Worker:
-        def __init__(self, transport):
-            self.transport = transport
+        self.input_queue = queue.Queue()
+        self._idle_state_callbacks: list = []
+        self.work = False
+        self.running = True
+        self.handled: list = []
+        self.loop_thread = None
 
-        def end_step(self, finished_req_ids=None):
-            log.append(("end_step", finished_req_ids))
-            if finished_req_ids == "boom":
-                raise RuntimeError("step failed")
+    def has_work(self):
+        return self.work
 
-    monkeypatch.delenv("TT_PD_FABRIC_PUMP", raising=False)
-    assert rank_mod.install_pump_hook(worker_cls=Worker) is None  # default off
-    Worker(Transport()).end_step(finished_req_ids={"a"})
-    assert log == [("end_step", {"a"})]
-    log.clear()
-    monkeypatch.setenv("TT_PD_FABRIC_PUMP", "1")
-    wrapped = rank_mod.install_pump_hook(worker_cls=Worker)
-    assert wrapped is not None and wrapped._pd_fabric_wrapped
-    assert rank_mod.install_pump_hook(worker_cls=Worker) is wrapped  # idempotent
-    Worker(Transport()).end_step(finished_req_ids={"b"})
-    assert log == [("end_step", {"b"}), "pump"]
-    log.clear()
-    with pytest.raises(RuntimeError, match="step failed"):
-        Worker(Transport()).end_step("boom")
-    assert log == [("end_step", "boom"), "pump"]  # pump still runs
-    log.clear()
-    Worker(object()).end_step()  # shm transport: no pump attribute -> no-op
-    assert log == [("end_step", None)]
+    def is_running(self):
+        return self.running
 
-    class BadPump:
-        def pump(self):
-            raise ValueError("pump broke")
+    def run_busy_loop(self):
+        import threading
 
-    Worker(BadPump()).end_step()  # a raising pump never takes the step down
-    with pytest.raises(RuntimeError, match="end_step"):
-        rank_mod.install_pump_hook(worker_cls=object, enabled=True)
+        self.loop_thread = threading.get_ident()
+        while self.running:
+            while not self.has_work() and self.is_running():
+                while self._idle_state_callbacks:
+                    self._idle_state_callbacks.pop()(self)
+                req = self.input_queue.get()
+                self.handled.append(req)
+            if self.has_work():
+                self.work = False  # one step
+        return "loop-ended"
+
+
+class _PumpTransport:
+    def __init__(self, wants: bool):
+        import threading
+
+        self.wants, self.pumps, self.threads = wants, 0, set()
+        self._threading = threading
+
+    def wants_pump(self):
+        return self.wants
+
+    def pump(self):
+        self.pumps += 1
+        self.threads.add(self._threading.get_ident())
+
+
+def test_install_idle_ticker_wakes_the_engine_thread_to_pump_only_when_wanted(
+    monkeypatch,
+):
+    """The idle-engine half of claim-gated sends: while the engine is idle and a
+    transport wants a pump, the ticker arms ONE idle callback and puts the WAKEUP
+    sentinel; the pump then runs on the ENGINE thread.  No wake-ups while nothing
+    is wanted or while the engine has work; the ticker stops with the loop;
+    idempotent; off with TT_PD_FABRIC_PUMP=0; a moved vLLM seam raises."""
+    import threading
+    import time
+
+    class Proc(_IdleProc):
+        pass
+
+    ts = [_PumpTransport(wants=False), _PumpTransport(wants=False)]
+    monkeypatch.setenv("TT_PD_FABRIC_PUMP", "0")
+    assert rank_mod.install_idle_ticker(proc_cls=Proc, transports=lambda: ts) is None
+    monkeypatch.delenv("TT_PD_FABRIC_PUMP", raising=False)  # default: ON
+    wrapped = rank_mod.install_idle_ticker(
+        proc_cls=Proc, period_s=0.002, transports=lambda: ts, wakeup="WAKEUP"
+    )
+    assert Proc.run_busy_loop is wrapped and wrapped._pd_fabric_wrapped
+    assert (
+        rank_mod.install_idle_ticker(proc_cls=Proc, transports=lambda: ts) is wrapped
+    )  # idempotent
+    proc = Proc()
+    result: list = []
+    th = threading.Thread(target=lambda: result.append(proc.run_busy_loop()))
+    th.start()
+    time.sleep(0.05)
+    ticker = proc._pd_fabric_idle_ticker
+    assert ticker.ticks == 0 and ts[0].pumps == 0  # nothing wanted: no wake-ups
+    ts[1].wants = True
+    deadline = time.perf_counter() + 2.0
+    while ts[1].pumps < 3 and time.perf_counter() < deadline:
+        time.sleep(0.002)
+    assert ts[1].pumps >= 3 and ts[0].pumps == ts[1].pumps  # every transport pumped
+    assert ts[1].threads == {proc.loop_thread}  # on the engine thread only
+    assert all(r == ("WAKEUP", None) for r in proc.handled)
+    assert ticker.ticks == ticker.pumps  # one callback armed per wake-up
+    ts[1].wants = False
+    n = ts[1].pumps
+    time.sleep(0.03)
+    assert ts[1].pumps == n  # quiet again
+    # a busy engine is left alone (its steps pump via TTKVWorker.end_step)
+    proc.work = True
+    ts[1].wants = True
+    assert not ticker.tick_once() and ticker.ticks == ticker.pumps
+    proc.work = False
+    # stop: the loop ends, the ticker thread with it
+    proc.running = False
+    proc.input_queue.put_nowait(("WAKEUP", None))
+    th.join(5)
+    assert result == ["loop-ended"] and not ticker._thread
+    # the seam checks: attributes the ticker relies on, the busy loop, the sentinel
+    with pytest.raises(RuntimeError, match="_idle_state_callbacks"):
+        rank_mod.IdleTicker(
+            SimpleNamespace(input_queue=None, has_work=None, is_running=None),
+            transports=lambda: [],
+            wakeup="W",
+        )
+    with pytest.raises(RuntimeError, match="run_busy_loop"):
+        rank_mod.install_idle_ticker(proc_cls=object, enabled=True, wakeup="W")
+    with pytest.raises(ValueError, match="TT_PD_FABRIC_IDLE_TICK_S"):
+        rank_mod.install_idle_ticker(proc_cls=Proc, enabled=True, period_s=0)
+
+
+def test_idle_ticker_default_transports_and_wakeup_come_from_vllm_and_the_registry(
+    clean_mesh_registry,
+):
+    """With no injected fakes the ticker pumps ``fabric_socket.registered_transports``
+    and uses vLLM's own WAKEUP sentinel (the one ``_handle_client_request`` ignores);
+    a transport without pump / wants_pump (shm) is skipped."""
+    from vllm.v1.engine import EngineCoreRequestType
+
+    class Proc(_IdleProc):
+        pass
+
+    wrapped = rank_mod.install_idle_ticker(proc_cls=Proc, enabled=True, period_s=0.5)
+    assert wrapped is not None
+    t, shm_like = _PumpTransport(wants=True), object()
+    fabric_socket.register_transport(t)
+    fabric_socket.register_transport(shm_like)  # no pump / wants_pump: skipped
+    try:
+        proc = Proc()
+        ticker = rank_mod.IdleTicker(
+            proc,
+            transports=fabric_socket.registered_transports,
+            wakeup=EngineCoreRequestType.WAKEUP,
+        )
+        assert ticker.tick_once() and ticker.ticks == 1
+        assert proc.input_queue.get_nowait() == (EngineCoreRequestType.WAKEUP, None)
+        proc._idle_state_callbacks.pop()(proc)  # what the engine thread does next
+        assert t.pumps == 1 and ticker.pumps == 1
+    finally:
+        fabric_socket.unregister_transport(t)
+        fabric_socket.unregister_transport(shm_like)
 
 
 def test_default_shutdown_transports_uses_fabric_socket_registry(
@@ -1471,88 +1601,6 @@ def test_install_dist_cleanup_patch_skips_accelerator_cache_without_accelerator(
     # a vLLM whose shutdown path moved is an error, not a silent skip
     with pytest.raises(RuntimeError, match="cleanup_dist_env_and_memory"):
         rank_mod.install_dist_cleanup_patch(SimpleNamespace(), torch_mod)
-
-
-def test_install_idle_pump_hook_pumps_while_idle_and_handles_requests():
-    """Idle half of the I4 shim: off by default; on, the blocking input-queue wait
-    becomes a timeout poll that pumps every registered transport on each timeout,
-    keeps the idle callbacks / aborts drain / request handling of the original, and
-    falls through to the original when the engine is in the non-blocking shape."""
-    import queue
-
-    log: list = []
-
-    class Proc:
-        process_input_queue_block = True
-
-        def __init__(self, work_after: int):
-            self.input_queue = queue.Queue()
-            self.aborts_queue = queue.Queue()
-            self.aborts_queue.put("abort-1")
-            self._work_after, self._polls = work_after, 0
-
-        def has_work(self):
-            return self._polls >= self._work_after
-
-        def is_running(self):
-            return True
-
-        def _notify_idle_state_callbacks(self):
-            self._polls += 1
-            log.append("idle")
-
-        def _handle_client_request(self, *req):
-            log.append(("req", req))
-
-        def _process_input_queue(self):
-            log.append("orig")
-
-    pumps: list = []
-    assert rank_mod.install_idle_pump_hook(proc_cls=Proc) is None  # default off
-    wrapped = rank_mod.install_idle_pump_hook(
-        proc_cls=Proc, enabled=True, period_s=0.01, pump_all=lambda: pumps.append(1)
-    )
-    assert Proc._process_input_queue is wrapped and wrapped._pd_fabric_wrapped
-    assert (
-        rank_mod.install_idle_pump_hook(proc_cls=Proc, enabled=True) is wrapped
-    )  # idempotent
-    p = Proc(work_after=3)
-    p._process_input_queue()
-    assert len(pumps) >= 2 and log.count("idle") == 3  # pumped on every timeout
-    assert p.aborts_queue.empty()  # aborts drained while idle (as the original)
-    # a request arriving while idle is handled; the non-blocking tail drains the rest
-    log.clear()
-    pumps.clear()
-    q = Proc(work_after=10)
-    q.input_queue.put(("add", "r1"))
-    q.input_queue.put(("add", "r2"))
-    q.has_work = lambda: q._polls >= 2  # work appears after the first request
-    q._process_input_queue()
-    assert ("req", ("add", "r1")) in log and ("req", ("add", "r2")) in log
-    # non-blocking shape: the original runs untouched
-    log.clear()
-    nb = Proc(work_after=0)
-    nb.process_input_queue_block = False
-    nb._process_input_queue()
-    assert log == ["orig"]
-    # a raising pump never takes the loop down
-    log.clear()
-
-    def boom():
-        raise ValueError("pump broke")
-
-    class Proc2(Proc):
-        pass
-
-    Proc2._process_input_queue = Proc._process_input_queue._pd_fabric_orig
-    rank_mod.install_idle_pump_hook(
-        proc_cls=Proc2, enabled=True, period_s=0.01, pump_all=boom
-    )
-    Proc2(work_after=2)._process_input_queue()
-    assert log.count("idle") == 2
-    # a vLLM whose idle loop moved is an error, not a silent skip
-    with pytest.raises(RuntimeError, match="_process_input_queue"):
-        rank_mod.install_idle_pump_hook(proc_cls=object, enabled=True)
 
 
 def test_run_headless_engine_exit_codes_and_lock_release(tmp_path):

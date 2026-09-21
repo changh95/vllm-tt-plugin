@@ -160,6 +160,43 @@ def _env_float(env: dict[str, str], key: str, default: float) -> float:
     return float(env.get(key, default))
 
 
+# The model's traced MASKED prefill buckets (tt-metal models/demos/blackhole/qwen36/
+# tt/model.py ``Qwen36Model._PREFILL_MASK_BUCKETS``; the model is not importable on a
+# host without ttnn, so the list is mirrored here).  ``QWEN36_PREFILL_BUCKET_TRACE``
+# selects which are traced, parsed like ``masked_bucket_trace.parse_bucket_trace_gate``.
+PREFILL_MASK_BUCKETS = (128, 256, 512, 1024, 2048)
+
+
+def largest_traced_prefill_bucket(gate: str | None = "1") -> int:
+    """Tokens the largest traced prefill bucket fills at warm-up (the KV-pool
+    guard's quantity).  ``gate`` = ``QWEN36_PREFILL_BUCKET_TRACE``: "1" / "all" /
+    "true" (and unset / "0": the plugin's ``platform.py`` refuses KV transfer
+    without the trace, so the guard assumes every bucket) -> the largest bucket; a
+    comma list -> the largest listed (a value not in the model's table raises)."""
+    if gate is None or gate.strip() in ("", "0", "1", "all", "true"):
+        return max(PREFILL_MASK_BUCKETS)
+    picked: list[int] = []
+    for part in gate.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            b = int(part)
+        except ValueError as e:
+            raise ValueError(
+                f"QWEN36_PREFILL_BUCKET_TRACE={gate!r}: {part!r} is not a bucket"
+            ) from e
+        if b not in PREFILL_MASK_BUCKETS:
+            raise ValueError(
+                f"QWEN36_PREFILL_BUCKET_TRACE={gate!r}: bucket {b} is not one of "
+                f"{PREFILL_MASK_BUCKETS}"
+            )
+        picked.append(b)
+    if not picked:
+        return max(PREFILL_MASK_BUCKETS)
+    return max(picked)
+
+
 # --------------------------------------------------------------------------- #
 # settings
 # --------------------------------------------------------------------------- #
@@ -232,6 +269,9 @@ class PairSettings:
     tag: str = "p3"
     p_extra_args: list[str] = field(default_factory=list)
     d_extra_args: list[str] = field(default_factory=list)
+    # QWEN36_PREFILL_BUCKET_TRACE as the model parses it ("1" = every bucket; a
+    # comma list = those); sizes the KV-pool guard below
+    bucket_trace_gate: str = "1"
 
     def __post_init__(self) -> None:
         if not self.tag:
@@ -286,20 +326,23 @@ class PairSettings:
             )
         if self.export_slots < 1:
             raise ValueError("EXPORT_SLOTS must be >= 1")
-        # The model's prefill bucket traces fill the WHOLE chunk (chunk_tokens / 64 = 32
-        # KV blocks) through a fixed-width page table at warm-up; a KV pool with fewer
-        # blocks makes that fill write past the pool in DRAM and the rank hangs in the
-        # next decode warm-up (device stopped consuming commands; seen twice on the
-        # 2026-09-21 tiny pairs: P_POOL=1024 -> "KV cache 18 blocks" vs a 32-block
-        # bucket, py-spy in SystemMemoryManager::fetch_queue_reserve_back).  One spare
-        # block (the pad block the scheduler never hands out) on top.
-        min_pool = self.chunk_tokens + 64
+        # The model's prefill bucket traces (QWEN36_PREFILL_BUCKET_TRACE, which the
+        # plugin requires ON for KV transfer) fill the WHOLE largest traced bucket
+        # (2048 tokens = 32 KV blocks) through a fixed-width page table at warm-up,
+        # independent of the transfer CHUNK_TOKENS; a KV pool with fewer blocks makes
+        # that fill write past the pool in DRAM and the rank hangs in the next decode
+        # warm-up (device stopped consuming commands; seen twice on the 2026-09-21
+        # tiny pairs: P_POOL=1024 -> "KV cache 18 blocks" vs a 32-block bucket,
+        # py-spy in SystemMemoryManager::fetch_queue_reserve_back).  One spare block
+        # (the pad block the scheduler never hands out) on top.
+        bucket = largest_traced_prefill_bucket(self.bucket_trace_gate)
+        min_pool = bucket + 64
         for name, pool in (("P_POOL", self.p_pool), ("D_POOL", self.d_pool)):
             if pool < min_pool:
                 raise ValueError(
-                    f"{name}={pool} tokens is below the {self.chunk_tokens}-token "
-                    f"prefill bucket trace + one pad block (>= {min_pool}); the "
-                    "warm-up fill would write past the KV pool and hang the rank"
+                    f"{name}={pool} tokens is below the {bucket}-token prefill bucket "
+                    f"trace + one pad block (>= {min_pool}); the warm-up fill would "
+                    "write past the KV pool and hang the rank"
                 )
         if self.export_budget <= 0:
             self.export_budget = export_pool_bytes(self.ctx, slots=self.export_slots)
@@ -345,6 +388,9 @@ class PairSettings:
             ctrl_dir=e.get("CTRL_DIR", cls.ctrl_dir),
             max_inflight=_env_int(e, "MAX_INFLIGHT", cls.max_inflight),
             chunk_tokens=_env_int(e, "CHUNK_TOKENS", cls.chunk_tokens),
+            bucket_trace_gate=e.get(
+                "QWEN36_PREFILL_BUCKET_TRACE", cls.bucket_trace_gate
+            ),
             chunks_per_step=_env_int(e, "CHUNKS_PER_STEP", cls.chunks_per_step),
             hybrid_state=e.get("HYBRID_STATE", cls.hybrid_state),
             transport=e.get("TRANSPORT", cls.transport),
