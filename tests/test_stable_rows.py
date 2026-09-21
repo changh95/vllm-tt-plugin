@@ -125,7 +125,9 @@ def test_pad_row_block_tables_are_zeroed():
     b.remove_request("a")
     stale = b.block_tables_for_rows([0], width=2)[0]
     assert stale[0, 0].item() == 7, "the raw table still holds a's block"
-    (table,) = b.slot_block_tables(b.occupied_rows(), zero_gaps=True, total=ROWS, width=2)
+    (table,) = b.slot_block_tables(
+        b.occupied_rows(), zero_gaps=True, total=ROWS, width=2
+    )
     assert table.tolist() == [[0, 0], [9, 0], [0, 0], [0, 0]]
 
 
@@ -293,7 +295,10 @@ def test_rows_are_held_for_life_and_no_remap_is_ever_issued():
 
     # Step 1: four new requests prefill into rows 0..3 == slots 0..3.
     r._update_states(
-        _step(new=[_new_req(f"r{i}", [1, 2], i + 1) for i in range(4)], scheduled=["r0", "r1", "r2", "r3"])
+        _step(
+            new=[_new_req(f"r{i}", [1, 2], i + 1) for i in range(4)],
+            scheduled=["r0", "r1", "r2", "r3"],
+        )
     )
     assert _prefill_step(r, ["r0", "r1", "r2", "r3"]) == ([0, 1, 2, 3], [0, 1, 2, 3])
 
@@ -394,7 +399,11 @@ def _sampling_runner(batch):
         vocab_size=VOCAB,
         tt_per_lane_max_num_seqs=ROWS,
     )
-    for name in ("_get_output_tokens", "_host_sample_stable_rows", "apply_grammar_bitmask"):
+    for name in (
+        "_get_output_tokens",
+        "_host_sample_stable_rows",
+        "apply_grammar_bitmask",
+    ):
         setattr(r, name, getattr(TTModelRunner, name).__get__(r))
     return r
 
@@ -553,7 +562,9 @@ def test_select_live_decode_rows_drops_pad_rows_in_row_order():
         logprobs=torch.arange(8, dtype=torch.float32).reshape(4, 2),
         selected_token_ranks=torch.arange(4),
     )
-    tokens, logprobs, req_ids = select_live_decode_rows(["a", None, "c", None], sampled, lp)
+    tokens, logprobs, req_ids = select_live_decode_rows(
+        ["a", None, "c", None], sampled, lp
+    )
     assert tokens.tolist() == [[10], [30]]
     assert req_ids == ["a", "c"]
     assert logprobs is not None
