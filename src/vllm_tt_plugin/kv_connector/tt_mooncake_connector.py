@@ -7,7 +7,9 @@ one from the transferred state), then stages the request's paged-KV blocks and i
 model-internal per-slot state (the Qwen3.x GDN recurrent + conv state) into one
 contiguous host buffer registered with Mooncake. The decode instance
 (``kv_consumer``) learns the buffer's address over a ZMQ side channel, pulls it with
-``transfer_sync_read`` (same host: TCP; cross-host: RDMA), writes the KV blocks into
+``transfer_sync_read`` (same host: TCP; cross-host: RDMA) -- or, when both run on one
+host, maps the producer's /dev/shm-backed staging buffer read-only and imports straight
+out of it (no copy; ``QWEN36_PD_SHM=0`` disables) -- writes the KV blocks into
 its own paged cache, parks the state snapshot for the runner to write into the
 request's decode slot when the request gets one, and runs the last prompt token as an
 ordinary decode step.  vLLM plumbing follows the in-tree Mooncake/NIXL connectors
@@ -22,15 +24,25 @@ config`` JSON)::  {"kv_connector": "TTMooncakeConnector", "kv_connector_module_p
 "kv_consumer", "kv_connector_extra_config": {"side_channel_host": "127.0.0.1",
 "side_channel_port": 18100, "mooncake_protocol": "tcp", "mooncake_device": ""}}  The
 producer's ``side_channel_host``/``side_channel_port`` are what it advertises to
-decoders in the returned ``kv_transfer_params``; a consumer needs no static port."""
+decoders in the returned ``kv_transfer_params``; a consumer needs no static port.  A
+proxy may pick the ``transfer_id`` itself (``kv_transfer_params.transfer_id`` on the
+producer request; the producer echoes it) and post to the consumer before the
+producer has answered: the consumer derives ``num_tokens`` from its own tokenization
+and its GET blocks on the side channel until the producer has staged."""
 
 from __future__ import annotations
 
+import contextlib
+import json
 import math
+import mmap
 import os
 import queue
+import socket
 import threading
 import time
+import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -57,8 +69,107 @@ if TYPE_CHECKING:
 logger = init_tt_logger(__name__)
 
 _DEFAULT_SIDE_CHANNEL_PORT = 18100
+# The producer holds a GET for a not-yet-staged transfer this long before answering
+# "pending" (must stay below the consumer's 5 s REQ receive timeout); the consumer then
+# re-polls every _GET_POLL_S until _GET_TIMEOUT_S.
+_GET_WAIT_S = 4.0
 _GET_POLL_S = 0.02
 _GET_TIMEOUT_S = 600.0
+_SHM_DIR = "/dev/shm"
+_SHM_PREFIX = "qwen36-pd-"
+
+
+def shm_enabled() -> bool:
+    """Same-host zero-copy hand-off: the producer backs its staging buffers with
+    /dev/shm files and a consumer on the same host maps them instead of pulling a
+    copy. ``QWEN36_PD_SHM=0`` disables it on either side."""
+    return os.environ.get("QWEN36_PD_SHM", "1") != "0" and os.path.isdir(_SHM_DIR)
+
+
+def host_identity() -> str:
+    """Identity a consumer compares with its own before trying a producer's shm
+    segment: hostname plus the kernel boot id. Two containers on one machine share
+    the boot id but normally neither the hostname nor /dev/shm, and the segment must
+    also open, so a false match only costs a failed open (then the Mooncake pull runs
+    as usual)."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot = f.read().strip()
+    except OSError:
+        boot = ""
+    return f"{socket.gethostname()}:{boot}"
+
+
+def shm_segment_name_is_valid(name: str) -> bool:
+    return (
+        isinstance(name, str)
+        and name.startswith(_SHM_PREFIX)
+        and "/" not in name
+        and name not in (".", "..")
+    )
+
+
+def map_shm_segment(name: str) -> torch.Tensor | None:
+    """Map a producer's staging segment read-only as one uint8 tensor (the whole file).
+    Returns ``None`` when the segment cannot be opened (other host, producer gone, shm
+    disabled there)."""
+    if not shm_segment_name_is_valid(name):
+        return None
+    path = os.path.join(_SHM_DIR, name)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            mm = mmap.mmap(
+                fd,
+                0,
+                flags=mmap.MAP_SHARED | getattr(mmap, "MAP_POPULATE", 0),
+                prot=mmap.PROT_READ,
+            )
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        return None
+    with warnings.catch_warnings():
+        # torch warns that a read-only buffer must not be written; the consumer only
+        # reads (views + borrowed uploads)
+        warnings.simplefilter("ignore", UserWarning)
+        return torch.frombuffer(mm, dtype=torch.uint8)
+
+
+def unlink_stale_shm_segments(pids_alive=None) -> list[str]:
+    """Remove ``/dev/shm/qwen36-pd-<pid>-*`` files whose producer process is gone (a
+    producer killed with SIGKILL never ran ``shutdown``). Returns the removed names."""
+    removed = []
+    try:
+        names = os.listdir(_SHM_DIR)
+    except OSError:
+        return removed
+    for name in names:
+        if not name.startswith(_SHM_PREFIX):
+            continue
+        try:
+            pid = int(name[len(_SHM_PREFIX) :].split("-", 1)[0])
+        except ValueError:
+            continue
+        alive = pid in pids_alive if pids_alive is not None else _pid_alive(pid)
+        if alive:
+            continue
+        try:
+            os.unlink(os.path.join(_SHM_DIR, name))
+            removed.append(name)
+        except OSError:
+            pass
+    return removed
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 # --------------------------------------------------------------------------------------
@@ -164,16 +275,46 @@ def payload_nbytes(kv, rec_snap, conv_snap) -> int:
 class _HostBufferPool:
     """Host uint8 buffers, page-faulted once and registered once with the Mooncake
     engine, reused across requests (per-request allocate + register + first-touch
-    cost 20-30 ms and halved the TCP pull rate)."""
+    cost 20-30 ms and halved the TCP pull rate). With ``shm=True`` (producer, see
+    ``shm_enabled``) every buffer is a MAP_SHARED mapping of a fresh
+    ``/dev/shm/qwen36-pd-<pid>-<id>`` file, so a consumer on this host can map the same
+    bytes instead of pulling them; the pointer registered with Mooncake is the same
+    mapping, so a consumer elsewhere still pulls over TCP/RDMA."""
 
     _MIN = 256 << 20
     _STEP = 64 << 20
 
-    def __init__(self, engine, engine_lock: threading.Lock, name: str):
+    def __init__(
+        self, engine, engine_lock: threading.Lock, name: str, shm: bool = False
+    ):
         self.engine, self.engine_lock, self.name = engine, engine_lock, name
+        self.shm = shm
         self._free: list[torch.Tensor] = []
         self._lock = threading.Lock()
         self.total = 0
+        self._shm_names: dict[int, str] = {}  # buffer data_ptr -> segment name
+        self._shm_maps: list[mmap.mmap] = []
+
+    def _alloc(self, cap: int) -> torch.Tensor:
+        if not self.shm:
+            b = torch.empty(cap, dtype=torch.uint8)
+            b.fill_(0)  # fault the pages in now, not inside the transfer
+            return b
+        name = f"{_SHM_PREFIX}{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        path = os.path.join(_SHM_DIR, name)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        try:
+            os.ftruncate(fd, cap)
+            mm = mmap.mmap(
+                fd, cap, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE
+            )
+        finally:
+            os.close(fd)
+        b = torch.frombuffer(mm, dtype=torch.uint8)
+        b.fill_(0)  # fault the tmpfs pages in now
+        self._shm_maps.append(mm)
+        self._shm_names[b.data_ptr()] = name
+        return b
 
     def acquire(self, nbytes: int) -> torch.Tensor:
         with self._lock:
@@ -184,24 +325,35 @@ class _HostBufferPool:
                     i
                 )  # by index: list.remove() would compare tensors element-wise
         cap = max(self._MIN, -(-nbytes // self._STEP) * self._STEP)
-        b = torch.empty(cap, dtype=torch.uint8)
-        b.fill_(0)  # fault the pages in now, not inside the transfer
+        b = self._alloc(cap)
         with self.engine_lock:
             rc = self.engine.register_memory(b.data_ptr(), cap)
         if rc != 0:
             raise RuntimeError(f"register_memory({cap}) failed ({rc})")
         self.total += cap
         logger.info(
-            "[pd] %s buffer pool: +%.0f MiB (total %.1f GiB)",
+            "[pd] %s buffer pool: +%.0f MiB (total %.1f GiB)%s",
             self.name,
             cap / 2**20,
             self.total / 2**30,
+            f" shm {self._shm_names[b.data_ptr()]}" if self.shm else "",
         )
         return b
 
     def release(self, b: torch.Tensor) -> None:
         with self._lock:
             self._free.append(b)
+
+    def shm_name(self, b: torch.Tensor) -> str | None:
+        """The /dev/shm segment ``b`` is a mapping of (``None`` for a plain buffer)."""
+        return self._shm_names.get(b.data_ptr())
+
+    def close(self) -> None:
+        """Unlink the pool's shm files (the mappings stay valid until dropped)."""
+        for name in self._shm_names.values():
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(_SHM_DIR, name))
+        self._shm_names.clear()
 
 
 def payload_digest(buf: torch.Tensor, nbytes: int) -> str:
@@ -249,6 +401,7 @@ class StageReq:
     req_id: str
     block_ids: list[int]
     num_tokens: int
+    transfer_id: str = ""  # the side-channel key (see _SchedulerSide.transfer_id)
 
 
 @dataclass
@@ -462,18 +615,28 @@ class _SchedulerSide:
         if not params:
             return
         if params.get("do_remote_prefill"):
-            needed = ("remote_host", "remote_port", "transfer_id", "num_tokens")
+            needed = ("remote_host", "remote_port", "transfer_id")
             if all(k in params for k in needed):
                 block_ids = (
                     list(blocks.get_block_ids()[0]) if num_external_tokens > 0 else []
                 )
+                # num_tokens = the producer's truncated prompt length. A proxy that
+                # posts to the consumer before the producer answered cannot send it;
+                # it is the same tokenization minus the last token (the count
+                # get_num_new_matched_tokens reported), and the worker checks it
+                # against the payload header.
+                if params.get("num_tokens") is not None:
+                    num_tokens = int(params["num_tokens"])
+                else:
+                    n = len(request.prompt_token_ids or [])
+                    num_tokens = n - 1 if n > 1 else n
                 self._to_recv[request.request_id] = RecvReq(
                     req_id=request.request_id,
                     block_ids=block_ids,
                     remote_host=str(params["remote_host"]),
                     remote_port=int(params["remote_port"]),
                     transfer_id=str(params["transfer_id"]),
-                    num_tokens=int(params["num_tokens"]),
+                    num_tokens=num_tokens,
                 )
             else:
                 logger.warning(
@@ -488,6 +651,7 @@ class _SchedulerSide:
                 req_id=request.request_id,
                 block_ids=list(blocks.get_block_ids()[0]),
                 num_tokens=int(request.num_prompt_tokens),
+                transfer_id=self.transfer_id(request),
             )
 
     def build_connector_meta(
@@ -542,15 +706,25 @@ class _SchedulerSide:
         # The worker stages synchronously in wait_for_save of the prefill step and
         # reports the request in finished_sending in that same step's output; the
         # scheduler frees the blocks from that report.
-        out = {
+        return True, {
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_host": self.c._side_host,
             "remote_port": self.c._side_port,
-            "transfer_id": request.request_id,
+            "transfer_id": self.transfer_id(request),
             "num_tokens": int(request.num_prompt_tokens),
         }
-        return True, out
+
+    @staticmethod
+    def transfer_id(request: Request) -> str:
+        """The id the staging is filed under. A proxy that fans out to the consumer
+        before this instance answered chooses it (``kv_transfer_params.transfer_id``)
+        because it cannot predict ``request.request_id``: vLLM's InputProcessor
+        appends ``-<8 hex>`` to the ``X-Request-Id``-derived id, differently on every
+        instance. Without one, the engine request id (the serial proxy round trip)."""
+        params = request.kv_transfer_params or {}
+        tid = params.get("transfer_id")
+        return str(tid) if tid else str(request.request_id)
 
 
 # --------------------------------------------------------------------------------------
@@ -565,6 +739,24 @@ class _Staged:
     nbytes: int
     header: dict[str, Any]
     t_staged: float
+    shm_name: str | None = None  # the /dev/shm segment ``buf`` maps (same-host path)
+
+
+@dataclass
+class _Fetched:
+    """Consumer: one pulled (or mapped) payload waiting for the main thread."""
+
+    rr: RecvReq
+    buf: torch.Tensor  # exactly the payload bytes (a view for a mapped segment)
+    header: dict[str, Any]
+    release: Any  # callable: the consumer is done with ``buf``
+    via: str  # "shm" | "pull"
+    t_wait: float
+    t_pull: float
+
+
+class _PullAborted(Exception):
+    """The consumer request finished (client hang-up) while its pull was in flight."""
 
 
 class _WorkerSide:
@@ -573,6 +765,8 @@ class _WorkerSide:
         self.runner = None
         self.model = None  # the inner Qwen36Model
         self.engine = None
+        self.pool: _HostBufferPool | None = None
+        self.local_host = "127.0.0.1"
         self.rpc_port = 0
         self._lock = threading.Lock()
         self._engine_lock = (
@@ -590,10 +784,13 @@ class _WorkerSide:
         # consumer
         self._pool: ThreadPoolExecutor | None = None
         self._inflight: dict[str, RecvReq] = {}
-        self._fetched: queue.Queue[
-            tuple[RecvReq, torch.Tensor, dict[str, Any], float, float]
-        ] = queue.Queue()
+        self._aborted: set[str] = set()  # in-flight pulls whose request finished
+        self._fetched: queue.Queue[_Fetched] = queue.Queue()
         self._failed: queue.Queue[tuple[RecvReq, BaseException]] = queue.Queue()
+        self._shm_ok = shm_enabled()
+        self._host_id = host_identity()
+        self._shm_segments: dict[str, torch.Tensor] = {}  # mapped producer segments
+        self._shm_lock = threading.Lock()
         self.stats = {
             "staged": 0,
             "staged_bytes": 0,
@@ -629,7 +826,6 @@ class _WorkerSide:
                 f"prefill_paged_slots (needs the qwen36 TP model)"
             )
         self.engine = TransferEngine()
-        self.pool: _HostBufferPool | None = None
         local_host = self.c._side_host if self.c._is_producer else "127.0.0.1"
         rc = self.engine.initialize(
             local_host, "P2PHANDSHAKE", self.c._protocol, self.c._device_name
@@ -642,6 +838,7 @@ class _WorkerSide:
             self.engine,
             self._engine_lock,
             "staging" if self.c._is_producer else "receive",
+            shm=self.c._is_producer and self._shm_ok,
         )
         if self.c._is_producer:
             # park each prefilled request's GDN snapshot under its slot; never write
@@ -653,11 +850,13 @@ class _WorkerSide:
             )
             self._zmq_thread.start()
             logger.info(
-                "TTMooncakeConnector producer: mooncake %s:%d, side channel %s:%d",
+                "TTMooncakeConnector producer: mooncake %s:%d, side channel %s:%d, "
+                "staging %s",
                 local_host,
                 self.rpc_port,
                 self.c._side_host,
                 self.c._side_port,
+                "/dev/shm (same-host consumers map it)" if self.pool.shm else "malloc",
             )
         else:
             self._pool = ThreadPoolExecutor(
@@ -665,9 +864,10 @@ class _WorkerSide:
             )
             runner.pd_pending_gdn = {}
             logger.info(
-                "TTMooncakeConnector consumer: mooncake %s:%d",
+                "TTMooncakeConnector consumer: mooncake %s:%d, same-host shm %s",
                 local_host,
                 self.rpc_port,
+                "on" if self._shm_ok else "off",
             )
 
     def post_warmup(self):
@@ -712,42 +912,94 @@ class _WorkerSide:
         self._stop.set()
         if self._pool is not None:
             self._pool.shutdown(wait=False)
+        if self.pool is not None:
+            self.pool.close()
 
     # ---- producer ----
+    def _get_reply(self, tid: str, host_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            st = self._staged.get(tid)
+        if st is None:
+            return None
+        rep = {
+            "status": "ok",
+            "segment": f"{self.local_host}:{self.rpc_port}",
+            "addr": st.addr,
+            "nbytes": st.nbytes,
+            "header": st.header,
+            "host": host_id,
+            "shm": None,
+        }
+        if st.shm_name is not None:
+            # ``buf`` is the pooled buffer itself, so the payload starts at 0; carry
+            # the offset anyway so the consumer never assumes it
+            rep["shm"] = {"name": st.shm_name, "offset": 0, "nbytes": st.nbytes}
+        return rep
+
+    @staticmethod
+    def _router_send(sock, ident: bytes, rep: dict[str, Any]) -> None:
+        # REQ clients expect [empty delimiter, body]; ROUTER prepends the identity
+        sock.send_multipart([ident, b"", json.dumps(rep).encode()])
+
     def _serve_side_channel(self):
+        """ROUTER loop: GET for a transfer that is not staged yet is parked (up to
+        _GET_WAIT_S) and answered as soon as stage_after_step files it, so a consumer
+        that was posted to concurrently with the producer does not poll; other
+        clients are served meanwhile (a REP socket would block them)."""
         ctx = zmq.Context()
-        sock = ctx.socket(zmq.REP)
+        sock = ctx.socket(zmq.ROUTER)
         sock.bind(f"tcp://{self.c._side_host}:{self.c._side_port}")
-        sock.setsockopt(zmq.RCVTIMEO, 500)
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        waiters: dict[str, list[tuple[bytes, float]]] = {}  # tid -> [(ident, deadline)]
+        host_id = host_identity()
         while not self._stop.is_set():
             try:
-                msg = sock.recv_json()
-            except zmq.Again:
+                events = dict(poller.poll(1 if waiters else 500))
+            except zmq.ZMQError as e:
+                logger.warning("side channel poll failed: %s", e)
                 continue
-            except Exception as e:  # noqa: BLE001
-                logger.warning("side channel recv failed: %s", e)
-                continue
-            op, tid = msg.get("op"), str(msg.get("transfer_id", ""))
-            if op == "GET":
-                with self._lock:
-                    st = self._staged.get(tid)
-                if st is None:
-                    sock.send_json({"status": "pending"})
+            if sock in events:
+                try:
+                    frames = sock.recv_multipart()
+                    ident, msg = frames[0], json.loads(frames[-1])
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("side channel recv failed: %s", e)
+                    continue
+                op, tid = msg.get("op"), str(msg.get("transfer_id", ""))
+                if op == "GET":
+                    rep = self._get_reply(tid, host_id)
+                    if rep is None:
+                        waiters.setdefault(tid, []).append(
+                            (ident, time.monotonic() + _GET_WAIT_S)
+                        )
+                    else:
+                        self._router_send(sock, ident, rep)
+                elif op in ("DONE", "CANCEL"):
+                    self._release(tid)
+                    for w_ident, _ in waiters.pop(tid, []):
+                        self._router_send(sock, w_ident, {"status": "cancelled"})
+                    self._router_send(sock, ident, {"status": "ok"})
                 else:
-                    sock.send_json(
-                        {
-                            "status": "ok",
-                            "segment": f"{self.local_host}:{self.rpc_port}",
-                            "addr": st.addr,
-                            "nbytes": st.nbytes,
-                            "header": st.header,
-                        }
+                    self._router_send(
+                        sock, ident, {"status": "error", "msg": f"unknown op {op}"}
                     )
-            elif op in ("DONE", "CANCEL"):
-                self._release(tid)
-                sock.send_json({"status": "ok"})
-            else:
-                sock.send_json({"status": "error", "msg": f"unknown op {op}"})
+            if waiters:
+                now = time.monotonic()
+                for tid in list(waiters):
+                    rep = self._get_reply(tid, host_id)
+                    still = []
+                    for ident, deadline in waiters[tid]:
+                        if rep is not None:
+                            self._router_send(sock, ident, rep)
+                        elif now >= deadline:
+                            self._router_send(sock, ident, {"status": "pending"})
+                        else:
+                            still.append((ident, deadline))
+                    if still:
+                        waiters[tid] = still
+                    else:
+                        del waiters[tid]
         sock.close(0)
         ctx.term()
 
@@ -763,7 +1015,7 @@ class _WorkerSide:
         from models.demos.blackhole.qwen36.tt import pd_transfer
 
         for sr in meta.stage:
-            if sr.req_id in self._staged or sr.req_id in self._stage_done:
+            if sr.req_id in self._stage_done:
                 continue  # re-shipped until the scheduler sees finished_sending
             t0 = time.perf_counter()
             slot = self.runner._req_state_slot.get(sr.req_id)
@@ -803,9 +1055,11 @@ class _WorkerSide:
             if release_snapshot is not None:
                 release_snapshot(rec_snap, conv_snap)
             addr, nbytes = buf.data_ptr(), int(header["nbytes"])
+            tid = sr.transfer_id or sr.req_id
+            shm_name = self.pool.shm_name(buf)
             with self._lock:
-                self._staged[sr.req_id] = _Staged(
-                    buf, addr, nbytes, header, time.time()
+                self._staged[tid] = _Staged(
+                    buf, addr, nbytes, header, time.time(), shm_name
                 )
                 self._finished_sending.add(sr.req_id)
                 self._stage_done.add(sr.req_id)
@@ -815,7 +1069,7 @@ class _WorkerSide:
             self.stats["stage_ms"] += 1e3 * (t2 - t0)
             logger.info(
                 "[pd] staged %s: %d tokens, %d blocks, %.1f MiB (export %.1f ms, "
-                "pack+register %.1f ms) digest %s",
+                "pack+register %.1f ms) digest %s transfer %s via %s",
                 sr.req_id,
                 sr.num_tokens,
                 n_blocks,
@@ -823,6 +1077,8 @@ class _WorkerSide:
                 1e3 * (t1 - t0),
                 1e3 * (t2 - t1),
                 payload_digest(buf, header["nbytes"]),
+                tid,
+                f"shm {shm_name}" if shm_name else "mooncake",
             )
         # garbage-collect stagings nobody pulled (decoder died / aborted upstream)
         now = time.time()
@@ -873,13 +1129,54 @@ class _WorkerSide:
         finally:
             sock.close(0)
 
+    def _shm_segment(self, name: str) -> torch.Tensor | None:
+        """The producer's staging segment ``name`` mapped read-only, cached per name
+        (the producer reuses its pooled buffers, so a handful of mappings serve every
+        request)."""
+        with self._shm_lock:
+            seg = self._shm_segments.get(name)
+        if seg is not None:
+            return seg
+        t0 = time.perf_counter()
+        seg = map_shm_segment(name)
+        if seg is None:
+            logger.info(
+                "[pd] shm segment %s does not open here; pulling through Mooncake",
+                name,
+            )
+            return None
+        with self._shm_lock:
+            self._shm_segments[name] = seg
+        logger.info(
+            "[pd] mapped producer shm segment %s (%.0f MiB) read-only in %.1f ms",
+            name,
+            seg.numel() / 2**20,
+            1e3 * (time.perf_counter() - t0),
+        )
+        return seg
+
+    def _send_done_later(self, rr: RecvReq) -> None:
+        """DONE lets the producer recycle the staging; off the main thread."""
+        msg = {"op": "DONE", "transfer_id": rr.transfer_id}
+        with contextlib.suppress(RuntimeError):  # executor shut down
+            self._pool.submit(
+                self._side_channel_call, rr.remote_host, rr.remote_port, msg
+            )
+
+    def _is_aborted(self, req_id: str) -> bool:
+        with self._lock:
+            return req_id in self._aborted
+
     def _pull(self, rr: RecvReq):
-        """Background: GET the staging descriptor, pull the bytes into a registered
-        local buffer."""
+        """Background: GET the staging descriptor, then either map the producer's shm
+        segment (same host: no copy, DONE once the runner has imported) or pull the
+        bytes into a registered local buffer (DONE right away)."""
         try:
             t0 = time.perf_counter()
             deadline = t0 + _GET_TIMEOUT_S
             while True:
+                if self._is_aborted(rr.req_id):
+                    raise _PullAborted(rr.req_id)
                 rep = self._side_channel_call(
                     rr.remote_host,
                     rr.remote_port,
@@ -894,25 +1191,48 @@ class _WorkerSide:
                 time.sleep(_GET_POLL_S)
             t1 = time.perf_counter()
             nbytes = int(rep["nbytes"])
-            buf = self.pool.acquire(nbytes)
-            addr = buf.data_ptr()
-            with self._engine_lock:
-                rc = self.engine.transfer_sync_read(
-                    rep["segment"], addr, int(rep["addr"]), nbytes
+            shm = rep.get("shm")
+            buf = None
+            if shm and self._shm_ok and rep.get("host") == self._host_id:
+                seg = self._shm_segment(str(shm["name"]))
+                off = int(shm["offset"])
+                if seg is not None and off + nbytes <= seg.numel():
+                    buf = seg[off : off + nbytes]
+                    # the producer keeps the bytes until DONE; send it when the runner
+                    # has finished reading the mapping (release below)
+                    release, via = (lambda: self._send_done_later(rr)), "shm"
+            if buf is None:
+                pooled = self.pool.acquire(nbytes)
+                with self._engine_lock:
+                    rc = self.engine.transfer_sync_read(
+                        rep["segment"], pooled.data_ptr(), int(rep["addr"]), nbytes
+                    )
+                if rc != 0:
+                    self.pool.release(pooled)
+                    raise RuntimeError(f"transfer_sync_read failed ({rc})")
+                self._side_channel_call(
+                    rr.remote_host,
+                    rr.remote_port,
+                    {"op": "DONE", "transfer_id": rr.transfer_id},
                 )
-            if rc != 0:
-                self.pool.release(buf)
-                raise RuntimeError(f"transfer_sync_read failed ({rc})")
+                buf = pooled[:nbytes]
+                release, via = (lambda b=pooled: self.pool.release(b)), "pull"
             t2 = time.perf_counter()
-            self._side_channel_call(
-                rr.remote_host,
-                rr.remote_port,
-                {"op": "DONE", "transfer_id": rr.transfer_id},
+            self._fetched.put(
+                _Fetched(rr, buf, rep["header"], release, via, t1 - t0, t2 - t1)
             )
-            self._fetched.put((rr, buf, rep["header"], t1 - t0, t2 - t1))
+        except _PullAborted as e:
+            self._failed.put((rr, e))
         except BaseException as e:  # noqa: BLE001
             logger.exception("[pd] pull failed for %s", rr.req_id)
             self._failed.put((rr, e))
+
+    def _finish_recv(self, req_id: str) -> None:
+        self._inflight.pop(req_id, None)
+        with self._lock:
+            self._aborted.discard(req_id)
+            self._finished_recving.add(req_id)
+            self._recv_done.add(req_id)
 
     def _drain_fetched(self):
         """Main thread: write pulled KV into the paged cache, park the GDN snapshot,
@@ -921,78 +1241,115 @@ class _WorkerSide:
 
         while True:
             try:
-                rr, buf, header, t_wait, t_pull = self._fetched.get_nowait()
+                f = self._fetched.get_nowait()
             except queue.Empty:
                 break
+            rr, buf, header = f.rr, f.buf, f.header
             t0 = time.perf_counter()
-            kv, rec, conv = unpack_payload(buf, header)
             n_blocks = int(header["n_blocks"])
-            if len(rr.block_ids) < n_blocks:
+            if self._is_aborted(rr.req_id):
+                logger.info("[pd] %s: finished before its import; dropping", rr.req_id)
+                f.release()
+            elif int(header["num_tokens"]) != int(rr.num_tokens):
+                # the producer prefilled a different number of tokens than this
+                # instance derived from its own tokenization: the state does not fit
+                # the request; the runner prefills it locally instead
+                logger.error(
+                    "[pd] %s: producer staged %d tokens, this instance expects %d "
+                    "(tokenization mismatch?); skipping import",
+                    rr.req_id,
+                    int(header["num_tokens"]),
+                    int(rr.num_tokens),
+                )
+                f.release()
+            elif len(rr.block_ids) < n_blocks:
                 logger.error(
                     "[pd] %s: %d local blocks for a %d-block payload; skipping import",
                     rr.req_id,
                     len(rr.block_ids),
                     n_blocks,
                 )
-                self.pool.release(buf)
+                f.release()
             else:
+                kv, rec, conv = unpack_payload(buf, header)
                 pd_transfer.import_kv_blocks(self.model, rr.block_ids[:n_blocks], kv)
-                # keep the snapshot alive (views into the pooled buf) until the runner
-                # writes the decode slot; the runner calls the release when done
-                self.runner.pd_pending_gdn[rr.req_id] = (
-                    rec,
-                    conv,
-                    buf,
-                    lambda b=buf: self.pool.release(b),
-                )
+                # keep the snapshot alive (views into buf: the pooled receive buffer
+                # or the producer's mapped segment) until the runner writes the decode
+                # slot; the runner calls the release when done (for a mapped segment
+                # that is what sends DONE to the producer)
+                self.runner.pd_pending_gdn[rr.req_id] = (rec, conv, buf, f.release)
             t1 = time.perf_counter()
-            self._inflight.pop(rr.req_id, None)
-            with self._lock:
-                self._finished_recving.add(rr.req_id)
-                self._recv_done.add(rr.req_id)
+            self._finish_recv(rr.req_id)
             self.stats["pulled"] += 1
             self.stats["pulled_bytes"] += header["nbytes"]
-            self.stats["pull_ms"] += 1e3 * t_pull
+            self.stats["pull_ms"] += 1e3 * f.t_pull
             self.stats["import_ms"] += 1e3 * (t1 - t0)
-            logger.info(
-                "[pd] pulled %s: %d tokens, %.1f MiB (wait %.1f ms, pull %.1f ms = "
-                "%.2f GB/s, KV import %.1f ms) digest %s blocks %s",
-                rr.req_id,
-                header["num_tokens"],
-                header["nbytes"] / 2**20,
-                1e3 * t_wait,
-                1e3 * t_pull,
-                header["nbytes"] / max(t_pull, 1e-9) / 2**30,
-                1e3 * (t1 - t0),
-                payload_digest(buf, header["nbytes"]),
-                rr.block_ids[:n_blocks],
-            )
+            if f.via == "shm":
+                logger.info(
+                    "[pd] pulled %s: %d tokens, %.1f MiB via shm (wait %.1f ms, map "
+                    "%.1f ms, KV import %.1f ms) digest %s blocks %s",
+                    rr.req_id,
+                    header["num_tokens"],
+                    header["nbytes"] / 2**20,
+                    1e3 * f.t_wait,
+                    1e3 * f.t_pull,
+                    1e3 * (t1 - t0),
+                    payload_digest(buf, header["nbytes"]),
+                    rr.block_ids[:n_blocks],
+                )
+            else:
+                logger.info(
+                    "[pd] pulled %s: %d tokens, %.1f MiB (wait %.1f ms, pull %.1f ms = "
+                    "%.2f GB/s, KV import %.1f ms) digest %s blocks %s",
+                    rr.req_id,
+                    header["num_tokens"],
+                    header["nbytes"] / 2**20,
+                    1e3 * f.t_wait,
+                    1e3 * f.t_pull,
+                    header["nbytes"] / max(f.t_pull, 1e-9) / 2**30,
+                    1e3 * (t1 - t0),
+                    payload_digest(buf, header["nbytes"]),
+                    rr.block_ids[:n_blocks],
+                )
         while True:
             try:
                 rr, err = self._failed.get_nowait()
             except queue.Empty:
                 break
-            # Report it as received so the scheduler proceeds; the runner then prefills
-            # locally (the request's state slot has no import parked), which is slow but
-            # correct.
-            self._inflight.pop(rr.req_id, None)
-            with self._lock:
-                self._finished_recving.add(rr.req_id)
-                self._recv_done.add(rr.req_id)
-            logger.error(
-                "[pd] %s: transfer failed (%s); the decoder will prefill it locally",
-                rr.req_id,
-                err,
-            )
+            # Report it as received so the scheduler proceeds (an aborted request's
+            # delayed block free needs it too); a live request's runner then prefills
+            # locally (its state slot has no import parked), slow but correct.
+            self._finish_recv(rr.req_id)
+            if isinstance(err, _PullAborted):
+                logger.info("[pd] %s: finished while its pull was pending", rr.req_id)
+            else:
+                logger.error(
+                    "[pd] %s: transfer failed (%s); the decoder prefills it locally",
+                    rr.req_id,
+                    err,
+                )
 
     def take_finished(
         self, finished_req_ids: set[str] | None = None
     ) -> tuple[set[str] | None, set[str] | None]:
-        if self.c._is_consumer:
-            self._drain_fetched()
         for req_id in finished_req_ids or ():
             self._stage_done.discard(req_id)
             self._recv_done.discard(req_id)
+            if req_id in self._inflight:
+                # client hung up while the pull is in flight: stop waiting on the
+                # producer and never import (a payload already fetched is dropped by
+                # the drain below); the drain reports it so the scheduler frees the
+                # blocks it held back
+                with self._lock:
+                    self._aborted.add(req_id)
+            pending = getattr(self.runner, "pd_pending_gdn", None)
+            if pending and req_id in pending:
+                # imported, parked, then aborted before it ever got a decode slot
+                entry = pending.pop(req_id)
+                if len(entry) > 3 and entry[3] is not None:
+                    entry[3]()
+        if self.c._is_consumer:
+            self._drain_fetched()
         with self._lock:
             s, r = self._finished_sending, self._finished_recving
             self._finished_sending, self._finished_recving = set(), set()
