@@ -169,11 +169,14 @@ PREFILL_MASK_BUCKETS = (128, 256, 512, 1024, 2048)
 
 def largest_traced_prefill_bucket(gate: str | None = "1") -> int:
     """Tokens the largest traced prefill bucket fills at warm-up (the KV-pool
-    guard's quantity).  ``gate`` = ``QWEN36_PREFILL_BUCKET_TRACE``: "1" / "all" /
-    "true" (and unset / "0": the plugin's ``platform.py`` refuses KV transfer
-    without the trace, so the guard assumes every bucket) -> the largest bucket; a
-    comma list -> the largest listed (a value not in the model's table raises)."""
-    if gate is None or gate.strip() in ("", "0", "1", "all", "true"):
+    guard's quantity).  ``gate`` = ``QWEN36_PREFILL_BUCKET_TRACE``, spelled exactly
+    as ``masked_bucket_trace.parse_bucket_trace_gate`` accepts it: "1" / "all" /
+    "true" (every bucket) and unset / "" / "0" / "off" / "false" (the model traces
+    nothing; the plugin's ``platform.py`` refuses KV transfer without the trace, so
+    the guard stays conservative and assumes every bucket) -> the largest bucket; a
+    comma list -> the largest listed (a value not in the model's table raises, as
+    the model's parser does)."""
+    if gate is None or gate.strip() in ("", "0", "off", "false", "1", "all", "true"):
         return max(PREFILL_MASK_BUCKETS)
     picked: list[int] = []
     for part in gate.split(","):

@@ -1441,6 +1441,20 @@ class _PumpTransport:
         self.threads.add(self._threading.get_ident())
 
 
+def test_largest_traced_bucket_parses_the_gate_like_the_model():
+    """Parity with masked_bucket_trace.parse_bucket_trace_gate (tt-metal): every
+    spelling the model maps to 'no traces' ("", "0", "off", "false") or to 'every
+    bucket' ("1", "all", "true"), whitespace-stripped, yields the largest bucket
+    (the guard is conservative: platform.py refuses KV transfer without the trace);
+    a comma list picks the largest listed; anything else raises like the model."""
+    for gate in (None, "", "0", "off", "false", "1", "all", "true", " off ", " 1 "):
+        assert lc.largest_traced_prefill_bucket(gate) == 2048, gate
+    assert lc.largest_traced_prefill_bucket("128, 256,") == 256
+    for bad in ("on", "OFF", "yes", "2048x"):
+        with pytest.raises(ValueError, match="QWEN36_PREFILL_BUCKET_TRACE"):
+            lc.largest_traced_prefill_bucket(bad)
+
+
 def test_install_idle_ticker_wakes_the_engine_thread_to_pump_only_when_wanted(
     monkeypatch,
 ):
