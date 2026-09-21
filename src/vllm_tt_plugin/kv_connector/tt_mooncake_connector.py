@@ -761,7 +761,9 @@ class _Fetched:
     via: str  # "shm" | "pull"
     t_wait: float
     t_pull: float
-    kv: Any = None
+    kv: Any = (
+        None  # the KV pairs, or a PreparedKvImport (traced importer staging order)
+    )
     rec: Any = None
     gdn: Any = None
     t_prep: float = 0.0
@@ -1238,13 +1240,22 @@ class _WorkerSide:
 
     def _unpack_and_prepare(self, buf: torch.Tensor, header: dict[str, Any]):
         """``(kv, rec, gdn)`` for a fetched payload: ``unpack_payload`` (views) plus the
-        GDN import's host preparation through the model's ``pd_gdn_host_packer`` (built
-        on the main thread in ``post_warmup``; torch ops only, so this runs on the pull
-        worker). Without a packer ``gdn`` is the raw taps and the importer prepares on
-        the main thread as before."""
+        host preparation of both imports (torch ops only, so this runs on the pull
+        worker): the GDN snapshot through the model's ``pd_gdn_host_packer`` (built on
+        the main thread in ``post_warmup``) and the KV payload through
+        ``pd_transfer.prepare_kv_import`` (the traced importer's staging order). Without
+        a packer (warm-up hook not run) both stay raw and the importers prepare on the
+        main thread as before."""
         kv, rec, taps = unpack_payload(buf, header)
         packer = getattr(self.model, "pd_gdn_host_packer", None)
-        gdn = packer.prepare(rec, taps) if packer is not None else taps
+        if packer is None:
+            return kv, rec, taps
+        gdn = packer.prepare(rec, taps)
+        from models.demos.blackhole.qwen36.tt import pd_transfer
+
+        prepare_kv = getattr(pd_transfer, "prepare_kv_import", None)
+        if prepare_kv is not None:
+            kv = prepare_kv(self.model, kv)
         return kv, rec, gdn
 
     def _pull(self, rr: RecvReq):

@@ -117,6 +117,45 @@ def test_pull_unpacks_and_prepares_on_the_worker_thread(
         prod.release(staged)
 
 
+def test_kv_payload_is_prepared_on_the_worker_when_pd_transfer_offers_it(
+    consumer, producer, monkeypatch, fake_pd_transfer
+):
+    """With pd_transfer.prepare_kv_import available the worker also stages the KV
+    payload; the drain hands that prepared object to import_kv_blocks."""
+    import sys
+
+    w = consumer
+    mod = sys.modules["models.demos.blackhole.qwen36.tt.pd_transfer"]
+    seen = []
+
+    def prepare_kv_import(model, kv):
+        seen.append(threading.current_thread().name)
+        return SimpleNamespace(kind="kv-prepared", kv=kv)
+
+    mod.prepare_kv_import = prepare_kv_import
+    kv, rec, taps = _payload()
+    buf, header = pack_payload(kv, rec, taps, 7, 2)
+    prod = producer.pool
+    staged = prod.acquire(buf.numel())
+    staged[: buf.numel()].copy_(buf)
+    try:
+        w._shm_ok = False
+        rep = _staged_reply(prod, staged, header, "elsewhere:0", None)
+        monkeypatch.setattr(w, "_side_channel_call", lambda h, p, msg: rep)
+        rr = _rr()
+        w._inflight[rr.req_id] = rr
+        _pull_on_worker(w, rr)
+        f = w._fetched.get_nowait()
+        assert seen and seen[0].startswith("pull") and f.kv.kind == "kv-prepared"
+        assert torch.equal(f.kv.kv[0][1], kv[0][1])
+        w._fetched.put(f)
+        w._drain_fetched()
+        assert fake_pd_transfer[0][0] == [3, 4] and fake_pd_transfer[0][1] is f.kv
+        w.runner.pd_pending_gdn[rr.req_id][3]()
+    finally:
+        prod.release(staged)
+
+
 def test_prep_failure_releases_the_payload_and_reports_the_pull_failed(
     consumer, producer, monkeypatch, fake_pd_transfer
 ):
