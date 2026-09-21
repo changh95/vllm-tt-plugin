@@ -30,38 +30,78 @@ Data path (direct mode, one FIFO channel, prefill rank 0 -> decode rank 1)
               ([1,4,2048,256], cache dtype) -- the hook deallocates ``blk`` right
               after the call; rec -> device copy of the live ``rec_state`` into a
               rec buffer; taps -> shm rows file.
-              finish_export(READY)  -> ALL ``send_direct_async`` enqueued in the
-              canonical order (chunk-outer, manifest K/V part order, then recs in
-              manifest order), sidecar written, then the shm READY publish.  The
-              sends PARK on the producer's CQ until the consumer posts its recvs.
-    consumer  open_get  -> claim (only when every lower publish sequence number is
-              received or drained and a rec set is free); ``SourceChunk.
-              read_into_device(hook_staging)`` = ``recv_direct_async`` posted right
-              where the hook then runs ``paged_fill_cache`` on the same CQ (no host
-              sync needed); after the LAST K/V item the 48 rec recvs are posted into
-              a transport-owned per-xfer rec set (the hook installs recs at the JOIN
-              step, possibly many steps later, and a single FIFO channel cannot hold
-              them back behind the next xfer's K/V); ``install_gdn_state`` gets them
-              by a device copy into the hook's ``_rec_staging``.
+              finish_export(READY)  -> sidecar (item list, ``seq`` None) + the shm
+              READY publish.  NOTHING is enqueued on the socket yet (claim-gated
+              sends, below); the export buffers stay allocated.
+    consumer  open_get  -> CLAIM (the shm rename ``{hx}`` -> ``{hx}.claimed-{D}``,
+              only when a rec set is free), then None until the producer's marker
+              says the sends are on the channel; the READY handle is issued once the
+              xfer is at the channel head.  ``SourceChunk.read_into_device(
+              hook_staging)`` = ``recv_direct_async`` posted right where the hook then
+              runs ``paged_fill_cache`` on the same CQ (no host sync needed); after
+              the LAST K/V item the 48 rec recvs are posted into a transport-owned
+              per-xfer rec set (the hook installs recs at the JOIN step, possibly
+              many steps later, and a single FIFO channel cannot hold them back
+              behind the next xfer's K/V); ``install_gdn_state`` gets them by a
+              device copy into the hook's ``_rec_staging``.
+    producer  pump() (every ``TTKVWorker.end_step`` and the rank's idle tick, both on
+              the engine thread) -> for every published export whose claim dir now
+              exists: ALL ``send_direct_async`` enqueued in the canonical order
+              (chunk-outer, manifest K/V part order, then recs in manifest order),
+              ``seq`` assigned in SEND order, then the marker
+              ``{control_dir}/.fabric_sent/{producer}/{hx}.json`` (epoch, seq, the
+              items actually enqueued) written atomically.
     completion = the worker's existing ``synchronize_device`` before KV_DONE; the
               producer reclaims buffers when the segment has left the disk (the
               consumer only removes it after posting every recv; the in-order CQ
               makes buffer reuse safe).
 
-Single-channel discipline
-    * publish sequence numbers (``seq`` per producer epoch) in the sidecar;
-    * the consumer receives xfers in publish order (``open_get`` -> None while an
-      older one is pending), enforces the item order (mismatch -> RuntimeError,
-      nothing posted), and DRAINS instead of skipping: an aborted / failed /
-      released / lease-expired xfer has its remaining items received into scratch;
-    * the producer janitor never expires a READY segment by age and ``abandon`` of a
-      published xfer marks it RELEASED (the consumer drains it) instead of unlinking.
+Claim-gated sends (the D5 fix)
+    Enqueuing the sends at READY parked the producer's CQ0 until the consumer posted
+    recvs, and an export the consumer never admitted (bogus / foreign xfer id, lost
+    D leg, client gone between the legs) parked it for good: 600 s device timeout,
+    engine fatal (PHASE3_RESULTS v2 8.3).  Now the consumer's CLAIM is the trigger:
 
-    * a ``send`` that raises part-way through ``finish_export(READY)`` leaves the
-      already-enqueued items parked on the channel: the export is published FAILED
-      with a sidecar that keeps its ``seq`` and lists exactly the enqueued items,
-      the janitor leaves such a segment alone and the consumer DRAINS it at its
-      turn (``open_get`` -> FAILED handle); nothing enqueued -> no ``seq`` consumed.
+    * an ORPHAN (never claimed) never touches the channel; its READY segment is
+      swept by the producer janitor at lease expiry like any shm segment and
+      ``_reclaim`` frees the buffers -- nothing to drain, nothing parked;
+    * the producer's sends park only between its enqueue and the consumer's recvs:
+      the consumer claimed, so it polls the marker at every ``begin_step`` /
+      ``end_step`` (``TTKVWorker``) and posts the recvs in the step it sees it --
+      the park is bounded by one consumer step (plus ``claim_wait_s`` at most);
+    * the consumer's recvs never wait for host-side work: the marker is written
+      AFTER the sends were enqueued, so a producer that dies between the claim and
+      the marker leaves the consumer idle (its claim expires with the lease), not
+      parked;
+    * a consumer that drops a claim BEFORE the marker (abort / lease expiry / a
+      demotion) first FENCES it: ``{hx}.claimed-{D}`` -> ``{hx}.claimed-{D}.closing``
+      (an atomic rename the producer never sends for; the janitor still treats it
+      as a claim of a live pid, the producer still holds the buffers), then reads
+      the marker: absent -> nothing is or will be on the channel, drop the claim;
+      present -> the items are parked, drained at their channel turn.  The one
+      residual window: the producer listed the claim, enqueued the sends and is
+      about to write the marker while the consumer fences -> the marker lands
+      after the consumer's check, as an ORPHAN MARKER (no claim of ours); the
+      consumer's ``pump()`` (every step + idle tick) drains it at its turn, so the
+      producer's CQ is parked for at most one consumer step / idle tick, never a
+      lease.
+    * the common-path cost: the sends start at the producer's next ``pump`` after
+      the claim -- at most the idle-tick period when P is idle, one P step when P
+      is mid-prefill for another request (today the sends were enqueued at READY).
+
+Single-channel discipline
+    * ``seq`` = send order per producer epoch, recorded in the marker; the sidecar
+      of a published segment carries ``seq: None`` (nothing on the channel);
+    * the consumer receives xfers in seq order (``open_get`` -> None while an older
+      sent xfer is pending), enforces the item order (mismatch -> RuntimeError,
+      nothing posted), and DRAINS instead of skipping: an aborted / failed /
+      released xfer whose items are on the channel has them received into scratch
+      at its turn (``pump`` / the next ``open_get``);
+    * a ``send`` that raises part-way through the enqueue leaves the already-enqueued
+      items parked on the channel: the marker keeps the ``seq`` and lists exactly
+      them with ``status: FAILED``; the consumer's ``open_get`` returns a FAILED
+      handle and drains them at their turn; nothing enqueued -> no ``seq`` consumed,
+      marker ``seq: None`` (the consumer drops the claim, nothing to drain).
 
 Device pools (allocated once in ``start()``, DRAM interleaved, cache dtype)
     producer  K/V export pool = ``fabric_export_budget_bytes`` / 2,228,224 B
@@ -84,12 +124,12 @@ Device pools (allocated once in ``start()``, DRAM interleaved, cache dtype)
     region; p3_device_validation_plan.md V4 records the measured headroom
     (``ttnn.dump_device_memory_state`` after ``start()``).
 
-Known v1 limitation (D5): the producer's CQ0 is parked from READY until the
-consumer posts recvs (proxy RTT + <= 1 decode step + wire); an ORPHANED xfer (never
-admitted on the consumer) parks it until the consumer's next transport entry.
-``pump()`` (both roles) drains / reclaims and is meant for an optional call from
-``TTKVWorker.end_step``; the producer also reclaims from ``open_put`` /
-``finish_export`` / ``abandon``.
+``pump()`` (both roles) is the claim-gated protocol's clock: the producer sends for
+new claims and reclaims finished exports, the consumer drains released xfers and
+orphan markers at the channel head.  ``TTKVWorker.end_step`` calls it after every
+step; the rank entry point wakes the idle engine thread for it
+(``pd_fabric_rank.install_idle_ticker``, gated by ``wants_pump()``, a host-only
+check any thread may make).  Device work happens on the engine thread only.
 
 Nothing here imports ``ttnn`` or ``torch`` at module import; ``fabric_socket`` does,
 lazily.  ``TT_PD_CHECKSUM=1`` and ``kv_both`` are unsupported over fabric (raised
@@ -102,6 +142,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from collections import deque
@@ -139,11 +180,8 @@ from .fabric_socket import (
     unregister_transport,
 )
 from .shm import (
-    FAILED,
     READY,
     RELEASED,
-    STATUS_NAMES,
-    TERMINAL_UNCLAIMED,
     ShmTransport,
     parse_xfer_id,
     read_header,
@@ -159,6 +197,11 @@ except Exception:  # pragma: no cover
 
 SIDECAR_NAME = "fabric.json"
 RENDEZVOUS_DIR = ".fabric_rendezvous"
+# producer-owned send markers: {control_dir}/.fabric_sent/{producer}/{hx}.json
+SENT_DIR = ".fabric_sent"
+# a consumer claim being dropped before the marker: {hx}.claimed-{D}.closing (the
+# producer never sends for it; the shm janitor still sees a ".claimed-" dir)
+CLOSING_SUFFIX = ".closing"
 DEFAULT_CONTROL_DIR = "/dev/shm/tt_pd_fabric"
 
 # One spec table for both ranks (design 4.3); the dtype placeholders are filled
@@ -252,6 +295,10 @@ class FabricConfig:
     lease_duration: float = 30.0
     janitor_period: float = 0.1
     socket_timeout_s: float = 300.0  # barrier + handshake bound (0 = unbounded)
+    # consumer: how long the FIRST open_get after the claim spins for the producer's
+    # send marker (an idle producer answers within its idle tick, ~5 ms); after
+    # that the worker re-polls at every step begin / end.  0 = never spin.
+    claim_wait_s: float = 0.010
     # DEBUG ONLY (p3 device validation): skip the warm-up send/recv in start() so a
     # pair can reach READY on a fabric link that does not pass payloads (the first
     # real export then compiles the programs and PARKS both CQs if the link is dead)
@@ -277,6 +324,7 @@ class FabricConfig:
         "kv_lease_duration": "lease_duration",
         "fabric_socket_timeout_s": "socket_timeout_s",
         "fabric_skip_warmup": "skip_warmup",
+        "fabric_claim_wait_s": "claim_wait_s",
     }
 
     @classmethod
@@ -290,6 +338,7 @@ class FabricConfig:
             max_model_len=_env_int("TT_PD_FABRIC_MAX_MODEL_LEN", DEFAULT_MAX_MODEL_LEN),
             rec_sets=_env_int("TT_PD_FABRIC_REC_SETS", 4),
             socket_timeout_s=_env_float("TT_PD_FABRIC_SOCKET_TIMEOUT_S", 300.0),
+            claim_wait_s=_env_float("TT_PD_FABRIC_CLAIM_WAIT_S", 0.010),
             skip_warmup=os.environ.get("TT_PD_FABRIC_SKIP_WARMUP", "0") == "1",
         )
         for k, v in (extra or {}).items():
@@ -314,6 +363,11 @@ class FabricConfig:
         cfg.lease_duration = float(cfg.lease_duration)
         cfg.janitor_period = float(cfg.janitor_period)
         cfg.socket_timeout_s = float(cfg.socket_timeout_s)
+        cfg.claim_wait_s = float(cfg.claim_wait_s)
+        if cfg.claim_wait_s < 0:
+            raise ValueError(
+                f"fabric_claim_wait_s must be >= 0 (got {cfg.claim_wait_s})"
+            )
         cfg.skip_warmup = str(cfg.skip_warmup).lower() in ("1", "true", "yes")
         if cfg.sender_rank == cfg.receiver_rank:
             raise ValueError("fabric sender_rank == receiver_rank")
@@ -381,12 +435,11 @@ class _ControlSegments(ShmTransport):
     stores (header + taps rows, ~4 MiB per xfer) against ``budget_bytes`` and the
     tmpfs free space -- the K/V and rec bytes of the manifest travel over the
     socket, so a 65535-token manifest (2.27 GiB on the wire) costs the control plane
-    nothing; the export pool is the producer's only limiter.  Janitor: unclaimed
-    segments are never unlinked on lease expiry (the consumer must DRAIN the parked
-    sends first), never while RELEASED (same reason; the consumer's drain unlinks
-    them) and never while FAILED with items parked on the channel (a ``send`` raised
-    mid ``finish_export``; same reason).  FAILED (nothing parked) / CONSUMED /
-    LOAD_FAILED unclaimed segments are swept.
+    nothing; the export pool is the producer's only limiter.  The janitor is the
+    parent's: with claim-gated sends an UNCLAIMED segment (READY past its lease,
+    RELEASED, FAILED) has nothing on the channel and is swept; a ``.claimed-*`` dir
+    (also the ``.closing`` fence of a claim being dropped) is swept only when its
+    consumer pid is dead.
     """
 
     KIND = "shm"  # segment files are ordinary dumpfile segments
@@ -404,19 +457,6 @@ class _ControlSegments(ShmTransport):
             p.nbytes for p in manifest.parts if p.kind == "gdn_taps"
         )
 
-    @staticmethod
-    def parked_items(seg_dir: str) -> int:
-        """Items of a published segment still parked on the channel per its fabric
-        sidecar (0 when there is no sidecar / no seq)."""
-        try:
-            with open(os.path.join(seg_dir, SIDECAR_NAME)) as f:
-                side = json.load(f)
-        except (OSError, ValueError):
-            return 0
-        if side.get("seq") is None:
-            return 0
-        return int(side.get("nitems", 0) or 0)
-
     def put_state(self, xfer_id: str) -> Any:
         with self._lock:
             return self._puts.get(xfer_id)
@@ -425,10 +465,6 @@ class _ControlSegments(ShmTransport):
         with self._lock:
             gs = self._gets.get(xfer_id)
             return None if gs is None else gs.hdr
-
-    def has_claim(self, xfer_id: str) -> bool:
-        with self._lock:
-            return xfer_id in self._gets
 
     def segment_dirs(self, engine: str, hx: str) -> tuple[str, str, str]:
         return (
@@ -441,10 +477,7 @@ class _ControlSegments(ShmTransport):
         self, engine: str, hx: str, names: set[str] | None = None
     ) -> bool:
         if names is None:
-            try:
-                names = set(os.listdir(self._engine_dir(engine)))
-            except FileNotFoundError:
-                return False
+            names = self.list_engine_dir(engine)
         return (
             hx in names
             or f"{hx}.tmp" in names
@@ -457,65 +490,60 @@ class _ControlSegments(ShmTransport):
         except FileNotFoundError:
             return set()
 
-    def janitor_once(self, now: float | None = None) -> None:
-        now = self._clock() if now is None else now
-        edir = self._engine_dir()
-        try:
-            names = os.listdir(edir)
-        except FileNotFoundError:
-            return
+    @staticmethod
+    def claimed_hexes(names: set[str]) -> set[str]:
+        """xfer hexes with an OPEN claim dir in ``names`` (a ``.closing`` fence is a
+        claim being dropped: the producer must not send for it)."""
+        return {
+            n.split(".claimed-", 1)[0]
+            for n in names
+            if ".claimed-" in n and not n.endswith(CLOSING_SUFFIX)
+        }
+
+    def fence_claim(self, xfer_id: str) -> str | None:
+        """Consumer: rename our open claim dir to its ``.closing`` fence (atomic) so
+        the producer's next ``pump`` will not start sends for it; the claim state
+        follows the rename (``release_remote`` / ``finish_import`` remove the fenced
+        dir).  Returns the new path, None when we hold no claim / the rename failed
+        (already fenced or gone)."""
         with self._lock:
-            owned_tmp = {
-                os.path.basename(s.tmp_dir)
-                for s in self._puts.values()
-                if not s.published
-            }
-            for n in names:
-                p = os.path.join(edir, n)
-                if not os.path.isdir(p):
-                    continue
-                if n.endswith(".tmp"):
-                    if n not in owned_tmp:
-                        self._rmtree(p)
-                        self.stats["swept"] += 1
-                elif ".claimed-" in n:
-                    stale, why = self._claim_is_stale(p, now)
-                    if stale:
-                        logger.warning("removing stale claim %s (%s)", n, why)
-                        self._rmtree(p)
-                        self.stats["stale_claims"] += 1
-                else:
-                    hp = self._find_header(p)
-                    status = None
-                    if hp is not None:
-                        try:
-                            status = read_header(hp, full=False).status
-                        except (ValueError, OSError):
-                            status = None
-                    if status is None or (
-                        status in TERMINAL_UNCLAIMED
-                        and status != RELEASED
-                        and not (status == FAILED and self.parked_items(p) > 0)
-                    ):
-                        self._rmtree(p)
-                        self.stats["swept"] += 1
-                    # RELEASED / lease-expired READY / FAILED with parked sends: the
-                    # consumer drains, then unlinks
+            gs = self._gets.get(xfer_id)
+            if gs is None or gs.claim_dir.endswith(CLOSING_SUFFIX):
+                return None
+            new = gs.claim_dir + CLOSING_SUFFIX
             try:
-                names_set = set(os.listdir(edir))
-            except FileNotFoundError:
-                names_set = set()
-            for xid, st in list(self._puts.items()):
-                if st.published and not self.any_dir_exists(
-                    self.engine_id, st.xfer_hex, names_set
-                ):
-                    st.close()
-                    del self._puts[xid]
-            for xid in list(self._inherited):
-                if not self.any_dir_exists(
-                    self.engine_id, parse_xfer_id(xid)[1], names_set
-                ):
-                    del self._inherited[xid]
+                os.rename(gs.claim_dir, new)
+            except OSError:
+                return None
+            gs.header_path = os.path.join(new, os.path.basename(gs.header_path))
+            gs.claim_dir = new
+            return new
+
+    def claim_status(self, xfer_id: str) -> int | None:
+        """Consumer: the CURRENT header status of our claim (the producer flips it
+        to RELEASED when it abandons a claimed, unsent export); None = no claim."""
+        with self._lock:
+            gs = self._gets.get(xfer_id)
+        if gs is None:
+            return None
+        try:
+            return read_header(gs.header_path, full=False).status
+        except (OSError, ValueError):
+            return None
+
+    def mark_claims_released(self, hx: str) -> int:
+        """Producer: write RELEASED into the header of every claim dir of ``hx``
+        (the consumer reads it at its next ``open_get`` and drops the claim without
+        waiting for a marker that will never come).  Returns the dirs touched."""
+        edir = self._engine_dir()
+        n = 0
+        for name in self.list_engine_dir(self.engine_id):
+            if name.startswith(f"{hx}.claimed-"):
+                hp = os.path.join(edir, name, self._header_name())
+                with contextlib.suppress(OSError):
+                    write_status(hp, RELEASED)
+                    n += 1
+        return n
 
 
 # --- device buffer pools --------------------------------------------------------------
@@ -573,8 +601,13 @@ class _Export:
     written: set[tuple[str, int]] = field(default_factory=set)
     published: bool = False
     status: str = ""
-    seq: int | None = None
+    seq: int | None = None  # assigned when the sends are enqueued (send order)
     nbytes: int = 0
+    items: list[tuple[str, int]] = field(default_factory=list)  # canonical order
+    n_kv: int = 0
+    sent: bool = False  # sends enqueued (or attempted) and the marker written
+    abandoned: bool = False  # abandon() after publish: never send
+    ready_ts: float = 0.0  # perf_counter at READY publish (handoff evidence)
 
 
 class FabricSink(Sink):
@@ -675,18 +708,24 @@ class FabricSink(Sink):
 
 @dataclass
 class _Xfer:
+    """A claim of ours on the consumer: from the CLAIM (``seq`` None, items from the
+    sidecar) through the producer's marker (``seq`` and the items actually sent)
+    to the posted recvs (``posted``) or a deferred drain (``released``)."""
+
     xfer_id: str
     hx: str
-    seq: int
+    seq: int | None
     items: list[tuple[str, int]]  # canonical channel order: kv items then rec items
     n_kv: int
     rec_set: list[_Buf] | None  # one buffer per rec item, in item order
     cursor: int = 0
     rec_index: dict[str, int] = field(default_factory=dict)  # rec part -> set index
-    kv_present: dict[str, int] = field(
-        default_factory=dict
-    )  # part -> chunks in sidecar
+    kv_present: dict[str, int] = field(default_factory=dict)  # part -> chunks sent
     failed: str = ""
+    posted: bool = False  # READY handle issued: the hook posts the recvs
+    released: bool = False  # drop the claim; drain the sent items at their turn
+    send_failed: bool = False  # the producer's enqueue raised part-way (marker FAILED)
+    claimed_ts: float = 0.0
 
     @property
     def nitems(self) -> int:
@@ -695,6 +734,14 @@ class _Xfer:
     @property
     def complete(self) -> bool:
         return self.cursor >= self.nitems
+
+    def index_items(self) -> None:
+        self.rec_index = {
+            name: k for k, (name, _c) in enumerate(self.items[self.n_kv :])
+        }
+        self.kv_present = {}
+        for name, _c in self.items[: self.n_kv]:
+            self.kv_present[name] = self.kv_present.get(name, 0) + 1
 
 
 class FabricChunk(SourceChunk):
@@ -815,10 +862,8 @@ class FabricSocketTransport(TTKVTransport):
         self._active: _Xfer | None = None  # posted-but-incomplete xfer (at most one)
         self._recv_epoch: str | None = None
         self._next_recv_seq = 0
-        self._seq_cache: dict[
-            str, int | None
-        ] = {}  # hx -> seq (sidecars are immutable)
-        self._gap_logged: int | None = None
+        self._by_seq: dict[int, _Xfer] = {}  # sent claims of ours by channel seq
+        self._markers: dict[str, dict[str, Any]] = {}  # hx -> marker (immutable)
         self.stats = {
             "sends": 0,
             "recvs": 0,
@@ -828,8 +873,10 @@ class FabricSocketTransport(TTKVTransport):
             "order_violations": 0,
             "reclaimed": 0,
             "exports_ready": 0,
+            "exports_sent": 0,
             "exports_failed": 0,
-            "imports": 0,
+            "imports": 0,  # claims
+            "orphan_markers": 0,
             "warm_programs": 0,
         }
 
@@ -923,6 +970,10 @@ class FabricSocketTransport(TTKVTransport):
             clock=self._clock,
         )
         self._ctrl.start()
+        if self.is_producer:
+            # a new epoch: markers of the previous producer process are void
+            shutil.rmtree(self._marker_dir(self.engine_id), ignore_errors=True)
+            os.makedirs(self._marker_dir(self.engine_id), exist_ok=True)
         t0 = time.perf_counter()
         try:
             self._allocate_pools()
@@ -1175,6 +1226,19 @@ class FabricSocketTransport(TTKVTransport):
         except (OSError, ValueError):
             return None
 
+    def _marker_dir(self, engine: str) -> str:
+        return os.path.join(self.cfg.control_dir, SENT_DIR, engine)
+
+    def _marker_path(self, engine: str, hx: str) -> str:
+        return os.path.join(self._marker_dir(engine), f"{hx}.json")
+
+    def _read_marker_file(self, engine: str, hx: str) -> dict[str, Any] | None:
+        try:
+            with open(self._marker_path(engine, hx)) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None  # absent, or mid-rename (the producer writes tmp + rename)
+
     @staticmethod
     def _canonical_items(
         manifest: Manifest, written: set[tuple[str, int]]
@@ -1199,9 +1263,10 @@ class FabricSocketTransport(TTKVTransport):
     def open_put(self, xfer_id: str, manifest: Manifest) -> PutHandle | None:
         self._require_started()
         if not self.is_producer:
-            raise RuntimeError("open_put on a consumer-role fabric transport")
+            raise RuntimeError("open_put on a producer-role fabric transport")
         ctrl, cfg = self.control, self.cfg
         kv_pool, rec_pool = self._producer_pools()
+        self._send_claimed()
         self._reclaim()
         engine, hx = parse_xfer_id(xfer_id)
         if engine != self.engine_id:
@@ -1285,8 +1350,11 @@ class FabricSocketTransport(TTKVTransport):
         return PutHandle(xfer_id, manifest, sinks, lease_expiry_ts=h.lease_expiry_ts)
 
     def finish_export(self, h: PutHandle, status: Literal["READY", "FAILED"]) -> None:
+        """Publish the control segment.  READY enqueues NOTHING on the socket: the
+        sends follow the consumer's claim (``_send_claimed`` from ``pump``)."""
         self._require_started()
         ctrl = self.control
+        self._send_claimed()
         self._reclaim()
         with self._lock:
             exp = self._exports.get(h.xfer_id)
@@ -1301,82 +1369,156 @@ class FabricSocketTransport(TTKVTransport):
             side: dict[str, Any] = {
                 "layout_version": LAYOUT_VERSION,
                 "epoch": self._epoch,
-                "seq": None,
+                "seq": None,  # assigned in send order by _send_export (marker)
                 "status": status,
-                "nitems": 0,
-                "n_kv": 0,
-                "items": [],
+                "claim_gated": True,
+                "nitems": len(items) if status == "READY" else 0,
+                "n_kv": n_kv if status == "READY" else 0,
+                "items": [list(x) for x in items] if status == "READY" else [],
                 "kv_spec": list(self.cfg.spec_table()["kv_spec"]),
                 "rec_spec": list(self.cfg.spec_table()["rec_spec"]),
                 "producer_pid": os.getpid(),
             }
-            t0 = time.perf_counter()
-            n_sent = 0
-            if status == "READY" and items:
-                seq = self._next_seq
-                try:
-                    for name, c in items[:n_kv]:
-                        self.layer.send(exp.kv_bufs[(name, c)].tensor, self._sock)
-                        n_sent += 1
-                    for name, _ in items[n_kv:]:
-                        self.layer.send(exp.rec_bufs[name].tensor, self._sock)
-                        n_sent += 1
-                except Exception:
-                    # The n_sent items already enqueued keep their place in the
-                    # FIFO channel: the consumer must drain exactly them at this
-                    # seq before anything published later, so publish FAILED with a
-                    # sidecar listing them (the seq is consumed only if something
-                    # was enqueued; with nothing enqueued no seq is used).
-                    logger.exception(
-                        "PD fabric: send %d/%d of %s raised; publishing FAILED with "
-                        "%d items parked on the channel",
-                        n_sent + 1,
-                        len(items),
-                        h.xfer_id,
-                        n_sent,
-                    )
-                    status = "FAILED"
-                    side["status"] = status
-                if n_sent > 0:
-                    self._next_seq = seq + 1
-                    exp.seq = seq
-                    side.update(
-                        seq=seq,
-                        nitems=n_sent,
-                        n_kv=min(n_sent, n_kv),
-                        items=[list(x) for x in items[:n_sent]],
-                    )
-                self.stats["sends"] += n_sent
-                if status == "READY":
-                    self.stats["exports_ready"] += 1
-                else:
-                    self.stats["exports_failed"] += 1
-            elif status == "FAILED":
-                self.stats["exports_failed"] += 1
-            # else: READY with no device items (nothing on the channel, no seq)
-            enqueue_ms = (time.perf_counter() - t0) * 1e3
             with open(self._sidecar_path(st.tmp_dir), "w") as f:
                 json.dump(side, f)
             exp.status = status
+            exp.items, exp.n_kv = (items, n_kv) if status == "READY" else ([], 0)
             ctrl.finish_export(h, status)  # part table, status LAST, atomic rename
             exp.published = True
-            if n_sent == 0:
-                # nothing on the channel: buffers go back now; the segment is swept
-                # by the janitor (FAILED) or consumed as an empty READY (no seq)
-                self._free_export(exp)
-                self._exports.pop(h.xfer_id, None)
-            # else: buffers stay until the consumer received / drained the items
+            exp.ready_ts = time.perf_counter()
+            if status == "READY" and items:
+                self.stats["exports_ready"] += 1
+                logger.info(
+                    "PD fabric: export %s READY published: %d items (%.1f MiB) held "
+                    "for the consumer's claim (nothing enqueued)",
+                    h.xfer_id,
+                    len(items),
+                    exp.nbytes / 2**20,
+                )
+                return  # buffers stay until sent and consumed / drained
+            # FAILED, or READY without device items: nothing will ever be on the
+            # channel; buffers go back now, the segment is the control plane's
+            if status == "FAILED":
+                self.stats["exports_failed"] += 1
+            self._free_export(exp)
+            self._exports.pop(h.xfer_id, None)
             logger.info(
-                "PD fabric: export %s %s seq=%s items=%d/%d (%.1f MiB) enqueued in "
-                "%.2f ms",
+                "PD fabric: export %s %s published with no device items (%.1f MiB)",
                 h.xfer_id,
                 status,
-                exp.seq,
-                n_sent,
-                len(items),
                 exp.nbytes / 2**20,
-                enqueue_ms,
             )
+
+    def _send_claimed(self) -> int:
+        """Enqueue the sends of every published export the consumer has CLAIMED
+        (open ``.claimed-*`` dir, not a ``.closing`` fence), in publish order, one
+        ``seq`` each in send order, then write the marker.  Engine thread only
+        (device ops).  Returns the number of exports sent."""
+        if not self._exports:
+            return 0
+        ctrl = self.control
+        with self._lock:
+            pending = [
+                e
+                for e in self._exports.values()
+                if e.published and not e.sent and not e.abandoned
+            ]
+            if not pending:
+                return 0
+            claimed = ctrl.claimed_hexes(ctrl.list_engine_dir(self.engine_id))
+            n = 0
+            for exp in pending:
+                if exp.hx in claimed:
+                    self._send_export(exp)
+                    n += 1
+            return n
+
+    def _send_export(self, exp: _Export) -> None:
+        seq = self._next_seq
+        t0 = time.perf_counter()
+        n_sent = 0
+        status = "READY"
+        try:
+            for name, c in exp.items[: exp.n_kv]:
+                self.layer.send(exp.kv_bufs[(name, c)].tensor, self._sock)
+                n_sent += 1
+            for name, _ in exp.items[exp.n_kv :]:
+                self.layer.send(exp.rec_bufs[name].tensor, self._sock)
+                n_sent += 1
+        except Exception:
+            # The n_sent items already enqueued keep their place in the FIFO
+            # channel: the consumer must drain exactly them at this seq before
+            # anything sent later, so the marker keeps the seq (consumed only if
+            # something was enqueued) and lists exactly them, status FAILED.
+            logger.exception(
+                "PD fabric: send %d/%d of %s raised; marker FAILED with %d items "
+                "parked on the channel",
+                n_sent + 1,
+                len(exp.items),
+                exp.xfer_id,
+                n_sent,
+            )
+            status = "FAILED"
+        enqueue_ms = (time.perf_counter() - t0) * 1e3
+        if n_sent > 0:
+            self._next_seq = seq + 1
+            exp.seq = seq
+        exp.sent = True
+        exp.status = status
+        marker = {
+            "layout_version": LAYOUT_VERSION,
+            "epoch": self._epoch,
+            "xfer_id": exp.xfer_id,
+            "seq": exp.seq,
+            "status": status,
+            "nitems": n_sent,
+            "n_kv": min(n_sent, exp.n_kv),
+            "items": [list(x) for x in exp.items[:n_sent]],
+            "kv_spec": list(self.cfg.spec_table()["kv_spec"]),
+            "rec_spec": list(self.cfg.spec_table()["rec_spec"]),
+            "producer_pid": os.getpid(),
+        }
+        self._write_marker(exp.hx, marker)
+        self.stats["sends"] += n_sent
+        if status == "READY":
+            self.stats["exports_sent"] += 1
+        else:
+            self.stats["exports_failed"] += 1
+        if n_sent == 0:
+            # nothing on the channel: the consumer drops its claim on this marker;
+            # the buffers are free now
+            self._free_export(exp)
+            self._exports.pop(exp.xfer_id, None)
+        # else: buffers stay until the consumer received / drained the items
+        logger.info(
+            "PD fabric: export %s %s seq=%s items=%d/%d (%.1f MiB) enqueued in "
+            "%.2f ms (%.1f ms after READY)",
+            exp.xfer_id,
+            status,
+            exp.seq,
+            n_sent,
+            len(exp.items),
+            exp.nbytes / 2**20,
+            enqueue_ms,
+            (time.perf_counter() - exp.ready_ts) * 1e3 if exp.ready_ts else 0.0,
+        )
+
+    def _write_marker(self, hx: str, marker: dict[str, Any]) -> None:
+        """Atomic (tmp + rename) into the producer-owned marker dir.  A failure here
+        would leave enqueued sends the consumer never learns about: raise."""
+        path = self._marker_path(self.engine_id, hx)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(marker, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            raise RuntimeError(
+                f"PD fabric: cannot write the send marker {path} ({e}); "
+                f"{marker['nitems']} items of {marker['xfer_id']} are enqueued on the "
+                "channel with no record the consumer can drain by"
+            ) from e
 
     def _free_export(self, exp: _Export) -> None:
         if self._kv_pool is not None:
@@ -1389,7 +1531,7 @@ class FabricSocketTransport(TTKVTransport):
         if not self._started or not self.is_producer:
             return
         ctrl = self.control
-        self._reclaim()
+        self._reclaim()  # never _send_claimed here: abandon starts no sends
         with self._lock:
             exp = self._exports.get(xfer_id)
             if exp is None:
@@ -1400,19 +1542,33 @@ class FabricSocketTransport(TTKVTransport):
                 self._free_export(exp)
                 ctrl.abandon(xfer_id)
                 return
-            # published with parked sends: the consumer must drain them -> RELEASED
-            engine, hx = parse_xfer_id(xfer_id)
-            _tmp, pub, _mine = ctrl.segment_dirs(engine, hx)
-            hp = os.path.join(pub, "header")
-            if os.path.isfile(hp):
-                with contextlib.suppress(OSError):
-                    write_status(hp, RELEASED)
-            # buffers come back through _reclaim once the consumer drained/unlinked
+            if exp.sent:
+                # on the channel: the consumer that claimed it receives or drains
+                # it; buffers come back through _reclaim
+                logger.info(
+                    "PD fabric: abandon(%s) after the sends: the consumer's claim "
+                    "settles it",
+                    xfer_id,
+                )
+                return
+            # published, nothing sent: never send; unclaimed -> unlink the segment
+            # (buffers back through _reclaim); claimed -> flip the claim's header
+            # to RELEASED so the consumer drops it instead of waiting for a marker
+            exp.abandoned = True
+            ctrl.abandon(xfer_id)  # removes the pub dir if still unclaimed
+            n = ctrl.mark_claims_released(exp.hx)  # a claim that raced the unlink
+            logger.info(
+                "PD fabric: abandon(%s) before any send: segment removed (%d claim "
+                "dir(s) marked RELEASED)",
+                xfer_id,
+                n,
+            )
+        self._reclaim()
 
     def _reclaim(self) -> None:
         """Return the buffers of every published export whose segment left the disk
-        (consumed, load-failed, released or drained -- the consumer removes the
-        directory only after posting every recv)."""
+        (consumed, load-failed, released, drained or swept -- the consumer removes a
+        claim dir only after posting every recv of the items on the channel)."""
         if not self._exports:
             return
         ctrl = self.control
@@ -1438,21 +1594,16 @@ class FabricSocketTransport(TTKVTransport):
         with self._lock:
             return len(self._exports)
 
-    # -- consumer ----------------------------------------------------------------------
-    def _seq_of_pub(self, engine: str, hx: str) -> int | None:
-        """Sequence number of an UNCLAIMED READY segment (None: no seq / unreadable)."""
-        if hx in self._seq_cache:
-            return self._seq_cache[hx]
-        _tmp, pub, _mine = self.control.segment_dirs(engine, hx)
-        side = self._read_sidecar(pub)
-        if side is None:
-            return None  # not yet decided (torn) -- do not cache
-        seq = side.get("seq")
-        if str(side.get("epoch")) != self._recv_epoch:
-            self._adopt_epoch(str(side.get("epoch")))
-        self._seq_cache[hx] = None if seq is None else int(seq)
-        return self._seq_cache[hx]
+    def unsent_exports(self) -> int:
+        """Published exports waiting for the consumer's claim (nothing enqueued)."""
+        with self._lock:
+            return sum(
+                1
+                for e in self._exports.values()
+                if e.published and not e.sent and not e.abandoned
+            )
 
+    # -- consumer ----------------------------------------------------------------------
     def _adopt_epoch(self, epoch: str) -> None:
         if epoch != self._recv_epoch:
             logger.warning(
@@ -1462,106 +1613,98 @@ class FabricSocketTransport(TTKVTransport):
             )
             self._recv_epoch = epoch
             self._next_recv_seq = 0
-            self._seq_cache.clear()
+            self._by_seq.clear()
+            self._markers.clear()
 
-    def _scan_pending(self, engine: str) -> dict[int, str]:
-        """seq -> hx of every unclaimed published segment of ``engine``."""
-        ctrl = self.control
-        out: dict[int, str] = {}
-        for n in ctrl.list_engine_dir(engine):
-            if n.endswith(".tmp") or ".claimed-" in n or n.startswith("."):
-                continue
-            seq = self._seq_of_pub(engine, n)
-            if seq is not None:
-                out[seq] = n
-        return out
+    def _marker(self, engine: str, hx: str) -> dict[str, Any] | None:
+        """The producer's send marker of ``hx`` (cached once read: immutable)."""
+        m = self._markers.get(hx)
+        if m is None:
+            m = self._read_marker_file(engine, hx)
+            if m is not None:
+                self._markers[hx] = m
+        return m
 
-    def _drainable(self, engine: str, hx: str) -> tuple[bool, str]:
-        _tmp, pub, _mine = self.control.segment_dirs(engine, hx)
-        hp = os.path.join(pub, "header")
+    def _unlink_marker(self, engine: str, hx: str) -> None:
+        self._markers.pop(hx, None)
+        with contextlib.suppress(OSError):
+            os.unlink(self._marker_path(engine, hx))
+
+    def _list_markers(self, engine: str) -> list[str]:
         try:
-            hdr = read_header(hp, full=False)
-        except (OSError, ValueError):
-            return False, "unreadable"
-        if hdr.status == RELEASED:
-            return True, "released"
-        if hdr.status == FAILED:
-            if self.control.parked_items(pub) > 0:
-                return True, "export failed mid-send"
-            return False, "FAILED"
-        if hdr.status != READY:
-            return False, STATUS_NAMES.get(hdr.status, str(hdr.status))
-        if self._clock() > hdr.lease_expiry_ts:
-            return True, "lease expired"
-        return False, "ready"
+            names = os.listdir(self._marker_dir(engine))
+        except FileNotFoundError:
+            return []
+        return [n[: -len(".json")] for n in names if n.endswith(".json")]
+
+    def _adopt_marker(self, xf: _Xfer, m: dict[str, Any]) -> None:
+        """Marker seen for our claim: the items ACTUALLY enqueued and their seq."""
+        epoch = str(m.get("epoch"))
+        if epoch != self._recv_epoch:
+            self._adopt_epoch(epoch)
+        xf.items = [tuple(x) for x in m.get("items", [])]
+        xf.n_kv = int(m.get("n_kv", 0))
+        xf.index_items()
+        xf.send_failed = m.get("status") != "READY"
+        seq = m.get("seq")
+        xf.seq = None if seq is None else int(seq)
+        if xf.seq is not None:
+            self._by_seq[xf.seq] = xf
+            if xf.send_failed:
+                # parked items nobody can import: drained at their turn like a
+                # released claim, whether or not the worker asks for it first
+                xf.released = True
+
+    def _marker_by_seq(self, engine: str, seq: int) -> dict[str, Any] | None:
+        """Scan the marker dir for channel seq ``seq``: markers of our claims are
+        adopted into their ``_Xfer`` on the way (``_by_seq`` fills), consumed or
+        foreign-epoch markers are unlinked; returns an ORPHAN marker (no claim of
+        ours) at ``seq``, else None."""
+        orphan: dict[str, Any] | None = None
+        for hx in self._list_markers(engine):
+            m = self._marker(engine, hx)
+            if m is None:
+                continue  # torn (mid-rename): next scan
+            xf = self._xfers.get(f"{engine}:{hx}")
+            if xf is not None:
+                if xf.seq is None and not xf.posted:
+                    self._adopt_marker(xf, m)
+                continue
+            epoch = str(m.get("epoch"))
+            if epoch != self._recv_epoch:
+                self._adopt_epoch(epoch)  # a restarted producer: its markers rule
+            mseq = m.get("seq")
+            if mseq is None or int(mseq) < self._next_recv_seq:
+                self._unlink_marker(engine, hx)  # nothing parked / already consumed
+                continue
+            if int(mseq) == seq:
+                orphan = m
+        return orphan
 
     def _settle_head(self, engine: str, upto_seq: int | None) -> bool:
-        """Advance the receive sequence past drainable (released / lease-expired)
-        segments at the head of the channel.  Returns True when the channel head is
+        """Advance the receive sequence past drainable xfers at the head of the
+        channel: released claims of ours and orphan markers (sends of a claim we
+        fenced before the marker landed).  Returns True when the channel head is
         ``upto_seq`` (or, with None, when nothing drainable remains)."""
-        if self._active is not None and not self._active.complete:
+        act = self._active
+        if act is not None and not act.complete and not act.released:
             return False  # an xfer is mid-receive: its remaining items come first
-        pending: dict[int, str] | None = None
         while upto_seq is None or self._next_recv_seq < upto_seq:
-            if pending is None:
-                pending = self._scan_pending(engine)
-            hx = pending.get(self._next_recv_seq)
-            if hx is None:
-                if upto_seq is not None and self._gap_logged != self._next_recv_seq:
-                    self._gap_logged = self._next_recv_seq
-                    logger.warning(
-                        "PD fabric: publish seq %d of %s is not visible yet "
-                        "(WRITING or "
-                        "swept); seq %d waits",
-                        self._next_recv_seq,
-                        engine,
-                        upto_seq,
-                    )
-                return upto_seq is None
-            ok, why = self._drainable(engine, hx)
-            if not ok:
-                return False  # an unexpired READY xfer nobody asked for yet: wait
-            self._drain_unclaimed(engine, hx, why)
-            pending = None
+            s = self._next_recv_seq
+            xf = self._by_seq.get(s)
+            if xf is None:
+                m = self._marker_by_seq(engine, s)
+                xf = self._by_seq.get(s)
+                if xf is None:
+                    if m is None:
+                        return upto_seq is None  # head not sent yet
+                    self._drain_orphan(engine, m)
+                    continue
+            if xf.released:
+                self._drain_released(xf)
+                continue
+            return False  # a live claim owns the head: the hook posts its recvs
         return True
-
-    def _drain_unclaimed(self, engine: str, hx: str, why: str) -> None:
-        """Claim an unclaimed READY/RELEASED segment, receive all its items into
-        scratch, unlink it (the producer reclaims its buffers)."""
-        ctrl = self.control
-        xfer_id = f"{engine}:{hx}"
-        _tmp, pub, _mine = ctrl.segment_dirs(engine, hx)
-        side = self._read_sidecar(pub)
-        hp = os.path.join(pub, "header")
-        if os.path.isfile(hp):
-            with contextlib.suppress(OSError):
-                write_status(hp, READY)  # _open_claimed requires READY to claim
-        g = ctrl.open_get(_Desc(xfer_id))
-        if g is None or not g.ready():
-            # Never advance past items we could not receive: a misaligned channel
-            # would deliver garbage into the next xfer's staging.  Stalling here is
-            # loud (this warning every step) and the launch script restarts the job.
-            logger.error(
-                "PD fabric: cannot claim %s to drain it (%s); receive seq %d is stuck",
-                xfer_id,
-                g.reason if g is not None else "still WRITING",
-                self._next_recv_seq,
-            )
-            return
-        items = [tuple(x) for x in (side or {}).get("items", [])]
-        n_kv = int((side or {}).get("n_kv", 0))
-        xf = _Xfer(xfer_id, hx, self._next_recv_seq, items, n_kv, None)
-        self._drain_items(xf)
-        ctrl.release_remote(xfer_id)  # RELEASED + unlink of our claim
-        self._seq_cache.pop(hx, None)
-        self._next_recv_seq += 1
-        self.stats["drained_xfers"] += 1
-        logger.info(
-            "PD fabric: drained %s (%s, %d items) into scratch",
-            xfer_id,
-            why,
-            len(items),
-        )
 
     def _drain_items(self, xf: _Xfer) -> None:
         layer, sock = self.layer, self._sock
@@ -1577,6 +1720,71 @@ class FabricSocketTransport(TTKVTransport):
         self.stats["recvs"] += n
         if self._active is xf:
             self._active = None
+
+    def _drain_orphan(self, engine: str, m: dict[str, Any]) -> None:
+        """Sends the producer enqueued for a claim we had already fenced and
+        dropped: receive them into scratch at their turn."""
+        xfer_id = str(m.get("xfer_id"))
+        hx = parse_xfer_id(xfer_id)[1]
+        xf = _Xfer(
+            xfer_id,
+            hx,
+            int(m["seq"]),
+            [tuple(x) for x in m.get("items", [])],
+            int(m.get("n_kv", 0)),
+            None,
+        )
+        self._drain_items(xf)
+        self._next_recv_seq = xf.seq + 1
+        self._unlink_marker(engine, hx)
+        self.stats["drained_xfers"] += 1
+        self.stats["orphan_markers"] += 1
+        logger.info(
+            "PD fabric: drained %s (sent after our claim was dropped, %d items) into "
+            "scratch",
+            xfer_id,
+            xf.nitems,
+        )
+
+    def _drain_released(self, xf: _Xfer) -> None:
+        """A released claim of ours at the channel head: drain what is left, then
+        drop the claim dir (the producer reclaims its buffers)."""
+        n_left = xf.nitems - xf.cursor
+        self._drain_items(xf)
+        self._next_recv_seq = max(self._next_recv_seq, int(xf.seq) + 1)
+        self._finalize(xf)
+        self.control.release_remote(xf.xfer_id)  # RELEASED + claim dir removed
+        self.stats["drained_xfers"] += 1
+        logger.info(
+            "PD fabric: drained %s (released, %d of %d items) into scratch",
+            xf.xfer_id,
+            n_left,
+            xf.nitems,
+        )
+
+    def _finalize(self, xf: _Xfer) -> None:
+        """Forget a claim of ours: rec set back, marker gone, indexes cleared."""
+        if xf.rec_set is not None:
+            self._rec_sets.append(xf.rec_set)
+            xf.rec_set = None
+        if self._active is xf:
+            self._active = None
+        self._xfers.pop(xf.xfer_id, None)
+        self._ctrl_sources.pop(xf.xfer_id, None)
+        if xf.seq is not None:
+            self._by_seq.pop(xf.seq, None)
+        peer = self.peer_engine_id
+        if peer is not None:
+            self._unlink_marker(peer, xf.hx)
+
+    def _drop_unsent(self, xf: _Xfer, why: str) -> None:
+        """Drop a claim nothing was (or will be) sent for: no drain, claim dir
+        removed, the producer's buffers come back through its ``_reclaim``."""
+        self._finalize(xf)
+        self.control.release_remote(xf.xfer_id)
+        logger.info(
+            "PD fabric: dropped claim %s (%s; nothing on the channel)", xf.xfer_id, why
+        )
 
     def open_get(self, desc: Any) -> GetHandle | None:
         self._require_started()
@@ -1599,43 +1807,22 @@ class FabricSocketTransport(TTKVTransport):
             )
         with self._lock:
             xf = self._xfers.get(xfer_id)
-            if xf is not None:  # re-open of our own claim
-                return self._handle(xf)
+            if xf is not None:  # our claim: marker / head gate / re-open
+                return self._reopen(engine, xf)
             _tmp, pub, mine = ctrl.segment_dirs(engine, hx)
             if not os.path.isdir(pub):
                 # WRITING (None) / MISSING / dead-producer FAILED: the control plane
-                # knows; nothing of ours is on the channel yet
+                # knows; nothing of ours is on the channel
                 return ctrl.open_get(_Desc(xfer_id))
             hp = os.path.join(pub, "header")
             try:
                 hdr = read_header(hp, full=False)
             except (OSError, ValueError):
                 return None  # torn publish; retry
-            if hdr.status == FAILED and ctrl.parked_items(pub) > 0:
-                # a send raised mid finish_export: its enqueued items sit on the
-                # channel ahead of everything published later -> drain at its turn
-                side = self._read_sidecar(pub) or {}
-                if str(side.get("epoch")) != self._recv_epoch:
-                    self._adopt_epoch(str(side.get("epoch")))
-                seq = int(side["seq"])
-                self._seq_cache[hx] = seq
-                n_parked = int(side.get("nitems", 0))
-                if seq < self._next_recv_seq:
-                    return GetHandle(
-                        xfer_id, None, "FAILED", {}, f"seq {seq} was already drained"
-                    )
-                if not self._settle_head(engine, seq):
-                    return None  # an older publish is pending on the channel: retry
-                self._drain_unclaimed(engine, hx, "export failed mid-send")
-                return GetHandle(
-                    xfer_id,
-                    None,
-                    "FAILED",
-                    {},
-                    f"producer export failed after {n_parked} items were sent",
-                )
-            if hdr.status not in (READY, RELEASED):
-                return ctrl.open_get(_Desc(xfer_id))  # FAILED -> claim + FAILED handle
+            if hdr.status != READY:
+                # FAILED / RELEASED unclaimed: nothing on the channel (claim-gated);
+                # the control plane claims and answers FAILED
+                return ctrl.open_get(_Desc(xfer_id))
             side = self._read_sidecar(pub)
             if side is None:
                 g = ctrl.open_get(_Desc(xfer_id))
@@ -1647,44 +1834,25 @@ class FabricSocketTransport(TTKVTransport):
             epoch = str(side.get("epoch"))
             if epoch != self._recv_epoch:
                 self._adopt_epoch(epoch)
-            seq = side.get("seq")
             items = [tuple(x) for x in side.get("items", [])]
             n_kv = int(side.get("n_kv", 0))
-            if seq is None or not items:
-                # READY with nothing on the channel (no device parts): plain segment
-                g = ctrl.open_get(_Desc(xfer_id))
-                return g
-            seq = int(seq)
-            self._seq_cache[hx] = seq
-            if seq < self._next_recv_seq:
-                return GetHandle(
-                    xfer_id, None, "MISSING", {}, f"seq {seq} was already drained"
-                )
-            if not self._settle_head(engine, seq):
-                return None  # an older publish is pending on the channel: retry
-            if hdr.status == RELEASED:
-                # released (demotion / abort) before we ever claimed it and now at
-                # the channel head: drain it; the load is reported MISSING
-                self._drain_unclaimed(engine, hx, "released before import")
-                return GetHandle(xfer_id, None, "MISSING", {}, "released before import")
-            mine = cfg.spec_table()
+            if not items:
+                # READY with nothing to send (no device parts): plain segment
+                return ctrl.open_get(_Desc(xfer_id))
+            mine_specs = cfg.spec_table()
             if (
-                side.get("kv_spec") != mine["kv_spec"]
-                or side.get("rec_spec") != mine["rec_spec"]
+                side.get("kv_spec") != mine_specs["kv_spec"]
+                or side.get("rec_spec") != mine_specs["rec_spec"]
             ):
                 raise RuntimeError(
-                    f"PD fabric: {xfer_id} was sent with specs {side['kv_spec']}/"
+                    f"PD fabric: {xfer_id} was exported with specs {side['kv_spec']}/"
                     f"{side['rec_spec']} but this consumer stages {cfg.spec_table()}: "
                     "direct-mode receive is impossible (fabric_kv_dtype mismatch)"
                 )
             n_rec = len(items) - n_kv
             if n_rec > cfg.rec_parts:
-                g = ctrl.open_get(_Desc(xfer_id))
-                if g is not None and g.ready():
-                    xf = _Xfer(xfer_id, hx, seq, items, n_kv, None)
-                    self._drain_items(xf)
-                    self._next_recv_seq += 1
-                    ctrl.finish_import(g, ok=False)
+                # never claim it: unclaimed, nothing is sent; the worker releases
+                # it (RELEASED) and the producer janitor sweeps it
                 return GetHandle(
                     xfer_id,
                     None,
@@ -1694,23 +1862,74 @@ class FabricSocketTransport(TTKVTransport):
                 )
             if n_rec > 0 and not self._rec_sets:
                 return None  # every rec set is held by a KV_DONE handle: retry
-            g = ctrl.open_get(_Desc(xfer_id))  # CLAIM
+            g = ctrl.open_get(_Desc(xfer_id))  # CLAIM: the producer's send trigger
             if g is None or not g.ready():
                 return g
             rec_set = self._rec_sets.popleft() if n_rec > 0 else None
-            xf = _Xfer(xfer_id, hx, seq, items, n_kv, rec_set)
-            for k, (name, _c) in enumerate(items[n_kv:]):
-                xf.rec_index[name] = k
-            for name, _c in items[:n_kv]:
-                xf.kv_present[name] = xf.kv_present.get(name, 0) + 1
+            xf = _Xfer(
+                xfer_id, hx, None, items, n_kv, rec_set, claimed_ts=time.perf_counter()
+            )
+            xf.index_items()
             self._xfers[xfer_id] = xf
-            self._active = xf
             self._ctrl_sources[xfer_id] = g.sources
-            self._seq_cache.pop(hx, None)  # no longer an unclaimed pub
             self.stats["imports"] += 1
-            if n_kv == 0:
-                self._post_recs(xf)
-            return self._handle(xf)
+            return self._reopen(engine, xf, first=True)
+
+    def _reopen(
+        self, engine: str, xf: _Xfer, *, first: bool = False
+    ) -> GetHandle | None:
+        """Our claim: None until the producer's marker is there and the xfer is at
+        the channel head; then the READY handle (once: the hook posts the recvs)."""
+        if xf.posted:
+            return self._handle(xf)  # re-open of a live import
+        if xf.released and not xf.send_failed:
+            return GetHandle(xf.xfer_id, None, "MISSING", {}, "released")
+        if xf.seq is None and not xf.send_failed:
+            m = self._marker(engine, xf.hx)
+            if m is None and first and self.cfg.claim_wait_s > 0:
+                # an idle producer answers a claim within its idle tick: spin a
+                # little so the recvs go out in THIS step (the common 1-user path)
+                deadline = time.perf_counter() + self.cfg.claim_wait_s
+                while m is None and time.perf_counter() < deadline:
+                    time.sleep(0.0002)
+                    m = self._marker(engine, xf.hx)
+            if m is None:
+                if self.control.claim_status(xf.xfer_id) == RELEASED:
+                    # the producer abandoned the export before any send
+                    self._drop_unsent(xf, "released by the producer before the send")
+                    return GetHandle(
+                        xf.xfer_id, None, "MISSING", {}, "released by the producer"
+                    )
+                return None  # sends not enqueued yet: the worker re-polls
+            self._adopt_marker(xf, m)
+        if xf.send_failed:
+            n = xf.nitems
+            if xf.seq is None:  # nothing was enqueued
+                self._drop_unsent(xf, "producer send failed before any item")
+            else:  # parked items (released by _adopt_marker): drain if at the head
+                self._settle_head(engine, None)
+            return GetHandle(
+                xf.xfer_id,
+                None,
+                "FAILED",
+                {},
+                f"producer export failed after {n} items were sent",
+            )
+        if not self._settle_head(engine, int(xf.seq)):
+            return None  # an older sent xfer is pending on the channel: retry
+        xf.posted = True
+        self._active = xf
+        if xf.n_kv == 0:
+            self._post_recs(xf)
+        logger.info(
+            "PD fabric: %s at the channel head seq=%d (%d items) %.1f ms after the "
+            "claim; receiving",
+            xf.xfer_id,
+            xf.seq,
+            xf.nitems,
+            (time.perf_counter() - xf.claimed_ts) * 1e3,
+        )
+        return self._handle(xf)
 
     def _handle(self, xf: _Xfer) -> GetHandle:
         ctrl = self.control
@@ -1739,6 +1958,11 @@ class FabricSocketTransport(TTKVTransport):
                 raise RuntimeError(
                     f"PD fabric: {xf.xfer_id} already failed: {xf.failed}"
                 )
+            if not xf.posted:
+                raise RuntimeError(
+                    f"PD fabric: {xf.xfer_id} item {item} requested before the "
+                    "producer's sends were on the channel (open_get was not READY)"
+                )
             if xf.cursor >= xf.n_kv:
                 raise RuntimeError(
                     f"PD fabric: {xf.xfer_id} item {item} requested after all "
@@ -1765,7 +1989,7 @@ class FabricSocketTransport(TTKVTransport):
         if n_rec == 0:
             if self._active is xf:
                 self._active = None
-            self._next_recv_seq = max(self._next_recv_seq, xf.seq + 1)
+            self._next_recv_seq = max(self._next_recv_seq, int(xf.seq) + 1)
             return
         if xf.rec_set is None:
             raise RuntimeError(
@@ -1777,7 +2001,7 @@ class FabricSocketTransport(TTKVTransport):
         xf.cursor = xf.nitems
         if self._active is xf:
             self._active = None
-        self._next_recv_seq = max(self._next_recv_seq, xf.seq + 1)
+        self._next_recv_seq = max(self._next_recv_seq, int(xf.seq) + 1)
 
     def _copy_rec_item(self, xf: _Xfer, part: str, rec_staging: Any) -> None:
         with self._lock:
@@ -1799,26 +2023,26 @@ class FabricSocketTransport(TTKVTransport):
                 raise ValueError(f"PD fabric: rec staging {got} != {self.cfg.rec_spec}")
             self.layer.copy(xf.rec_set[k].tensor, rec_staging)
 
-    def _close_xfer(self, xf: _Xfer) -> None:
-        """Drain what is left on the channel and return the rec set."""
-        if not xf.complete:
-            self._drain_items(xf)
-            self._next_recv_seq = max(self._next_recv_seq, xf.seq + 1)
-        if xf.rec_set is not None:
-            self._rec_sets.append(xf.rec_set)
-            xf.rec_set = None
-        if self._active is xf:
-            self._active = None
-        self._ctrl_sources.pop(xf.xfer_id, None)
-
     def finish_import(self, h: GetHandle, ok: bool) -> None:
         if not self._started:
             return
         ctrl = self.control
         with self._lock:
-            xf = self._xfers.pop(h.xfer_id, None)
-            if xf is not None:
-                self._close_xfer(xf)
+            xf = self._xfers.get(h.xfer_id)
+            if xf is None:
+                ctrl.finish_import(h, ok)  # CONSUMED | LOAD_FAILED + unlink
+                return
+            if not xf.posted:
+                # a FAILED handle of ours (send failed) or a worker giving up
+                # before READY: the release path settles it (drain at its turn)
+                if not xf.released:
+                    self._release_claimed(xf)
+                return
+            if not xf.complete:
+                # posted and mid-receive = at the channel head: drain the rest now
+                self._drain_items(xf)
+                self._next_recv_seq = max(self._next_recv_seq, int(xf.seq) + 1)
+            self._finalize(xf)
             ctrl.finish_import(h, ok)  # CONSUMED | LOAD_FAILED + unlink
 
     def release_remote(self, xfer_id: str) -> None:
@@ -1830,30 +2054,63 @@ class FabricSocketTransport(TTKVTransport):
         except ValueError:
             return
         with self._lock:
-            xf = self._xfers.pop(xfer_id, None)
-            if xf is not None:  # claimed by us: drain the rest, drop the claim
-                self._close_xfer(xf)
-                ctrl.release_remote(xfer_id)
+            xf = self._xfers.get(xfer_id)
+            if xf is not None:  # claimed by us
+                self._release_claimed(xf)
                 return
-            _tmp, pub, _mine = ctrl.segment_dirs(engine, hx)
-            if os.path.isdir(pub):
-                seq = self._seq_of_pub(engine, hx)
-                if seq is not None and self._settle_head(engine, seq):
-                    self._drain_unclaimed(engine, hx, "released")
-                    return
-                # not at the channel head yet: mark RELEASED; drained at its turn
-                ctrl.release_remote(xfer_id)
+            # unclaimed (or missing / .tmp): nothing of it is on the channel; the
+            # control plane marks a published segment RELEASED for the janitor
+            ctrl.release_remote(xfer_id)
+
+    def _release_claimed(self, xf: _Xfer) -> None:
+        """Drop a claim of ours.  Unsent: FENCE first (the producer will not start
+        sends for a ``.closing`` dir), then read the marker -- absent: nothing is or
+        will be on the channel; present: its items are parked.  Sent: drain at the
+        channel turn (now when at the head, else from ``pump`` / a later
+        ``open_get``)."""
+        if xf.released:
+            return
+        engine = parse_xfer_id(xf.xfer_id)[0]
+        if xf.seq is None and not xf.send_failed:
+            self.control.fence_claim(xf.xfer_id)
+            m = self._marker(engine, xf.hx)
+            if m is None:
+                self._drop_unsent(xf, "released before the producer sent")
                 return
-            ctrl.release_remote(xfer_id)  # missing / .tmp / foreign claim
+            self._adopt_marker(xf, m)
+        if xf.seq is None:  # marker says nothing was enqueued
+            self._drop_unsent(xf, "producer sent nothing")
+            return
+        xf.released = True
+        if xf.posted:
+            # the READY handle was issued, so it is the channel head (or complete):
+            # drain what is left now; the rec set comes back in CQ order behind
+            # the recvs already posted into it
+            self._drain_released(xf)
+            return
+        if xf.rec_set is not None:
+            self._rec_sets.append(xf.rec_set)  # no recv targets it: back now
+            xf.rec_set = None
+        if not self._settle_head(engine, None):
+            logger.info(
+                "PD fabric: %s released with %d items on the channel behind seq %d; "
+                "drained at its turn",
+                xf.xfer_id,
+                xf.nitems - xf.cursor,
+                self._next_recv_seq,
+            )
 
     # -- both roles --------------------------------------------------------------------
     def pump(self) -> None:
-        """Optional per-step call (TTKVWorker.end_step): producer reclaims buffers of
-        finished exports; consumer drains released / lease-expired orphans at the
-        head of the channel so the producer's CQ is not parked behind them."""
+        """The protocol clock, ENGINE THREAD ONLY (device ops): the producer enqueues
+        the sends of newly claimed exports and reclaims finished ones; the consumer
+        drains released claims and orphan markers at the head of the channel.
+        Called by ``TTKVWorker.end_step`` after every step and by the rank's idle
+        ticker while the engine is idle."""
         if not self._started:
             return
         if self.is_producer:
+            self._send_claimed()
             self._reclaim()
             return
         peer = self.peer_engine_id
@@ -1862,15 +2119,32 @@ class FabricSocketTransport(TTKVTransport):
         with self._lock:
             self._settle_head(peer, None)
 
+    def wants_pump(self) -> bool:
+        """Host-only (any thread): would ``pump()`` have something to do soon?
+        Producer: an export is published (a claim may appear / a segment may go).
+        Consumer: a claim of ours is open, or a marker exists (a live import, or
+        the sends of a claim we dropped, to drain)."""
+        if not self._started:
+            return False
+        with self._lock:
+            if self.is_producer:
+                return bool(self._exports)
+            if self._xfers:
+                return True
+            peer = self.peer_engine_id
+            return peer is not None and bool(self._list_markers(peer))
+
     def pending_receive_seq(self) -> int:
         return self._next_recv_seq
 
 
 __all__ = [
+    "CLOSING_SUFFIX",
     "DEFAULT_CONTROL_DIR",
     "DEFAULT_KV_PARTS",
     "DEFAULT_MAX_MODEL_LEN",
     "RENDEZVOUS_DIR",
+    "SENT_DIR",
     "SIDECAR_NAME",
     "STAGING_SPECS",
     "FabricChunk",

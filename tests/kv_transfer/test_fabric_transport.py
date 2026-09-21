@@ -38,6 +38,7 @@ from vllm_tt_plugin.kv_transfer.transport.base import (
     build_manifest,
 )
 from vllm_tt_plugin.kv_transfer.transport.fabric import (
+    CLOSING_SUFFIX,
     SIDECAR_NAME,
     FabricConfig,
     FabricSink,
@@ -386,6 +387,7 @@ def make_pair(
         max_model_len=(kv_bufs // 4) * 2048,
         lease_duration=lease,
         socket_timeout_s=5.0,
+        claim_wait_s=0.0,  # tests drive the producer's pump by hand
     )
     common.update(kw)
     P = FabricSocketTransport(
@@ -516,6 +518,30 @@ def publish(P, i, m, rng, **kw):
 def seg_dirs(D, i):
     """(tmp, pub, D-claim) of the producer segment i; claims carry the CONSUMER id."""
     return D.control.segment_dirs(P_ENGINE, HX[i])
+
+
+def marker_path(D, i):
+    """The producer's send marker of segment i (claim-gated sends)."""
+    return D._marker_path(P_ENGINE, HX[i])
+
+
+def claim(D, i):
+    """The consumer's CLAIM: open_get renames the segment and returns None until the
+    producer's marker says the sends are on the channel."""
+    g = D.open_get(Desc(xfer(i)))
+    assert g is None, g
+    tmp, pub, mine = seg_dirs(D, i)
+    assert os.path.isdir(mine) and not os.path.isdir(pub)
+    return mine
+
+
+def claim_and_send(P, D, i):
+    """Claim, the producer's next pump (its step / idle tick) sends, READY handle."""
+    claim(D, i)
+    P.pump()
+    g = D.open_get(Desc(xfer(i)))
+    assert g is not None and g.ready(), g
+    return g
 
 
 # --- construction / seam --------------------------------------------------------------
@@ -904,7 +930,11 @@ def test_open_put_pool_accounting_and_sinks(tmp_path):
     D.shutdown()
 
 
-def test_finish_export_ready_channel_order_and_sidecar(tmp_path):
+def test_finish_export_publishes_without_sends_then_the_claim_triggers_them(tmp_path):
+    """Claim-gated sends (D5): READY puts NOTHING on the channel; the consumer's
+    claim (open_get -> rename -> None) is the trigger; the producer's next pump
+    enqueues every item once, in canonical order, assigns the seq in send order
+    and writes the marker; the consumer's next open_get is READY."""
     world, clock, P, D = started_pair(tmp_path)
     m = manifest()
     rng = np.random.default_rng(1)
@@ -917,10 +947,12 @@ def test_finish_export_ready_channel_order_and_sidecar(tmp_path):
             assert buf.spec == KV_HM and np.array_equal(
                 buf.tensor.data, want[(p.name, c)]
             )
-    assert world.channel.pending_sends == 0  # nothing sent before READY
     P.finish_export(h, "READY")
-    assert world.channel.pending_sends == 14 and P.stats["sends"] == 14
-    assert P.layer.sends == 14 + 2  # + the two warm-up items
+    assert world.channel.pending_sends == 0 and P.stats["sends"] == 0
+    P.pump()
+    P.pump()  # no claim: nothing is ever enqueued
+    assert world.channel.pending_sends == 0 and P.unsent_exports() == 1
+    assert P.stats["exports_ready"] == 1 and P.stats["exports_sent"] == 0
     tmp, pub, mine = seg_dirs(D, 0)
     assert os.path.isdir(pub) and not os.path.isdir(tmp)
     hdr = read_header(os.path.join(pub, "header"), full=True)
@@ -929,25 +961,55 @@ def test_finish_export_ready_channel_order_and_sidecar(tmp_path):
         r.name: r.chunks_written for r in hdr.parts if r.spec.kind == "kv_blocks"
     } == {p.name: 3 for p in kv_parts(m)}
     side = load_json(os.path.join(pub, SIDECAR_NAME))
-    assert (side["seq"], side["nitems"], side["n_kv"], side["epoch"]) == (
+    names = [p.name for p in kv_parts(m)]
+    items = [[n, c] for c in range(3) for n in names] + [
+        [p.name, 0] for p in rec_parts(m)
+    ]
+    assert (
+        side["seq"],
+        side["claim_gated"],
+        side["nitems"],
+        side["n_kv"],
+        side["epoch"],
+    ) == (None, True, 14, 12, P._epoch)
+    assert side["items"] == items
+    assert side["kv_spec"] == [[1, 4, 2048, 256], "bfloat8_b", "TILE"]
+    assert os.path.isfile(os.path.join(pub, "gdn.L0.taps.rows.pt"))
+    # the consumer CLAIMS (rename) and gets None: nothing is on the channel yet
+    assert D.open_get(Desc(xfer(0))) is None
+    assert os.path.isdir(mine) and not os.path.isdir(pub) and D.stats["imports"] == 1
+    assert world.channel.pending_sends == 0 and not os.path.exists(marker_path(D, 0))
+    assert D.open_get(Desc(xfer(0))) is None  # re-poll: still no marker
+    # the producer's pump sees the claim: 14 sends in canonical order, seq 0, marker
+    P.pump()
+    assert world.channel.pending_sends == 14 and P.stats["sends"] == 14
+    assert P.layer.sends == 14 + 2  # + the two warm-up items
+    with world.channel.cond:
+        specs = [s for _, s in world.channel.sends]
+    assert specs == [KV_HM] * 12 + [REC] * 2
+    mk = load_json(marker_path(D, 0))
+    assert (mk["seq"], mk["status"], mk["nitems"], mk["n_kv"], mk["epoch"]) == (
         0,
+        "READY",
         14,
         12,
         P._epoch,
     )
-    names = [p.name for p in kv_parts(m)]
-    assert side["items"] == [[n, c] for c in range(3) for n in names] + [
-        [p.name, 0] for p in rec_parts(m)
-    ]
-    assert side["kv_spec"] == [[1, 4, 2048, 256], "bfloat8_b", "TILE"]
-    assert os.path.isfile(os.path.join(pub, "gdn.L0.taps.rows.pt"))
-    # the channel holds exactly the canonical order
-    with world.channel.cond:
-        specs = [s for _, s in world.channel.sends]
-    assert specs == [KV_HM] * 12 + [REC] * 2
-    # a second READY export gets seq 1
-    h2, _ = publish(P, 1, manifest(num_tokens=100, kv_layers=1), rng)
-    assert load_json(os.path.join(seg_dirs(D, 1)[1], SIDECAR_NAME))["seq"] == 1
+    assert mk["items"] == items and mk["xfer_id"] == xfer(0)
+    # exactly once: further pumps enqueue nothing more
+    P.pump()
+    P.pump()
+    assert world.channel.pending_sends == 14 and P.stats["sends"] == 14
+    assert P.stats["exports_sent"] == 1 and P.unsent_exports() == 0
+    g = D.open_get(Desc(xfer(0)))  # channel head seq 0: READY
+    assert g is not None and g.ready()
+    # a second export claimed later gets seq 1 in SEND order and waits behind A
+    publish(P, 1, manifest(num_tokens=100, kv_layers=1), rng)
+    assert load_json(os.path.join(seg_dirs(D, 1)[1], SIDECAR_NAME))["seq"] is None
+    claim(D, 1)
+    P.pump()
+    assert load_json(marker_path(D, 1))["seq"] == 1
+    assert D.open_get(Desc(xfer(1))) is None  # A (seq 0) is mid-receive: B waits
     assert P.outstanding_exports() == 2 and not P.export_complete(xfer(0))
     P.shutdown()
     D.shutdown()
@@ -963,8 +1025,8 @@ def test_default_hook_part_outer_write_order_is_canonicalised(tmp_path):
     side = load_json(os.path.join(seg_dirs(D, 0)[1], SIDECAR_NAME))
     names = [p.name for p in kv_parts(m)]
     assert side["items"] == [[n, c] for c in range(3) for n in names]
-    g = D.open_get(Desc(xfer(0)))
-    assert g is not None and g.ready()
+    g = claim_and_send(P, D, 0)
+    assert load_json(marker_path(D, 0))["items"] == side["items"]
     staging = [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)]
     got = import_like_hook(g, m, staging)
     assert all(np.array_equal(got[k], want[k]) for k in got) and len(got) == 12
@@ -985,8 +1047,14 @@ def test_end_to_end_identity_two_steps(tmp_path):
     h = P.open_put(xfer(0), m)
     assert D.open_get(Desc(xfer(0))) is None  # WRITING
     want = export_like_hook(h, m, rng)
-    assert D.open_get(Desc(xfer(0))) is None  # still WRITING (sends not enqueued)
+    assert D.open_get(Desc(xfer(0))) is None  # still WRITING
     P.finish_export(h, "READY")
+    tmp, pub, mine = seg_dirs(D, 0)
+    assert D.open_get(Desc(xfer(0))) is None  # CLAIMED, the producer has not pumped
+    assert os.path.isdir(mine) and not os.path.isdir(pub)
+    assert len(D._rec_sets) == 1  # the rec set is reserved at the claim
+    assert world.channel.pending_sends == 0
+    P.pump()  # the producer's next step / idle tick: sends + marker
     g = D.open_get(Desc(xfer(0)))
     assert g is not None and g.ready() and g.manifest.nblk == 65
     for p in kv_parts(m) + rec_parts(m):
@@ -995,9 +1063,6 @@ def test_end_to_end_identity_two_steps(tmp_path):
     for p in taps_parts(m):
         assert isinstance(g.sources[p.name], DumpfileSource)
     assert D.open_get(Desc(xfer(0))) is not None  # re-open of our own claim
-    tmp, pub, mine = seg_dirs(D, 0)
-    assert os.path.isdir(mine) and not os.path.isdir(pub)
-    assert len(D._rec_sets) == 1  # one set taken
     staging = [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)]
     # step 1: chunks 0..1 (max_import_chunks_per_step = 2)
     got = import_like_hook(g, m, staging, slice(0, 2))
@@ -1025,15 +1090,18 @@ def test_end_to_end_identity_two_steps(tmp_path):
         g.sources["kv.L0.k"].chunk(0).read_device(None)
     with pytest.raises(NotImplementedError):
         g.sources["kv.L0.k"].crc32c()
+    assert os.path.exists(marker_path(D, 0))  # marker lives until the claim is done
     D.finish_import(g, ok=True)
     assert not os.path.isdir(mine) and len(D._rec_sets) == 2
+    assert not os.path.exists(marker_path(D, 0)) and D._markers == {}
+    assert not D.wants_pump()
     # producer reclaims the buffers (engine thread, via open_put/pump)
-    assert P._kv_pool.free == 4
+    assert P._kv_pool.free == 4 and P.wants_pump()
     P.pump()
     assert (
         P._kv_pool.free == 16 and P._rec_pool.free == 4 and P.export_complete(xfer(0))
     )
-    assert P.stats["reclaimed"] == 1
+    assert P.stats["reclaimed"] == 1 and not P.wants_pump()
     # no program compiled after start() on either side (TT_PD_STRICT_SHAPES)
     assert P.layer.compiled == keys_p and D.layer.compiled == keys_d
     # janitor: nothing left to sweep, no _puts entry
@@ -1043,27 +1111,23 @@ def test_end_to_end_identity_two_steps(tmp_path):
     D.shutdown()
 
 
-def test_seq_gate_and_lease_expired_drain(tmp_path):
+def test_orphan_export_never_parks_and_is_swept_at_lease_expiry(tmp_path):
+    """V7 (D5): an export whose D leg never comes has NOTHING on the channel; a
+    later claimed export flows past it (seq 0 goes to the first SENT xfer); the
+    producer janitor sweeps the orphan at lease expiry and its buffers come back
+    -- no drain, no parked CQ, no lease-long stall of the producer."""
     world, clock, P, D = started_pair(tmp_path, kv_bufs=32, lease=10.0)
     rng = np.random.default_rng(11)
     mA, mB = manifest(kv_layers=1), manifest(num_tokens=100, kv_layers=1)
-    publish(P, 0, mA, rng)  # seq 0: 6 kv + 2 rec
-    _, wantB = publish(P, 1, mB, rng)  # seq 1: 2 kv + 2 rec
-    assert world.channel.pending_sends == 12
-    # B is behind A on the channel: not before A is received or drained
-    assert D.open_get(Desc(xfer(1))) is None
-    assert os.path.isdir(seg_dirs(D, 1)[1])  # B not claimed
-    assert world.channel.pending_sends == 12
-    # A's lease expires (the proxy never admitted it on D): B's open_get drains A
-    clock.now += 10.5
-    g = D.open_get(Desc(xfer(1)))
-    assert g is not None and g.ready()
-    assert not os.path.isdir(seg_dirs(D, 0)[1]) and not os.path.isdir(seg_dirs(D, 0)[2])
-    assert D.stats["drained_xfers"] == 1 and D.stats["drains"] == 8
-    assert world.channel.pending_sends == 4  # only B's items remain
-    # a later request for the drained A -> MISSING
-    gA = D.open_get(Desc(xfer(0)))
-    assert gA is not None and gA.status == "MISSING"
+    publish(P, 0, mA, rng)  # the D leg never names A
+    _, wantB = publish(P, 1, mB, rng)
+    P.pump()
+    D.pump()
+    assert world.channel.pending_sends == 0 and P.stats["sends"] == 0
+    g = claim_and_send(P, D, 1)
+    assert load_json(marker_path(D, 1))["seq"] == 0
+    assert world.channel.pending_sends == 4 and P.stats["sends"] == 4
+    assert os.path.isdir(seg_dirs(D, 0)[1])  # A: published, unclaimed, unsent
     staging = [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)]
     got = import_like_hook(g, mB, staging)
     assert all(np.array_equal(got[k], wantB[k]) for k in got)
@@ -1071,75 +1135,140 @@ def test_seq_gate_and_lease_expired_drain(tmp_path):
     inst = install_like_hook(g, mB, FakeTensor.zeros(REC))
     assert all(np.array_equal(inst[p.name], wantB[p.name]) for p in rec_parts(mB))
     D.finish_import(g, ok=True)
+    assert D.pending_receive_seq() == 1 and D.stats["drains"] == 0
+    # A's lease expires: nothing for the consumer to drain, the janitor sweeps it
+    clock.now += 10.5
+    D.pump()
+    assert D.stats["drained_xfers"] == 0 and world.channel.pending_sends == 0
+    assert P.outstanding_exports() == 2  # A's buffers held while its segment exists
+    P.control.janitor_once()
+    assert not os.path.isdir(seg_dirs(D, 0)[1]) and P.control.stats["expired"] == 1
     P.pump()
     assert P._kv_pool.free == 32 and P.outstanding_exports() == 0
+    assert P.stats["sends"] == 4 and P.stats["exports_sent"] == 1
+    # a late request for the swept A -> definite MISSING
+    gA = D.open_get(Desc(xfer(0)))
+    assert gA is not None and gA.status == "MISSING"
     P.shutdown()
     D.shutdown()
 
 
-def test_release_remote_unclaimed_at_head_drains(tmp_path):
+def test_mixed_orphans_and_claims_keep_send_order(tmp_path):
+    """Four exports published A B C Dd; the consumer claims C then A: the producer
+    sends the claimed ones in PUBLISH order (A seq 0, C seq 1), the consumer
+    receives in seq order (C waits for A), B and Dd never touch the channel; B
+    claimed afterwards is seq 2."""
+    world, clock, P, D = started_pair(tmp_path, kv_bufs=32, rec_sets=4, d_kw={})
+    rng = np.random.default_rng(17)
+    m = manifest(num_tokens=100, kv_layers=1)  # 2 kv + 2 rec items each
+    wants = [publish(P, i, m, rng)[1] for i in range(4)]
+    claim(D, 2)
+    claim(D, 0)
+    P.pump()
+    assert world.channel.pending_sends == 8 and P.unsent_exports() == 2
+    assert load_json(marker_path(D, 0))["seq"] == 0
+    assert load_json(marker_path(D, 2))["seq"] == 1
+    assert D.open_get(Desc(xfer(2))) is None  # A (seq 0) is the channel head
+    gA = D.open_get(Desc(xfer(0)))
+    assert gA is not None and gA.ready()
+    staging = [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)]
+    got = import_like_hook(gA, m, staging)
+    assert all(np.array_equal(got[k], wants[0][k]) for k in got)
+    gC = D.open_get(Desc(xfer(2)))
+    assert gC is not None and gC.ready() and D.pending_receive_seq() == 1
+    got = import_like_hook(gC, m, staging)
+    assert all(np.array_equal(got[k], wants[2][k]) for k in got)
+    assert world.channel.pending_sends == 0 and D.pending_receive_seq() == 2
+    D.finish_import(gA, ok=True)
+    D.finish_import(gC, ok=True)
+    gB = claim_and_send(P, D, 1)
+    assert load_json(marker_path(D, 1))["seq"] == 2
+    got = import_like_hook(gB, m, staging)
+    assert all(np.array_equal(got[k], wants[1][k]) for k in got)
+    D.finish_import(gB, ok=True)
+    assert D.pending_receive_seq() == 3 and D.stats["drains"] == 0
+    assert P.stats["sends"] == 12 and P.unsent_exports() == 1  # Dd: orphan
+    P.shutdown()
+    D.shutdown()
+
+
+def test_release_remote_unclaimed_marks_released_nothing_to_drain(tmp_path):
     world, clock, P, D = started_pair(tmp_path)
     rng = np.random.default_rng(5)
     publish(P, 0, manifest(kv_layers=1), rng)
-    assert world.channel.pending_sends == 8
     D.release_remote(xfer(0))  # scheduler demotion before the worker ever claimed it
-    assert world.channel.pending_sends == 0 and D.pending_receive_seq() == 1
+    pub = seg_dirs(D, 0)[1]
+    assert os.path.isdir(pub) and read_status(os.path.join(pub, "header")) == RELEASED
+    P.pump()  # no claim: nothing sent; the segment is the janitor's
+    assert world.channel.pending_sends == 0 and P.stats["sends"] == 0
+    P.control.janitor_once()
     assert not any(os.path.isdir(d) for d in seg_dirs(D, 0))
-    D.release_remote(xfer(0))  # idempotent
     P.pump()
-    assert P._kv_pool.free == 16
+    assert P._kv_pool.free == 16 and P.outstanding_exports() == 0
+    D.release_remote(xfer(0))  # idempotent
+    D.pump()
+    assert D.pending_receive_seq() == 0 and D.stats["drains"] == 0
     P.shutdown()
     D.shutdown()
 
 
-def test_release_remote_unclaimed_behind_head_marks_released_then_drains(tmp_path):
+def test_released_unclaimed_export_does_not_block_a_later_claim(tmp_path):
     world, clock, P, D = started_pair(tmp_path, kv_bufs=32)
     rng = np.random.default_rng(6)
     mA = manifest(kv_layers=1)
     _, wantA = publish(P, 0, mA, rng)
     publish(P, 1, manifest(num_tokens=100, kv_layers=1), rng)
-    D.release_remote(xfer(1))  # B released while A (unexpired) is still ahead
+    D.release_remote(xfer(1))  # B released while A, published earlier, is unclaimed
     pubB = seg_dirs(D, 1)[1]
     assert os.path.isdir(pubB) and read_status(os.path.join(pubB, "header")) == RELEASED
-    assert world.channel.pending_sends == 12  # nothing drained yet
-    # the producer janitor must NOT sweep a RELEASED fabric segment (parked sends)
-    P.control.janitor_once()
-    assert os.path.isdir(pubB)
-    # a worker asking for the released B still gets a definite answer, not None forever
-    g = D.open_get(Desc(xfer(0)))
-    assert g is not None and g.ready()
+    g = claim_and_send(P, D, 0)  # A flows: nothing of B is on the channel
+    assert load_json(marker_path(D, 0))["seq"] == 0
     got = import_like_hook(g, mA, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
     assert all(np.array_equal(got[k], wantA[k]) for k in got)
-    assert world.channel.pending_sends == 4  # B's items parked
+    # a worker asking for the released B gets a definite answer, not None forever
     gB = D.open_get(Desc(xfer(1)))
-    assert gB is not None and gB.status == "MISSING" and "released" in gB.reason
-    assert world.channel.pending_sends == 0 and not os.path.isdir(pubB)
+    assert gB is not None and gB.status == "FAILED" and "RELEASED" in gB.reason
+    assert not os.path.isdir(pubB) and world.channel.pending_sends == 0
     D.finish_import(g, ok=True)
     P.pump()
-    assert P.outstanding_exports() == 0
+    assert P.outstanding_exports() == 0 and P.stats["sends"] == 8
     P.shutdown()
     D.shutdown()
 
 
-def test_pump_drains_orphans_and_abandon_after_publish(tmp_path):
+def test_abandon_after_publish_unsent_and_claimed(tmp_path):
     world, clock, P, D = started_pair(tmp_path, kv_bufs=32, lease=5.0)
     rng = np.random.default_rng(8)
     publish(P, 0, manifest(kv_layers=1), rng)
     publish(P, 1, manifest(num_tokens=100, kv_layers=1), rng)
-    D.pump()  # both unexpired READY: nothing to do
-    assert world.channel.pending_sends == 12
-    P.abandon(xfer(0))  # producer gives up a PUBLISHED xfer -> RELEASED, not unlinked
-    pubA = seg_dirs(D, 0)[1]
-    assert os.path.isdir(pubA) and read_status(os.path.join(pubA, "header")) == RELEASED
-    assert P.outstanding_exports() == 2  # buffers stay until the consumer drained
-    D.pump()  # drains A (head, released); B stays (unexpired)
-    assert world.channel.pending_sends == 4 and not os.path.isdir(pubA)
-    assert D.pending_receive_seq() == 1
-    clock.now += 6
-    D.pump()  # B's lease expired: drained too
-    assert world.channel.pending_sends == 0 and D.pending_receive_seq() == 2
+    D.pump()
+    P.pump()  # nothing claimed: nothing on the channel
+    assert world.channel.pending_sends == 0
+    # the producer gives up a PUBLISHED, unsent xfer: segment removed, buffers back
+    P.abandon(xfer(0))
+    assert not any(os.path.isdir(d) for d in seg_dirs(D, 0))
+    assert P.outstanding_exports() == 1 and P._kv_pool.free == 30
+    # B claimed, then abandoned before the producer pumped: the claim's header
+    # flips to RELEASED, nothing is ever sent, the consumer drops the claim
+    claim(D, 1)
+    P.abandon(xfer(1))
+    mineB = seg_dirs(D, 1)[2]
+    assert (
+        os.path.isdir(mineB) and read_status(os.path.join(mineB, "header")) == RELEASED
+    )
+    P.pump()
+    assert world.channel.pending_sends == 0 and P.stats["sends"] == 0
+    g = D.open_get(Desc(xfer(1)))
+    assert (
+        g is not None
+        and g.status == "MISSING"
+        and "released by the producer" in (g.reason)
+    )
+    assert not any(os.path.isdir(d) for d in seg_dirs(D, 1)) and len(D._rec_sets) == 2
     P.pump()
     assert P.outstanding_exports() == 0 and P._kv_pool.free == 32
+    D.pump()
+    assert D.pending_receive_seq() == 0 and D.stats["drains"] == 0
     P.shutdown()
     D.shutdown()
 
@@ -1149,8 +1278,7 @@ def test_out_of_order_read_raises_then_failed_import_drains(tmp_path):
     rng = np.random.default_rng(9)
     m = manifest(kv_layers=1)
     publish(P, 0, m, rng)
-    g = D.open_get(Desc(xfer(0)))
-    assert g is not None and g.ready()
+    g = claim_and_send(P, D, 0)
     st = FakeTensor.zeros(KV_HM)
     g.sources["kv.L0.k"].chunk(0).read_into_device(st)
     with pytest.raises(RuntimeError, match="order violation"):
@@ -1158,18 +1286,17 @@ def test_out_of_order_read_raises_then_failed_import_drains(tmp_path):
     assert world.channel.pending_sends == 7 and D.stats["order_violations"] == 1
     with pytest.raises(RuntimeError, match="already failed"):
         g.sources["kv.L0.v"].chunk(0).read_into_device(st)
-    # wrong staging spec is rejected without posting
-    g2 = None
     # worker _fail -> finish_import(ok=False): the rest is drained into scratch
     D.finish_import(g, ok=False)
     assert world.channel.pending_sends == 0 and D.stats["drains"] == 7
     assert len(D._rec_sets) == 2 and D.pending_receive_seq() == 1
     assert not any(os.path.isdir(d) for d in seg_dirs(D, 0))
+    assert not os.path.exists(marker_path(D, 0))
     P.pump()
     assert P._kv_pool.free == 16
     # a fresh xfer after the failure flows normally
     _, want = publish(P, 1, m, rng)
-    g2 = D.open_get(Desc(xfer(1)))
+    g2 = claim_and_send(P, D, 1)
     got = import_like_hook(g2, m, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
     assert all(np.array_equal(got[k], want[k]) for k in got)
     D.finish_import(g2, ok=True)
@@ -1181,7 +1308,7 @@ def test_bad_staging_spec_rejected_without_posting(tmp_path):
     world, clock, P, D = started_pair(tmp_path)
     m = manifest(kv_layers=1)
     publish(P, 0, m, np.random.default_rng(2))
-    g = D.open_get(Desc(xfer(0)))
+    g = claim_and_send(P, D, 0)
     with pytest.raises(ValueError, match="staging spec"):
         g.sources["kv.L0.k"].chunk(0).read_into_device(FakeTensor.zeros(KV_BM))
     assert world.channel.pending_sends == 8 and world.channel.pending_recvs == 0
@@ -1200,17 +1327,19 @@ def test_rec_set_exhaustion_returns_none_before_claiming(tmp_path):
     mA, mB = manifest(kv_layers=1), manifest(num_tokens=100, kv_layers=1)
     _, wantA = publish(P, 0, mA, rng)
     _, wantB = publish(P, 1, mB, rng)
-    gA = D.open_get(Desc(xfer(0)))
+    gA = claim_and_send(P, D, 0)
     import_like_hook(gA, mA, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
     assert D.pending_receive_seq() == 1 and len(D._rec_sets) == 0
-    # A holds the only rec set until its join step: B waits, unclaimed
+    # A holds the only rec set until its join step: B waits UNCLAIMED, so the
+    # producer sends nothing for it
     assert D.open_get(Desc(xfer(1))) is None
     assert os.path.isdir(seg_dirs(D, 1)[1])
+    P.pump()
+    assert world.channel.pending_sends == 0 and P.unsent_exports() == 1
     D.layer.sync(None)
     install_like_hook(gA, mA, FakeTensor.zeros(REC))
     D.finish_import(gA, ok=True)  # join step: set returned
-    gB = D.open_get(Desc(xfer(1)))
-    assert gB is not None and gB.ready()
+    gB = claim_and_send(P, D, 1)
     got = import_like_hook(gB, mB, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
     assert all(np.array_equal(got[k], wantB[k]) for k in got)
     inst = install_like_hook(gB, mB, FakeTensor.zeros(REC))
@@ -1224,16 +1353,197 @@ def test_aborted_claimed_xfer_release_drains(tmp_path):
     world, clock, P, D = started_pair(tmp_path)
     m = manifest(kv_layers=1)
     publish(P, 0, m, np.random.default_rng(4))
-    g = D.open_get(Desc(xfer(0)))
+    g = claim_and_send(P, D, 0)
     import_like_hook(
         g, m, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)], slice(0, 1)
     )
     assert world.channel.pending_sends == 6
-    D.release_remote(xfer(0))  # abort while IMPORTING_KV (release path)
+    D.release_remote(xfer(0))  # abort while IMPORTING_KV: at the head -> drained now
     assert world.channel.pending_sends == 0 and len(D._rec_sets) == 2
     assert not any(os.path.isdir(d) for d in seg_dirs(D, 0))
+    assert not os.path.exists(marker_path(D, 0)) and D.pending_receive_seq() == 1
+    P.pump()
+    assert P._kv_pool.free == 16 and P.outstanding_exports() == 0
     P.shutdown()
     D.shutdown()
+
+
+def test_release_before_the_send_fences_the_claim(tmp_path):
+    """A claim dropped before the producer pumped (abort / lease expiry on D) is
+    FENCED (rename to .closing) then dropped: the producer never sends for it,
+    nothing is parked, its buffers come back."""
+    world, clock, P, D = started_pair(tmp_path)
+    publish(P, 0, manifest(kv_layers=1), np.random.default_rng(4))
+    claim(D, 0)
+    mine = seg_dirs(D, 0)[2]
+    assert os.path.isdir(mine) and len(D._rec_sets) == 1
+    D.release_remote(xfer(0))
+    assert not any(os.path.isdir(d) for d in seg_dirs(D, 0))
+    assert not os.path.isdir(mine + CLOSING_SUFFIX) and len(D._rec_sets) == 2
+    assert xfer(0) not in D._xfers
+    P.pump()  # the producer never sends for a dropped claim
+    assert world.channel.pending_sends == 0 and P.stats["sends"] == 0
+    assert P.outstanding_exports() == 0 and P._kv_pool.free == 16
+    D.pump()
+    assert D.pending_receive_seq() == 0 and not D.wants_pump()
+    P.shutdown()
+    D.shutdown()
+
+
+def test_released_claim_behind_a_live_import_is_drained_by_pump_at_its_turn(tmp_path):
+    """The request of a SENT claim dies (abort) while an older xfer is still being
+    received: the drain is deferred to its channel turn and done by the next pump
+    -- one consumer step after the head clears, no lease involved."""
+    world, clock, P, D = started_pair(tmp_path, kv_bufs=32)
+    rng = np.random.default_rng(14)
+    mA, mB = manifest(kv_layers=1), manifest(num_tokens=100, kv_layers=1)
+    _, wantA = publish(P, 0, mA, rng)
+    publish(P, 1, mB, rng)
+    gA = claim_and_send(P, D, 0)  # seq 0
+    claim(D, 1)
+    P.pump()  # B seq 1
+    assert world.channel.pending_sends == 12 and len(D._rec_sets) == 0
+    assert D.open_get(Desc(xfer(1))) is None  # A is the head
+    D.release_remote(xfer(1))  # B's request aborted: deferred behind A
+    assert world.channel.pending_sends == 12
+    assert xfer(1) in D._xfers and D._xfers[xfer(1)].released
+    assert len(D._rec_sets) == 1  # B's set back at once (no recv targets it)
+    D.pump()  # not at the head yet: nothing to do
+    assert world.channel.pending_sends == 12 and D.wants_pump()
+    staging = [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)]
+    got = import_like_hook(gA, mA, staging)
+    assert all(np.array_equal(got[k], wantA[k]) for k in got)
+    assert world.channel.pending_sends == 4 and D.pending_receive_seq() == 1
+    D.pump()  # B is the head now: drained
+    assert world.channel.pending_sends == 0 and D.pending_receive_seq() == 2
+    assert xfer(1) not in D._xfers and D.stats["drained_xfers"] == 1
+    assert not any(os.path.isdir(d) for d in seg_dirs(D, 1))
+    D.finish_import(gA, ok=True)
+    P.pump()
+    assert P.outstanding_exports() == 0 and P._kv_pool.free == 32
+    P.shutdown()
+    D.shutdown()
+
+
+class CallbackSendLayer(FakeSocketLayer):
+    """``send`` runs ``on_send`` once, on the first data send (warm-up excluded)."""
+
+    def __init__(self, world, rank, **kw):
+        super().__init__(world, rank, **kw)
+        self.on_send = None
+        self.armed = False
+
+    def send(self, t, sock):
+        if self.armed and self.on_send is not None:
+            cb, self.on_send = self.on_send, None
+            cb()
+        super().send(t, sock)
+
+
+def _pair_with_layer0(tmp_path, layer0, world):
+    common = dict(
+        control_dir=str(tmp_path / "ctrl"),
+        mesh_device=object(),
+        janitor_period=0,
+        rec_sets=2,
+        rec_parts=2,
+        export_budget_bytes=16 * KV_NBYTES,
+        kv_parts=4,
+        max_model_len=8192,
+        socket_timeout_s=5.0,
+        claim_wait_s=0.0,
+    )
+    P = FabricSocketTransport(
+        engine_id=P_ENGINE, role="producer", socket_layer=layer0, **common
+    )
+    D = FabricSocketTransport(
+        engine_id=D_ENGINE, role="consumer", socket_layer=world.layer(1), **common
+    )
+    assert not start_both(P, D)
+    return P, D
+
+
+def test_release_racing_the_send_leaves_an_orphan_marker_drained_by_pump(tmp_path):
+    """The residual window: the producer listed the claim and is enqueueing when
+    the consumer fences and drops it (no marker yet).  The marker then lands as
+    an ORPHAN; the consumer's next pump drains the parked items at their turn and
+    a later export flows with the next seq."""
+    world = FakeWorld()
+    layer0 = CallbackSendLayer(world, 0)
+    P, D = _pair_with_layer0(tmp_path, layer0, world)
+    rng = np.random.default_rng(3)
+    m = manifest(kv_layers=1)  # 6 kv + 2 rec items
+    publish(P, 0, m, rng)
+    claim(D, 0)
+    layer0.armed = True
+    layer0.on_send = lambda: D.release_remote(xfer(0))  # fence + drop mid-enqueue
+    P.pump()
+    assert world.channel.pending_sends == 8 and os.path.exists(marker_path(D, 0))
+    assert not any(os.path.isdir(d) for d in seg_dirs(D, 0))
+    assert xfer(0) not in D._xfers and len(D._rec_sets) == 2
+    assert D.wants_pump()  # the orphan marker
+    D.pump()  # the consumer's next step / idle tick
+    assert world.channel.pending_sends == 0 and D.pending_receive_seq() == 1
+    assert D.stats["orphan_markers"] == 1 and D.stats["drains"] == 8
+    assert not os.path.exists(marker_path(D, 0)) and not D.wants_pump()
+    P.pump()
+    assert P.outstanding_exports() == 0 and P._kv_pool.free == 16
+    mB = manifest(num_tokens=100, kv_layers=1)
+    _, wantB = publish(P, 1, mB, rng)
+    gB = claim_and_send(P, D, 1)
+    assert load_json(marker_path(D, 1))["seq"] == 1
+    got = import_like_hook(gB, mB, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
+    assert all(np.array_equal(got[k], wantB[k]) for k in got)
+    D.finish_import(gB, ok=True)
+    P.shutdown()
+    D.shutdown()
+
+
+def test_claim_wait_spins_for_an_idle_producers_marker(tmp_path):
+    """The common 1-user path: the producer's idle tick answers the claim within a
+    few ms; the FIRST open_get after the claim spins up to claim_wait_s so the
+    recvs go out in the same consumer step."""
+    world, clock, P, D = started_pair(tmp_path, d_kw={"claim_wait_s": 1.0})
+    m = manifest(kv_layers=1)
+    _, want = publish(P, 0, m, np.random.default_rng(15))
+
+    def producer_tick():
+        deadline = time.perf_counter() + 2.0
+        while P.unsent_exports() and time.perf_counter() < deadline:
+            time.sleep(0.005)
+            P.pump()
+
+    th = threading.Thread(target=producer_tick)
+    th.start()
+    t0 = time.perf_counter()
+    g = D.open_get(Desc(xfer(0)))  # claim + spin: READY in this call
+    th.join(5)
+    assert g is not None and g.ready(), g
+    assert time.perf_counter() - t0 < 1.0  # returned as soon as the marker landed
+    got = import_like_hook(g, m, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
+    assert all(np.array_equal(got[k], want[k]) for k in got)
+    D.finish_import(g, ok=True)
+    P.shutdown()
+    D.shutdown()
+
+
+def test_wants_pump_is_a_host_only_hint_for_the_idle_ticker(tmp_path):
+    world, clock, P, D = started_pair(tmp_path)
+    assert not P.wants_pump() and not D.wants_pump()
+    publish(P, 0, manifest(kv_layers=1), np.random.default_rng(0))
+    assert P.wants_pump() and not D.wants_pump()  # a claim may appear any time
+    claim(D, 0)
+    assert D.wants_pump()  # a claim of ours is open
+    P.pump()
+    g = D.open_get(Desc(xfer(0)))
+    import_like_hook(g, manifest(kv_layers=1), [FakeTensor.zeros(KV_HM)] * 2)
+    D.finish_import(g, ok=True)
+    assert not D.wants_pump() and P.wants_pump()  # buffers not reclaimed yet
+    P.pump()
+    assert not P.wants_pump()
+    P.shutdown()
+    D.shutdown()
+    assert not P.wants_pump() and not D.wants_pump()
 
 
 def test_open_get_misc_statuses(tmp_path):
@@ -1250,12 +1560,12 @@ def test_open_get_misc_statuses(tmp_path):
     assert g is not None and g.status == "FAILED" and "mismatch" in g.reason
     # the connector's config-derived descriptor says mode dumpfile: accepted
     publish(P, 0, manifest(kv_layers=1), np.random.default_rng(0))
-    g = D.open_get(
-        Desc(
-            xfer(0),
-            transport={"kind": "fabric", "mode": "dumpfile", "layout_version": 1},
-        )
+    desc = Desc(
+        xfer(0), transport={"kind": "fabric", "mode": "dumpfile", "layout_version": 1}
     )
+    assert D.open_get(desc) is None  # claimed
+    P.pump()
+    g = D.open_get(desc)
     assert g is not None and g.ready()
     with pytest.raises(RuntimeError):
         P.open_get(Desc(xfer(0)))
@@ -1303,7 +1613,7 @@ def test_write_host_rec_row(tmp_path):
     for j, p in enumerate(taps_parts(m)):
         h.sinks[p.name].write_rows(rows_tensor(j))
     P.finish_export(h, "READY")
-    g = D.open_get(Desc(xfer(0)))
+    g = claim_and_send(P, D, 0)
     got = import_like_hook(g, m, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
     inst = install_like_hook(g, m, FakeTensor.zeros(REC))
     assert all(np.array_equal(got[k], want[k]) for k in got)
@@ -1327,8 +1637,10 @@ def test_partial_export_nbytes_present(tmp_path):
     for j, p in enumerate(taps_parts(m)):
         h.sinks[p.name].write_rows(rows_tensor(j))
     P.finish_export(h, "READY")
+    assert load_json(os.path.join(seg_dirs(D, 0)[1], SIDECAR_NAME))["nitems"] == 3
+    g = claim_and_send(P, D, 0)
     assert world.channel.pending_sends == 3
-    g = D.open_get(Desc(xfer(0)))
+    assert load_json(marker_path(D, 0))["nitems"] == 3
     assert g.sources["kv.L0.k"].nbytes_present == g.sources["kv.L0.k"].spec.chunk_nbytes
     assert g.sources["gdn.L1.rec"].nbytes_present == 0
     assert g.sources["gdn.L0.rec"].nbytes_present == g.sources["gdn.L0.rec"].spec.nbytes
@@ -1348,8 +1660,10 @@ def test_partial_export_nbytes_present(tmp_path):
 
 
 def test_two_rank_threads_blocking_recv_identity(tmp_path):
-    """Both engines on their own thread; the decode rank's recvs block until the
-    prefill rank's sends arrive (the CQ parks), two requests back to back."""
+    """Both engines on their own thread: the producer pumps like its step / idle
+    tick, the consumer's first open_get after each claim spins for the marker
+    (claim_wait_s) and its recvs block until the sends arrive (the CQ parks), two
+    requests back to back."""
     world = FakeWorld()
     world_layers = {
         0: world.layer(0),
@@ -1367,6 +1681,7 @@ def test_two_rank_threads_blocking_recv_identity(tmp_path):
         kv_parts=4,
         max_model_len=16384,
         socket_timeout_s=5.0,
+        claim_wait_s=0.2,
     )
     P = FabricSocketTransport(
         engine_id=P_ENGINE, role="producer", socket_layer=world_layers[0], **common
@@ -1380,6 +1695,7 @@ def test_two_rank_threads_blocking_recv_identity(tmp_path):
     got: dict = {}
     errors: list = []
     go = threading.Event()
+    done = threading.Event()
 
     def producer():
         try:
@@ -1389,7 +1705,9 @@ def test_two_rank_threads_blocking_recv_identity(tmp_path):
                 time.sleep(0.02)  # the consumer polls open_get meanwhile
                 _, w = publish(P, i, m, rng)
                 want[i] = w
+            while not done.is_set():  # the step / idle-tick pump
                 P.pump()
+                time.sleep(0.002)
         except BaseException as e:  # noqa: BLE001
             errors.append(e)
 
@@ -1400,7 +1718,8 @@ def test_two_rank_threads_blocking_recv_identity(tmp_path):
                 t0 = time.perf_counter()
                 while g is None or g.status == "MISSING":
                     # MISSING only before the producer created the segment (in the
-                    # real system D asks after P's response, so never), None = WRITING
+                    # real system D asks after P's response, so never), None =
+                    # WRITING, or claimed and waiting for the producer's sends
                     g = D.open_get(Desc(xfer(i)))
                     if g is None or g.status == "MISSING":
                         assert time.perf_counter() - t0 < 10, (
@@ -1417,13 +1736,16 @@ def test_two_rank_threads_blocking_recv_identity(tmp_path):
                 got[i] = r
         except BaseException as e:  # noqa: BLE001
             errors.append(e)
+        finally:
+            done.set()
 
     tp, tc = threading.Thread(target=producer), threading.Thread(target=consumer)
     tc.start()
     tp.start()
     go.set()
-    tp.join(20)
     tc.join(20)
+    done.set()
+    tp.join(20)
     assert not errors, errors
     for i, m in enumerate(ms):
         for k, v in want[i].items():
@@ -1434,22 +1756,24 @@ def test_two_rank_threads_blocking_recv_identity(tmp_path):
     assert world.channel.pending_sends == 0 and world.channel.pending_recvs == 0
     P.pump()
     assert P.outstanding_exports() == 0 and P._kv_pool.free == 32
+    assert P.stats["exports_sent"] == 2 and D.stats["drains"] == 0
     P.shutdown()
     D.shutdown()
 
 
-def test_producer_janitor_keeps_ready_segments(tmp_path):
-    """The shm janitor's lease-expiry rule is disabled: an unclaimed READY segment
-    has parked sends; only the consumer may remove it (drain)."""
+def test_producer_janitor_sweeps_expired_unsent_ready_segments(tmp_path):
+    """An unclaimed READY segment has nothing on the channel (claim-gated sends):
+    the shm janitor's lease-expiry rule applies and the buffers come back."""
     world, clock, P, D = started_pair(tmp_path, lease=1.0)
     publish(P, 0, manifest(kv_layers=1), np.random.default_rng(0))
     clock.now += 100
     P.control.janitor_once()
     pub = seg_dirs(D, 0)[1]
-    assert os.path.isdir(pub) and read_status(os.path.join(pub, "header")) == READY
-    assert P.control.stats["expired"] == 0
-    D.pump()  # consumer drains the expired orphan
-    assert not os.path.isdir(pub) and world.channel.pending_sends == 0
+    assert not os.path.isdir(pub) and P.control.stats["expired"] == 1
+    P.pump()
+    assert P.outstanding_exports() == 0 and P._kv_pool.free == 16
+    D.pump()  # nothing to drain
+    assert world.channel.pending_sends == 0 and D.stats["drained_xfers"] == 0
     P.shutdown()
     D.shutdown()
 
@@ -1635,58 +1959,30 @@ class FailingSendLayer(FakeSocketLayer):
         super().send(t, sock)
 
 
-def test_partial_send_failure_publishes_failed_and_consumer_drains(tmp_path):
+def test_partial_send_failure_marks_failed_and_consumer_drains(tmp_path):
     world = FakeWorld()
     layer0 = FailingSendLayer(world, 0, fail_at=5)
-    clock = Clock()
-    common = dict(
-        control_dir=str(tmp_path / "ctrl"),
-        mesh_device=object(),
-        janitor_period=0,
-        clock=clock,
-        rec_sets=2,
-        rec_parts=2,
-        export_budget_bytes=16 * KV_NBYTES,
-        kv_parts=4,
-        max_model_len=8192,
-        socket_timeout_s=5.0,
-    )
-    P = FabricSocketTransport(
-        engine_id=P_ENGINE, role="producer", socket_layer=layer0, **common
-    )
-    D = FabricSocketTransport(
-        engine_id=D_ENGINE, role="consumer", socket_layer=world.layer(1), **common
-    )
-    assert not start_both(P, D)
+    P, D = _pair_with_layer0(tmp_path, layer0, world)
     layer0.armed = True
     m = manifest(kv_layers=1)  # 6 kv + 2 rec items
     rng = np.random.default_rng(3)
-    h = P.open_put(xfer(0), m)
-    export_like_hook(h, m, rng)
-    P.finish_export(h, "READY")  # send #5 raises: 4 items parked, FAILED published
-    tmp, pub, mine = seg_dirs(D, 0)
-    assert os.path.isdir(pub) and read_status(os.path.join(pub, "header")) == FAILED
-    side = load_json(os.path.join(pub, SIDECAR_NAME))
-    assert (side["status"], side["seq"], side["nitems"], side["n_kv"]) == (
-        "FAILED",
-        0,
-        4,
-        4,
-    )
-    assert len(side["items"]) == 4 and world.channel.pending_sends == 4
+    publish(P, 0, m, rng)
+    claim(D, 0)
+    P.pump()  # send #5 raises: 4 items parked, marker FAILED (seq consumed)
+    mk = load_json(marker_path(D, 0))
+    assert (mk["status"], mk["seq"], mk["nitems"], mk["n_kv"]) == ("FAILED", 0, 4, 4)
+    assert len(mk["items"]) == 4 and world.channel.pending_sends == 4
     assert P.stats["sends"] == 4 and P.stats["exports_failed"] == 1
     # the seq is consumed and the buffers stay with the parked sends
     assert P._next_seq == 1 and P.outstanding_exports() == 1
     assert P._kv_pool.free == 10 and P._rec_pool.free == 2
-    # the producer janitor must not sweep a FAILED segment with parked sends
-    P.control.janitor_once()
-    assert os.path.isdir(pub) and P.control.parked_items(pub) == 4
     # the consumer asks for the failed xfer: definite FAILED, its items drained
     g = D.open_get(Desc(xfer(0)))
     assert g is not None and g.status == "FAILED" and "after 4 items" in g.reason
     assert world.channel.pending_sends == 0 and D.stats["drains"] == 4
-    assert D.pending_receive_seq() == 1
+    assert D.pending_receive_seq() == 1 and len(D._rec_sets) == 2
     assert not any(os.path.isdir(d) for d in seg_dirs(D, 0))
+    assert not os.path.exists(marker_path(D, 0))
     P.pump()
     assert (
         P._kv_pool.free == 16 and P._rec_pool.free == 4 and P.outstanding_exports() == 0
@@ -1694,23 +1990,23 @@ def test_partial_send_failure_publishes_failed_and_consumer_drains(tmp_path):
     # a later export flows normally with the next seq
     mB = manifest(num_tokens=100, kv_layers=1)
     _, wantB = publish(P, 1, mB, rng)
-    assert load_json(os.path.join(seg_dirs(D, 1)[1], SIDECAR_NAME))["seq"] == 1
-    gB = D.open_get(Desc(xfer(1)))
-    assert gB is not None and gB.ready()
+    gB = claim_and_send(P, D, 1)
+    assert load_json(marker_path(D, 1))["seq"] == 1
     staging = [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)]
     got = import_like_hook(gB, mB, staging)
     assert all(np.array_equal(got[k], wantB[k]) for k in got)
     D.finish_import(gB, ok=True)
-    # second failure (seq 2), then a good export (seq 3): asking for the good one
-    # drains the failed head first, like a released / lease-expired head
+    # second failure (seq 2), then a good export (seq 3), both claimed: asking for
+    # the good one first drains the failed head, like a released claim
     layer0.data_sends = 0
-    hC = P.open_put(xfer(2), m)
-    export_like_hook(hC, m, rng)
-    P.finish_export(hC, "READY")
-    assert world.channel.pending_sends == 4 and P._exports[xfer(2)].seq == 2
-    layer0.armed = False
+    publish(P, 2, m, rng)
     _, wantD = publish(P, 3, mB, rng)
+    claim(D, 2)
+    claim(D, 3)
+    P.pump()
     assert world.channel.pending_sends == 8
+    assert load_json(marker_path(D, 2))["status"] == "FAILED"
+    assert load_json(marker_path(D, 3))["seq"] == 3
     gD = D.open_get(Desc(xfer(3)))
     assert gD is not None and gD.ready()
     assert world.channel.pending_sends == 4 and D.stats["drains"] == 8
@@ -1722,7 +2018,8 @@ def test_partial_send_failure_publishes_failed_and_consumer_drains(tmp_path):
     D.finish_import(gD, ok=True)
     P.pump()
     assert P.outstanding_exports() == 0 and P._kv_pool.free == 16
-    assert P.stats["exports_failed"] == 2 and P.stats["exports_ready"] == 2
+    assert P.stats["exports_failed"] == 2 and P.stats["exports_sent"] == 2
+    assert P.stats["exports_ready"] == 4
     P.shutdown()
     D.shutdown()
 
@@ -1730,43 +2027,26 @@ def test_partial_send_failure_publishes_failed_and_consumer_drains(tmp_path):
 def test_first_send_failure_consumes_no_seq(tmp_path):
     world = FakeWorld()
     layer0 = FailingSendLayer(world, 0, fail_at=1)
-    common = dict(
-        control_dir=str(tmp_path / "ctrl"),
-        mesh_device=object(),
-        janitor_period=0,
-        rec_sets=2,
-        rec_parts=2,
-        export_budget_bytes=16 * KV_NBYTES,
-        kv_parts=4,
-        max_model_len=8192,
-        socket_timeout_s=5.0,
-    )
-    P = FabricSocketTransport(
-        engine_id=P_ENGINE, role="producer", socket_layer=layer0, **common
-    )
-    D = FabricSocketTransport(
-        engine_id=D_ENGINE, role="consumer", socket_layer=world.layer(1), **common
-    )
-    assert not start_both(P, D)
+    P, D = _pair_with_layer0(tmp_path, layer0, world)
     layer0.armed = True
     m = manifest(kv_layers=1)
     rng = np.random.default_rng(4)
-    h = P.open_put(xfer(0), m)
-    export_like_hook(h, m, rng)
-    P.finish_export(h, "READY")
-    pub = seg_dirs(D, 0)[1]
-    assert read_status(os.path.join(pub, "header")) == FAILED
-    side = load_json(os.path.join(pub, SIDECAR_NAME))
-    assert side["seq"] is None and side["nitems"] == 0
-    # nothing parked: buffers back at once, no seq consumed, plain FAILED handle
+    publish(P, 0, m, rng)
+    claim(D, 0)
+    P.pump()
+    mk = load_json(marker_path(D, 0))
+    assert (mk["status"], mk["seq"], mk["nitems"]) == ("FAILED", None, 0)
+    # nothing parked: buffers back at once, no seq consumed
     assert world.channel.pending_sends == 0 and P._next_seq == 0
     assert P._kv_pool.free == 16 and P.outstanding_exports() == 0
-    g = D.open_get(Desc(xfer(0)))
-    assert g is not None and g.status == "FAILED" and not os.path.isdir(pub)
+    g = D.open_get(Desc(xfer(0)))  # definite FAILED, claim dropped, marker gone
+    assert g is not None and g.status == "FAILED" and "after 0 items" in g.reason
+    assert not any(os.path.isdir(d) for d in seg_dirs(D, 0))
+    assert not os.path.exists(marker_path(D, 0)) and len(D._rec_sets) == 2
     layer0.armed = False
     h2, want = publish(P, 1, m, rng)
-    assert load_json(os.path.join(seg_dirs(D, 1)[1], SIDECAR_NAME))["seq"] == 0
-    g2 = D.open_get(Desc(xfer(1)))
+    g2 = claim_and_send(P, D, 1)
+    assert load_json(marker_path(D, 1))["seq"] == 0
     got = import_like_hook(g2, m, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
     assert all(np.array_equal(got[k], want[k]) for k in got)
     D.finish_import(g2, ok=True)

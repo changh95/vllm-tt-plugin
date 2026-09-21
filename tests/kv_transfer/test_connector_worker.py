@@ -370,7 +370,9 @@ def test_writing_header_is_polled_until_ready():
     )
     assert wm == TTKVWorkerMeta(7)  # slot claimed -> count changed
     fin, inv, wm = step(w)
-    assert fin == (None, None) and wm is None and tr.count("open_get") == 2
+    # polled at step begin AND step end (the fabric claim's sends land during the
+    # forward): two open_get per step
+    assert fin == (None, None) and wm is None and tr.count("open_get") == 4
     tr.segments[rm.xfer.xfer_id] = "READY"
     fin, inv, wm = step(w)
     assert fin == (None, {"r1"}) and w.loads()["r1"].state == LoadState.KV_DONE
@@ -782,3 +784,54 @@ def test_pending_ready_job_with_an_expired_lease_fails_without_claiming():
     fin, inv, wm = step(w, meta(reqs_to_recv={"r2": rm2}))
     assert fin == (None, {"r2"}) and w.loads()["r2"].state == LoadState.KV_DONE
     assert tr.count("open_get", rm2.xfer.xfer_id) == 1
+
+
+def test_pending_ready_claim_that_becomes_ready_during_the_forward_imports_same_step():
+    """Fabric claim-gated sends: begin_step claims (open_get -> None), the
+    producer sends during our forward, end_step re-polls and imports in the SAME
+    step instead of the next one."""
+    w, tr, model, runner = make_worker()
+    rm = recv_meta("r1")
+    tr.publish(rm.xfer.xfer_id, "READY")
+    polls = {"n": 0}
+    orig_open_get = tr.open_get
+
+    def open_get(desc):
+        polls["n"] += 1
+        if polls["n"] == 1:
+            tr.calls.append(("open_get", desc.xfer_id))
+            return None  # claimed, the producer has not pumped yet
+        return orig_open_get(desc)
+
+    tr.open_get = open_get
+    fin, inv, wm = step(w, meta(reqs_to_recv={"r1": rm}))
+    assert polls["n"] == 2 and tr.count("open_get") == 2
+    assert w.loads()["r1"].state == LoadState.KV_DONE and fin == (None, {"r1"})
+    assert "import_kv_blocks" in model.names()
+
+
+def test_end_step_pumps_a_transport_that_has_pump_and_survives_its_errors():
+    """The claim-gated protocol's per-step clock lives in end_step: a transport
+    with pump() is pumped after the exports / imports of every step, a raising
+    pump is logged and never takes the step down, shm (no pump) is a no-op."""
+    w, tr, model, runner = make_worker(role="both")
+    log: list = []
+    tr.pump = lambda: log.append(("pump", len(tr.calls)))
+    step(w)
+    step(w)
+    assert [k for k, _ in log] == ["pump", "pump"]
+    rm = recv_meta("r1")
+    tr.publish(rm.xfer.xfer_id, "READY")
+    step(w, meta(reqs_to_recv={"r1": rm}))
+    # the pump ran AFTER this step's import (open_get / finish_import calls precede)
+    assert log[-1][1] >= tr.count("open_get") and w.loads()["r1"].state == (
+        LoadState.KV_DONE
+    )
+
+    def boom():
+        raise ValueError("pump broke")
+
+    tr.pump = boom
+    step(w)  # no raise
+    del tr.pump
+    step(w)  # shm shape: no pump attribute, no-op

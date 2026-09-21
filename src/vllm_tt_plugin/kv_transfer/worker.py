@@ -12,10 +12,18 @@ Two step hooks, both on the ENGINE thread (I5):
   (``join_req_ids``, I11). No K/V device writes here.
 * ``end_step(finished_req_ids=None)`` — step-END, called from
   ``_kv_connector_step_end`` after the forward returned (device idle): producer
-  exports; consumer K/V block imports (request-private, may land in any step),
-  then ``validate_gdn_parts`` and ``KV_DONE``. Jobs whose id finished this step
-  (the set ``begin_step`` saw, plus anything passed here; critic NIT-5) are
-  never imported: their blocks may already belong to another request.
+  exports; consumer re-polls its PENDING_READY jobs (a claim whose producer
+  sent during the forward imports in THIS step, not the next), then K/V block
+  imports (request-private, may land in any step), then ``validate_gdn_parts``
+  and ``KV_DONE``. Jobs whose id finished this step (the set ``begin_step``
+  saw, plus anything passed here; critic NIT-5) are never imported: their
+  blocks may already belong to another request. Last, ``transport.pump()``
+  when the transport has one (fabric: the claim-gated send protocol's clock --
+  the producer enqueues the sends of newly claimed exports and reclaims
+  finished ones, the consumer drains released claims at the channel head; no-op
+  for shm). The pump is the transport's per-step seam; the idle-engine seam is
+  the rank entry point's ticker (``launch.pd_fabric_rank.install_idle_ticker``),
+  which also runs ``pump()`` on the engine thread.
 
 LoadJob states: PENDING_SLOT -> PENDING_READY -> IMPORTING_KV -> KV_DONE
 (``finished_recving`` reported; job stays, holding the claimed GetHandle) ->
@@ -344,24 +352,31 @@ class TTKVWorker:
                 self._step_progress = True
                 logger.info("PD: %s claimed state slot %d", r, slot)
             if job.state == LoadState.PENDING_READY:
-                expiry = job.meta.xfer.expiry
-                if expiry is not None and time.time() > float(expiry):
-                    # The producer's janitor sweeps an unclaimed segment past
-                    # its lease; claiming it now would race that sweep (audit:
-                    # janitor-vs-claim). The lease was valid at the offer
-                    # (``_lease_ok``), it ran out while PENDING_SLOT: recompute.
-                    self._fail(r, job, "lease expired before the claim", handle=None)
-                    continue
-                h = self.transport.open_get(job.meta.xfer)
-                if h is None:
-                    continue  # still WRITING
-                status = getattr(h, "status", None)
-                if status != "READY":
-                    self._fail(r, job, f"segment header {status}", handle=None)
-                    continue
-                job.handle = h
-                job.state = LoadState.IMPORTING_KV
-                self._step_progress = True
+                self._poll_ready(r, job)
+
+    def _poll_ready(self, r: str, job: LoadJob) -> None:
+        """PENDING_READY -> IMPORTING_KV when the header is READY (shm) / the
+        claim-gated fabric xfer is sent and at the channel head; called at step
+        begin and again at step end (``_run_kv_imports``)."""
+        expiry = job.meta.xfer.expiry
+        if expiry is not None and time.time() > float(expiry):
+            # The producer's janitor sweeps an unclaimed segment past its lease;
+            # claiming it now would race that sweep (audit: janitor-vs-claim). The
+            # lease was valid at the offer (``_lease_ok``), it ran out while
+            # PENDING_SLOT: recompute. A fabric claim already made is dropped by
+            # release_remote (fence, then drain if the producer had sent).
+            self._fail(r, job, "lease expired before the claim", handle=None)
+            return
+        h = self.transport.open_get(job.meta.xfer)
+        if h is None:
+            return  # still WRITING, or (fabric) claimed and waiting for the sends
+        status = getattr(h, "status", None)
+        if status != "READY":
+            self._fail(r, job, f"segment header {status}", handle=None)
+            return
+        job.handle = h
+        job.state = LoadState.IMPORTING_KV
+        self._step_progress = True
 
     # ------------------------------------------------------------------ #
     # step-END
@@ -376,7 +391,21 @@ class TTKVWorker:
             self._run_exports()
         if self.is_consumer:
             self._run_kv_imports()
+        self._pump_transport()
         self._note_stall()
+
+    def _pump_transport(self) -> None:
+        """Fabric: the claim-gated send protocol's per-step clock (producer sends
+        for new claims + reclaims, consumer drains at the channel head). A
+        transport without ``pump`` (shm) is a no-op; a raising pump is logged,
+        never takes the step down (the next step pumps again)."""
+        pump = getattr(self.transport, "pump", None)
+        if pump is None:
+            return
+        try:
+            pump()
+        except Exception:
+            logger.exception("PD: transport.pump() raised")
 
     def _run_exports(self) -> None:
         for r, s in list(self._pending_saves.items()):
@@ -426,6 +455,13 @@ class TTKVWorker:
     def _run_kv_imports(self) -> None:
         budget: int | None = self.max_import_chunks_per_step or None
         progressed = False
+        # Re-poll the claims still waiting at step begin: over the fabric the
+        # producer enqueues the sends at ITS next pump after our claim, typically
+        # during our forward; polling again here lets the recvs go out in this
+        # step's import instead of the next step's (the pre-claim-gating latency).
+        for r, job in list(self._loads.items()):
+            if job.state == LoadState.PENDING_READY and r not in self._step_finished:
+                self._poll_ready(r, job)
         for r, job in list(self._loads.items()):
             if job.state != LoadState.IMPORTING_KV or r in self._step_finished:
                 # a finished id's blocks may already belong to another request:
