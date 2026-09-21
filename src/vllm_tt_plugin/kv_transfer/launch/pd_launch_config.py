@@ -74,13 +74,19 @@ KV_ROLE_OF_ROLE: dict[str, str] = {"prefill": "kv_producer", "decode": "kv_consu
 ROLE_OF_KV_ROLE: dict[str, str] = {v: k for k, v in KV_ROLE_OF_ROLE.items()}
 WORLD_SIZE = 2
 
-# chip pairs on the P300x2 box: inter-card Warp400 cable pairs only (PHASE3_NOTES 4).
+# chip pairs on the P300x2 box: inter-card Warp400 cable pairs only (PHASE3_NOTES 4);
+# ``p150x2`` = two p150a cards linked by ethernet (the container product's board), one
+# chip per card, so its (0, 1) is a cable pair, not a P300 on-package pair.
 PAIRS: dict[str, tuple[int, int]] = {
     "prod": (0, 3),
     "test": (1, 2),
     "chips03": (0, 3),
     "chips12": (1, 2),
+    "p150x2": (0, 1),
 }
+BOARDS: tuple[str, ...] = ("p300x2", "p150x2")
+BOARD_OF_PAIR: dict[str, str] = {p: "p300x2" for p in PAIRS}
+BOARD_OF_PAIR["p150x2"] = "p150x2"
 TEMPLATE_OF_PAIR: dict[str, str] = {
     "prod": "pd_rank_binding_chips03.yaml",
     "chips03": "pd_rank_binding_chips03.yaml",
@@ -211,6 +217,10 @@ class PairSettings:
     weights: str = ""  # default: {root}/weights_qwen38
     served_model_name: str = "Qwen/Qwen3.8-27B"
     pair: str = "prod"
+    # board the chip indices refer to: "p300x2" (dev box: (0,1)/(2,3) are on-package
+    # TRACE pairs and refused) or "p150x2" (one chip per card, any two chips are a
+    # cable pair); "" = the pair's board (BOARD_OF_PAIR)
+    board: str = ""
     p_chip: int = -1  # default from pair
     d_chip: int = -1
     p_port: int = 8100
@@ -275,6 +285,20 @@ class PairSettings:
     # QWEN36_PREFILL_BUCKET_TRACE as the model parses it ("1" = every bucket; a
     # comma list = those); sizes the KV-pool guard below
     bucket_trace_gate: str = "1"
+    # serve-argv knobs the container supervisor maps from the tool's ``vllm serve``
+    # line (run_pd_pair_fabric.sh fixes them at these values)
+    block_size: int = 64
+    max_num_batched_tokens: int = 0  # 0 = ctx
+    tool_call_parser: str = "qwen3_coder"
+    reasoning_parser: str = "qwen3"
+    enable_auto_tool_choice: int = 1
+    # per-rank converted-weights cache: "" = one shared TT_CACHE_PATH from the parent
+    # env (global_env); a root -> rank env_overrides TT_CACHE_PATH={root}/tp1-rank{N}
+    # (two ranks converting into one dir on a cold boot is an unvalidated race)
+    tensor_cache_root: str = ""
+    # explicit two-mesh MGD for the rank binding; "" = {root}/profiles/pd/... (the
+    # template's own path wins over both)
+    mgd_path: str = ""
 
     def __post_init__(self) -> None:
         if not self.tag:
@@ -294,6 +318,10 @@ class PairSettings:
             raise ValueError("P_ENGINE_ID and D_ENGINE_ID must differ")
         if self.pair not in PAIRS:
             raise ValueError(f"unknown PAIR {self.pair!r}; one of {sorted(PAIRS)}")
+        if not self.board:
+            self.board = BOARD_OF_PAIR[self.pair]
+        if self.board not in BOARDS:
+            raise ValueError(f"unknown BOARD {self.board!r}; one of {BOARDS}")
         pc, dc = PAIRS[self.pair]
         if self.p_chip < 0:
             self.p_chip = pc
@@ -301,10 +329,22 @@ class PairSettings:
             self.d_chip = dc
         if self.p_chip == self.d_chip:
             raise ValueError("prefill and decode chips must differ")
-        if {self.p_chip, self.d_chip} in ({0, 1}, {2, 3}):
+        if self.board == "p300x2" and {self.p_chip, self.d_chip} in ({0, 1}, {2, 3}):
             raise ValueError(
-                f"chips {self.p_chip},{self.d_chip} are an on-package TRACE pair, "
-                "not a cable pair; use (0,3) or (1,2) (PHASE3_NOTES 4)"
+                f"chips {self.p_chip},{self.d_chip} are an on-package TRACE pair on a "
+                "p300x2, not a cable pair; use (0,3) or (1,2) (PHASE3_NOTES 4)"
+            )
+        if self.p_chip < 0 or self.d_chip < 0:
+            raise ValueError("chip indices must be >= 0")
+        if self.block_size <= 0:
+            raise ValueError("block_size must be > 0")
+        if self.max_num_batched_tokens <= 0:
+            self.max_num_batched_tokens = self.ctx
+        if self.max_num_batched_tokens < self.ctx:
+            raise ValueError(
+                f"max_num_batched_tokens {self.max_num_batched_tokens} < ctx "
+                f"{self.ctx}: "
+                "the nodes prefill whole prompts (no chunked prefill)"
             )
         if not self.weights:
             self.weights = os.path.join(self.root, "weights_qwen38")
@@ -366,6 +406,7 @@ class PairSettings:
             weights=e.get("WEIGHTS", ""),
             served_model_name=e.get("SERVED_MODEL_NAME", cls.served_model_name),
             pair=e.get("PAIR", cls.pair),
+            board=e.get("BOARD", cls.board),
             p_chip=_env_int(e, "P_CHIP", -1),
             d_chip=_env_int(e, "D_CHIP", -1),
             p_port=_env_int(e, "P_PORT", cls.p_port),
@@ -439,6 +480,12 @@ class PairSettings:
 
     def metal_cache(self, role: str) -> str:
         return os.path.join(self.metal_cache_root, f"metal_rank{RANK_OF_ROLE[role]}")
+
+    def tensor_cache(self, role: str) -> str | None:
+        """Per-rank ``TT_CACHE_PATH`` (``None`` = shared, from the parent env)."""
+        if not self.tensor_cache_root:
+            return None
+        return os.path.join(self.tensor_cache_root, f"tp1-rank{RANK_OF_ROLE[role]}")
 
     @property
     def fabric_enabled(self) -> bool:
@@ -574,20 +621,18 @@ def serve_argv(s: PairSettings, role: str) -> list[str]:
         "--port",
         str(s.port(role)),
         "--block-size",
-        "64",
+        str(s.block_size),
         "--max-model-len",
         str(s.ctx),
         "--max-num-batched-tokens",
-        str(s.ctx),
+        str(s.max_num_batched_tokens),
         "--max-num-seqs",
         str(s.max_num_seqs(role)),
         "--seed",
         str(s.seed),
-        "--enable-auto-tool-choice",
-        "--tool-call-parser",
-        "qwen3_coder",
-        "--reasoning-parser",
-        "qwen3",
+        *(["--enable-auto-tool-choice"] if s.enable_auto_tool_choice else []),
+        *(["--tool-call-parser", s.tool_call_parser] if s.tool_call_parser else []),
+        *(["--reasoning-parser", s.reasoning_parser] if s.reasoning_parser else []),
         "--max-log-len",
         "32",
         # remote headless engine: the front-end binds the handshake ROUTER on
@@ -939,6 +984,9 @@ def rank_env_overrides(s: PairSettings, role: str) -> dict[str, str]:
     }
     if role == "decode":
         ov["TT_PD_ALLOW_FUSED_CONV"] = str(s.allow_fused_conv)
+    tc = s.tensor_cache(role)
+    if tc:
+        ov["TT_CACHE_PATH"] = tc  # env_overrides win over global_env in tt-run
     return ov
 
 
@@ -1007,7 +1055,7 @@ def render_rank_binding(
     g = {k: str(v) for k, v in g.items() if k not in GLOBAL_ENV_BLOCKLIST}
     g.update(collect_global_env(env, s, node_args_path, extra_global_env))
     out["global_env"] = g
-    mgd = template.get("mesh_graph_desc_path")
+    mgd = template.get("mesh_graph_desc_path") or s.mgd_path
     if not mgd:
         mgd = os.path.join(
             s.root, "profiles", "pd", "pd_two_p150_mesh_graph_descriptor.textproto"
@@ -1243,6 +1291,8 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "BOARDS",
+    "BOARD_OF_PAIR",
     "GLOBAL_ENV_BLOCKLIST",
     "GLOBAL_ENV_REQUIRED",
     "KV_ROLE_OF_ROLE",

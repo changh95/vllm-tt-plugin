@@ -1,0 +1,23 @@
+# Two single-die Blackhole meshes (mesh 0 = prefill node, mesh 1 = decode node) joined by fabric.
+# Packaged copy for the container supervisor (pd_container): the topology mapper binds the two mesh ids to whichever
+# two chips the rank binding makes visible, so the same file serves a p150x2 (chips 0,1) and the dev P300x2 cable pairs.
+mesh_descriptors {
+  name: "P150"
+  arch: BLACKHOLE
+  device_topology { dims: [ 1, 1 ] }
+  host_topology   { dims: [ 1, 1 ] }
+  channels { count: 2 policy: RELAXED }   # was 1 (p150 stock): a 1x1 mesh then has 1 port per direction and the 2-channel cable cannot be placed -> "Found 0 intermesh connections"
+}
+graph_descriptors {
+  name: "G0"
+  type: "FABRIC"
+  instances { mesh { mesh_descriptor: "P150" mesh_id: 0 } }
+  instances { mesh { mesh_descriptor: "P150" mesh_id: 1 } }
+  connections {
+    nodes { mesh { mesh_descriptor: "P150" mesh_id: 0 } }
+    nodes { mesh { mesh_descriptor: "P150" mesh_id: 1 } }
+    channels { count: 2 policy: RELAXED }
+    directional: false
+  }
+}
+top_level_instance { graph { graph_descriptor: "G0" graph_id: 0 } }

@@ -1061,17 +1061,31 @@ async def _close_upstream(reader: asyncio.Future, resp: httpx.Response) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def create_app(config: PDProxyConfig, proxy: PDProxy | None = None) -> FastAPI:
+def create_app(
+    config: PDProxyConfig,
+    proxy: PDProxy | None = None,
+    *,
+    startup: Callable[[], Awaitable[None]] | None = None,
+    shutdown: Callable[[], Awaitable[None]] | None = None,
+) -> FastAPI:
+    """The FastAPI app.  ``startup`` runs inside the lifespan BEFORE the app starts
+    serving (uvicorn prints "Application startup complete." only after it returns;
+    an exception fails the startup), ``shutdown`` runs after the proxy closed --
+    the container supervisor brings the P/D pair up and down through these."""
     owns_proxy = proxy is None
     proxy = proxy or PDProxy(config)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):  # pragma: no cover - process teardown
+        if startup is not None:
+            await startup()
         try:
             yield
         finally:
             if owns_proxy:
                 await proxy.aclose()
+            if shutdown is not None:
+                await shutdown()
 
     app = FastAPI(title="TT P/D disaggregation proxy", lifespan=_lifespan)
     app.state.proxy = proxy

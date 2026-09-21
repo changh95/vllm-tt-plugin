@@ -35,6 +35,9 @@ dev = ["pre-commit", "ruff==0.14.0", "pytest>=8,<9"]
 
 [project.entry-points."vllm.general_plugins"]
 tt_model_registry = "vllm_tt_plugin.entrypoints:register"
+# TT_SERVE_LAUNCHER=pd_container turns the tool's fixed `vllm serve ...` line into the
+# PD pair supervisor (kv_transfer/launch/dispatch.py); a no-op without the variable.
+tt_serve_launcher = "vllm_tt_plugin.kv_transfer.launch.dispatch:maybe_exec"
 
 [project.entry-points."vllm.platform_plugins"]
 tt = "vllm_tt_plugin.entrypoints:platform_plugin"
@@ -42,6 +45,10 @@ tt = "vllm_tt_plugin.entrypoints:platform_plugin"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["vllm_tt_plugin*"]
+
+[tool.setuptools.package-data]
+# the PD pair's two-mesh MGD and rank-binding template ship with the wheel
+"vllm_tt_plugin.kv_transfer.launch" = ["data/*.textproto", "data/*.yaml"]
 
 # Linting aligned to upstream vLLM rules
 [tool.ruff.lint]

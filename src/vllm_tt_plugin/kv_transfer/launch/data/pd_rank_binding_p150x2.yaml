@@ -1,0 +1,20 @@
+# PD pair rank binding TEMPLATE for the container product (p150x2: two p150a cards, one chip each, ethernet-linked).
+# Rank 0 = prefill node (MeshSocket sender) on chip 0, rank 1 = decode node (receiver) on chip 1.  pd_container renders
+# the final binding from this template: per-rank env_overrides (chips, kernel caches, roles, RPC ports, pools) are
+# re-derived from the container settings, global_env gets every VLLM_/HF_/QWEN36_/TT_PD_ variable of the container env
+# plus PD_ARGS_JSON, and mesh_graph_desc_path is the packaged two-mesh MGD (the empty value below = "fill in").
+rank_bindings:
+  - rank: 0
+    mesh_id: 0
+    env_overrides:
+      PD_ROLE: "prefill"
+  - rank: 1
+    mesh_id: 1
+    env_overrides:
+      PD_ROLE: "decode"
+global_env:
+  MESH_DEVICE: "P150"                          # (1,1) mesh per rank
+  ARCH_NAME: "blackhole"
+  TT_METAL_OPERATION_TIMEOUT_SECONDS: "600"    # ControlPlane cross-rank collectives window at mesh open (default 120 s)
+  PYTHONUNBUFFERED: "1"
+mesh_graph_desc_path: ""

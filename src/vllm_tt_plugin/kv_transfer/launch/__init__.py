@@ -9,6 +9,11 @@
 * ``pd_fabric_rank`` -- the program tt-run launches on every MPI rank.  It imports
   vllm and ttnn (lazily, inside ``main``) and runs a headless ``EngineCoreProc``
   in-process: rank 0 = prefill node (mesh 0), rank 1 = decode node (mesh 1).
+* ``dispatch`` / ``pd_container`` -- the container entry point: the
+  ``vllm.general_plugins`` hook ``tt_serve_launcher`` execs ``pd_container`` when
+  ``TT_SERVE_LAUNCHER=pd_container``, and the supervisor turns the tool's one
+  ``vllm serve`` line into front-ends + tt-run ranks + the in-process proxy
+  (``data/`` holds the packaged two-mesh MGD and rank-binding template).
 
 Nothing here is imported by the API server; the connector module stays ttnn-free.
 """
