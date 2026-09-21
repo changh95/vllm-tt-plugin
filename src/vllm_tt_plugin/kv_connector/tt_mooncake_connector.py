@@ -744,7 +744,15 @@ class _Staged:
 
 @dataclass
 class _Fetched:
-    """Consumer: one pulled (or mapped) payload waiting for the main thread."""
+    """Consumer: one pulled (or mapped) payload waiting for the main thread.
+
+    The pull worker also unpacks the payload and runs the GDN import's host-side
+    preparation (``pd_transfer.prepare_gdn_import``: the packed conv-history rows for
+    both slot parities), so the main thread -- inside a decode step -- only uploads and
+    replays. ``kv``/``rec``/``gdn`` are views into ``buf`` (plus the prepared history);
+    ``gdn`` is a ``PreparedGdnImport`` when the model's host packer was available, else
+    the raw device-major taps. ``rec is None`` means the worker did not unpack (older
+    producers of this record, tests): the drain then does it on the main thread."""
 
     rr: RecvReq
     buf: torch.Tensor  # exactly the payload bytes (a view for a mapped segment)
@@ -753,6 +761,10 @@ class _Fetched:
     via: str  # "shm" | "pull"
     t_wait: float
     t_pull: float
+    kv: Any = None
+    rec: Any = None
+    gdn: Any = None
+    t_prep: float = 0.0
 
 
 class _PullAborted(Exception):
@@ -903,6 +915,9 @@ class _WorkerSide:
                 self.model,
                 max_bucket=int(os.environ.get("QWEN36_PD_IMPORT_WARMUP_MAX", "2048")),
             )
+        # the GDN import's host-side packer (gather index, layout check): built here on
+        # the main thread so the pull workers can run prepare_gdn_import
+        pd_transfer.get_gdn_host_packer(self.model)
         if (
             os.environ.get("QWEN36_PD_GDN_IMPORT", "trace") != "trace"
             or os.environ.get("QWEN36_PD_GDN_PRECAPTURE", "1") != "1"
@@ -1221,10 +1236,23 @@ class _WorkerSide:
         with self._lock:
             return req_id in self._aborted
 
+    def _unpack_and_prepare(self, buf: torch.Tensor, header: dict[str, Any]):
+        """``(kv, rec, gdn)`` for a fetched payload: ``unpack_payload`` (views) plus the
+        GDN import's host preparation through the model's ``pd_gdn_host_packer`` (built
+        on the main thread in ``post_warmup``; torch ops only, so this runs on the pull
+        worker). Without a packer ``gdn`` is the raw taps and the importer prepares on
+        the main thread as before."""
+        kv, rec, taps = unpack_payload(buf, header)
+        packer = getattr(self.model, "pd_gdn_host_packer", None)
+        gdn = packer.prepare(rec, taps) if packer is not None else taps
+        return kv, rec, gdn
+
     def _pull(self, rr: RecvReq):
         """Background: GET the staging descriptor, then either map the producer's shm
         segment (same host: no copy, DONE once the runner has imported) or pull the
-        bytes into a registered local buffer (DONE right away)."""
+        bytes into a registered local buffer (DONE right away). Then unpack + prepare
+        the GDN import on this thread (``_unpack_and_prepare``); a failure there
+        releases the payload (DONE / pool) and reports the pull as failed."""
         try:
             t0 = time.perf_counter()
             deadline = t0 + _GET_TIMEOUT_S
@@ -1272,8 +1300,28 @@ class _WorkerSide:
                 buf = pooled[:nbytes]
                 release, via = (lambda b=pooled: self.pool.release(b)), "pull"
             t2 = time.perf_counter()
+            kv = rec = gdn = None
+            if not self._is_aborted(rr.req_id):
+                try:
+                    kv, rec, gdn = self._unpack_and_prepare(buf, rep["header"])
+                except BaseException:
+                    release()
+                    raise
+            t3 = time.perf_counter()
             self._fetched.put(
-                _Fetched(rr, buf, rep["header"], release, via, t1 - t0, t2 - t1)
+                _Fetched(
+                    rr,
+                    buf,
+                    rep["header"],
+                    release,
+                    via,
+                    t1 - t0,
+                    t2 - t1,
+                    kv,
+                    rec,
+                    gdn,
+                    t3 - t2,
+                )
             )
         except _PullAborted as e:
             # the producer may stage this transfer later (the request was still queued
@@ -1297,8 +1345,8 @@ class _WorkerSide:
             self._recv_done.add(req_id)
 
     def _drain_fetched(self):
-        """Main thread: write pulled KV into the paged cache, park the GDN snapshot,
-        report finished_recving."""
+        """Main thread: write pulled KV into the paged cache, park the (host-prepared)
+        GDN snapshot for the runner, report finished_recving."""
         from models.demos.blackhole.qwen36.tt import pd_transfer
 
         while True:
@@ -1333,13 +1381,17 @@ class _WorkerSide:
                 )
                 f.release()
             else:
-                kv, rec, conv = unpack_payload(buf, header)
+                if f.rec is None:  # not unpacked on the pull thread
+                    kv, rec, gdn = self._unpack_and_prepare(buf, header)
+                else:
+                    kv, rec, gdn = f.kv, f.rec, f.gdn
                 pd_transfer.import_kv_blocks(self.model, rr.block_ids[:n_blocks], kv)
                 # keep the snapshot alive (views into buf: the pooled receive buffer
                 # or the producer's mapped segment) until the runner writes the decode
                 # slot; the runner calls the release when done (for a mapped segment
-                # that is what sends DONE to the producer)
-                self.runner.pd_pending_gdn[rr.req_id] = (rec, conv, buf, f.release)
+                # that is what sends DONE to the producer). ``gdn`` goes in the conv
+                # position: import_gdn_slot / verify_gdn_slot take the prepared form.
+                self.runner.pd_pending_gdn[rr.req_id] = (rec, gdn, buf, f.release)
             t1 = time.perf_counter()
             self._finish_recv(rr.req_id)
             self.stats["pulled"] += 1
@@ -1349,12 +1401,13 @@ class _WorkerSide:
             if f.via == "shm":
                 logger.info(
                     "[pd] pulled %s: %d tokens, %.1f MiB via shm (wait %.1f ms, map "
-                    "%.1f ms, KV import %.1f ms) digest %s blocks %s",
+                    "%.1f ms, prep %.1f ms, KV import %.1f ms) digest %s blocks %s",
                     rr.req_id,
                     header["num_tokens"],
                     header["nbytes"] / 2**20,
                     1e3 * f.t_wait,
                     1e3 * f.t_pull,
+                    1e3 * f.t_prep,
                     1e3 * (t1 - t0),
                     payload_digest(buf, header["nbytes"]),
                     rr.block_ids[:n_blocks],
@@ -1362,13 +1415,14 @@ class _WorkerSide:
             else:
                 logger.info(
                     "[pd] pulled %s: %d tokens, %.1f MiB (wait %.1f ms, pull %.1f ms = "
-                    "%.2f GB/s, KV import %.1f ms) digest %s blocks %s",
+                    "%.2f GB/s, prep %.1f ms, KV import %.1f ms) digest %s blocks %s",
                     rr.req_id,
                     header["num_tokens"],
                     header["nbytes"] / 2**20,
                     1e3 * f.t_wait,
                     1e3 * f.t_pull,
                     header["nbytes"] / max(f.t_pull, 1e-9) / 2**30,
+                    1e3 * f.t_prep,
                     1e3 * (t1 - t0),
                     payload_digest(buf, header["nbytes"]),
                     rr.block_ids[:n_blocks],
