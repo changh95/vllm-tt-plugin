@@ -420,8 +420,8 @@ class RecvReq:
 class TTMooncakeConnectorMetadata(KVConnectorMetadata):
     stage: list[StageReq] = field(default_factory=list)
     recv: list[RecvReq] = field(default_factory=list)
-    # consumer requests aborted before their pull started: tell the producer to drop the
-    # staging
+    # consumer requests aborted before their pull was ever scheduled: tell the producer
+    # to drop the staging (or, if it has not staged yet, to drop it on arrival)
     cancel: list[tuple[str, int, str]] = field(
         default_factory=list
     )  # (host, port, transfer_id)
@@ -779,10 +779,17 @@ class _WorkerSide:
         self._recv_done: set[str] = set()
         # producer
         self._staged: dict[str, _Staged] = {}
+        # CANCELled transfer_ids that were not staged yet (the consumer aborted while
+        # its GET was parked, or before it was scheduled): stage_after_step frees the
+        # staging on arrival instead of holding it until the _GET_TIMEOUT_S GC
+        self._cancelled: dict[str, float] = {}  # tid -> time.time() of the CANCEL
         self._zmq_thread: threading.Thread | None = None
         self._stop = threading.Event()
-        # consumer
+        # consumer: pulls park on the producer for its whole queue time, so DONE/CANCEL
+        # (which free the producer's staging) go through their own single worker and
+        # never queue behind them
         self._pool: ThreadPoolExecutor | None = None
+        self._ctrl_pool: ThreadPoolExecutor | None = None
         self._inflight: dict[str, RecvReq] = {}
         self._aborted: set[str] = set()  # in-flight pulls whose request finished
         self._fetched: queue.Queue[_Fetched] = queue.Queue()
@@ -862,6 +869,9 @@ class _WorkerSide:
             self._pool = ThreadPoolExecutor(
                 max_workers=4, thread_name_prefix="tt-pd-pull"
             )
+            self._ctrl_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="tt-pd-ctrl"
+            )
             runner.pd_pending_gdn = {}
             logger.info(
                 "TTMooncakeConnector consumer: mooncake %s:%d, same-host shm %s",
@@ -912,6 +922,8 @@ class _WorkerSide:
         self._stop.set()
         if self._pool is not None:
             self._pool.shutdown(wait=False)
+        if self._ctrl_pool is not None:
+            self._ctrl_pool.shutdown(wait=False)
         if self.pool is not None:
             self.pool.close()
 
@@ -976,7 +988,7 @@ class _WorkerSide:
                     else:
                         self._router_send(sock, ident, rep)
                 elif op in ("DONE", "CANCEL"):
-                    self._release(tid)
+                    self._release(tid, remember_cancel=op == "CANCEL")
                     for w_ident, _ in waiters.pop(tid, []):
                         self._router_send(sock, w_ident, {"status": "cancelled"})
                     self._router_send(sock, ident, {"status": "ok"})
@@ -1003,11 +1015,18 @@ class _WorkerSide:
         sock.close(0)
         ctx.term()
 
-    def _release(self, tid: str):
+    def _release(self, tid: str, remember_cancel: bool = False) -> bool:
+        """Free ``tid``'s staging. With ``remember_cancel`` a transfer that is not
+        staged yet is filed in ``_cancelled`` (same lock as the filing in
+        stage_after_step, so a CANCEL racing the stage frees the buffer either way).
+        Returns whether a staging was released."""
         with self._lock:
             st = self._staged.pop(tid, None)
+            if st is None and remember_cancel:
+                self._cancelled[tid] = time.time()
         if st is not None:
             self.pool.release(st.buf)
+        return st is not None
 
     def stage_after_step(self, meta: TTMooncakeConnectorMetadata):
         if not self.c._is_producer or not meta.stage:
@@ -1034,6 +1053,24 @@ class _WorkerSide:
             # the model reads snapshots into pooled host buffers; give them back once
             # the bytes are in the staging buffer (or the request cannot be staged)
             release_snapshot = getattr(self.model, "pd_gdn_snapshot_release", None)
+            tid = sr.transfer_id or sr.req_id
+            with self._lock:
+                cancelled = self._cancelled.pop(tid, None) is not None
+            if cancelled:
+                # the consumer gave up (client hang-up) while this instance still had
+                # the request queued: nothing to stage; the scheduler frees the blocks
+                # from finished_sending as usual
+                logger.info(
+                    "[pd] %s: transfer %s cancelled before it was staged; dropping",
+                    sr.req_id,
+                    tid,
+                )
+                if release_snapshot is not None:
+                    release_snapshot(rec_snap, conv_snap)
+                with self._lock:
+                    self._finished_sending.add(sr.req_id)
+                    self._stage_done.add(sr.req_id)
+                continue
             n_blocks = max(1, math.ceil(sr.num_tokens / self.c._block_size))
             block_ids = sr.block_ids[:n_blocks]
             if len(block_ids) < n_blocks:
@@ -1055,14 +1092,25 @@ class _WorkerSide:
             if release_snapshot is not None:
                 release_snapshot(rec_snap, conv_snap)
             addr, nbytes = buf.data_ptr(), int(header["nbytes"])
-            tid = sr.transfer_id or sr.req_id
             shm_name = self.pool.shm_name(buf)
             with self._lock:
-                self._staged[tid] = _Staged(
-                    buf, addr, nbytes, header, time.time(), shm_name
-                )
+                # a CANCEL that arrived while the bytes were being packed: free the
+                # buffer now instead of filing it
+                cancelled = self._cancelled.pop(tid, None) is not None
+                if not cancelled:
+                    self._staged[tid] = _Staged(
+                        buf, addr, nbytes, header, time.time(), shm_name
+                    )
                 self._finished_sending.add(sr.req_id)
                 self._stage_done.add(sr.req_id)
+            if cancelled:
+                self.pool.release(buf)
+                logger.info(
+                    "[pd] %s: transfer %s cancelled while it was being staged; dropped",
+                    sr.req_id,
+                    tid,
+                )
+                continue
             t2 = time.perf_counter()
             self.stats["staged"] += 1
             self.stats["staged_bytes"] += header["nbytes"]
@@ -1080,7 +1128,8 @@ class _WorkerSide:
                 tid,
                 f"shm {shm_name}" if shm_name else "mooncake",
             )
-        # garbage-collect stagings nobody pulled (decoder died / aborted upstream)
+        # garbage-collect stagings nobody pulled (decoder died / aborted upstream) and
+        # cancels whose staging never came (the request failed on this instance)
         now = time.time()
         with self._lock:
             stale = [
@@ -1088,6 +1137,10 @@ class _WorkerSide:
                 for tid, st in self._staged.items()
                 if now - st.t_staged > _GET_TIMEOUT_S
             ]
+            for tid in [
+                t for t, at in self._cancelled.items() if now - at > _GET_TIMEOUT_S
+            ]:
+                del self._cancelled[tid]
         for tid in stale:
             logger.warning(
                 "[pd] dropping staged %s: never pulled within %.0f s",
@@ -1105,12 +1158,7 @@ class _WorkerSide:
                 self._inflight[rr.req_id] = rr
                 self._pool.submit(self._pull, rr)
             for host, port, tid in meta.cancel:
-                self._pool.submit(
-                    self._side_channel_call,
-                    host,
-                    port,
-                    {"op": "CANCEL", "transfer_id": tid},
-                )
+                self._send_control(host, port, {"op": "CANCEL", "transfer_id": tid})
             self._drain_fetched()
 
     @staticmethod
@@ -1155,13 +1203,19 @@ class _WorkerSide:
         )
         return seg
 
-    def _send_done_later(self, rr: RecvReq) -> None:
-        """DONE lets the producer recycle the staging; off the main thread."""
-        msg = {"op": "DONE", "transfer_id": rr.transfer_id}
+    def _send_control(self, host: str, port: int, msg: dict[str, Any]) -> None:
+        """DONE/CANCEL (they free the producer's staging), off the main thread and never
+        behind the pull workers: those park on the producer for its whole queue time,
+        so a DONE queued after them would hold one staging per queued request."""
         with contextlib.suppress(RuntimeError):  # executor shut down
-            self._pool.submit(
-                self._side_channel_call, rr.remote_host, rr.remote_port, msg
-            )
+            self._ctrl_pool.submit(self._side_channel_call, host, port, msg)
+
+    def _send_done_later(self, rr: RecvReq) -> None:
+        self._send_control(
+            rr.remote_host,
+            rr.remote_port,
+            {"op": "DONE", "transfer_id": rr.transfer_id},
+        )
 
     def _is_aborted(self, req_id: str) -> bool:
         with self._lock:
@@ -1222,6 +1276,14 @@ class _WorkerSide:
                 _Fetched(rr, buf, rep["header"], release, via, t1 - t0, t2 - t1)
             )
         except _PullAborted as e:
+            # the producer may stage this transfer later (the request was still queued
+            # there): CANCEL now, so it frees the buffer on arrival instead of after
+            # the _GET_TIMEOUT_S GC; a payload already fetched is DONE'd by the drain
+            self._send_control(
+                rr.remote_host,
+                rr.remote_port,
+                {"op": "CANCEL", "transfer_id": rr.transfer_id},
+            )
             self._failed.put((rr, e))
         except BaseException as e:  # noqa: BLE001
             logger.exception("[pd] pull failed for %s", rr.req_id)

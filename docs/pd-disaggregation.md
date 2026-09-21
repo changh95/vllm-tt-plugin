@@ -29,6 +29,11 @@ token from the transferred state, so its first step is a decode step, never a pr
 KV + state into one contiguous host buffer registered with Mooncake, and serves a ZMQ side channel
 (`GET`/`DONE`/`CANCEL`; a ROUTER socket, so a `GET` for a transfer that is not staged yet is
 parked, up to 4 s, and answered the moment the producer stages it while other clients are served).
+A `CANCEL` for a transfer that is not staged yet is remembered (up to the 600 s GC) and the
+staging is freed the moment it arrives, so a consumer abort during the producer's queue time holds
+nothing. The consumer sends `DONE`/`CANCEL` from a dedicated thread: its pull workers park on the
+producer for its whole queue time, and a `DONE` queued behind them would hold one 256 MiB staging
+per queued request.
 The consumer writes the KV into its paged cache (`paged_fill_cache`) and parks the state until the
 request is given a decode slot. How the bytes get there depends on where the two run:
 
@@ -100,9 +105,10 @@ both at once:
    the payload and lets the runner prefill locally. Its `GET` parks on the side channel until the
    producer stages.
 4. Await the producer. On a non-200 (or missing `kv_transfer_params`), cancel/close the consumer
-   request: the consumer aborts it (its connector stops the in-flight pull, reports it so the
-   scheduler frees the blocks it held back, and sends `CANCEL` if the pull never started) and
-   returns the producer's error to the client. If the producer did not echo the `transfer_id`
+   request: the consumer aborts it (its connector stops waiting on the side channel, reports the
+   request so the scheduler frees the blocks it held back, and sends `CANCEL` -- both when the
+   request finished before it was scheduled and when its `GET` was still parked; a payload it
+   already fetched is dropped and `DONE`'d) and return the producer's error to the client. If the producer did not echo the `transfer_id`
    (an older connector), abandon the consumer request the same way and run the serial round trip
    with the producer's parameters.
 5. Stream the consumer's response.

@@ -7,7 +7,8 @@
 * the ROUTER side channel that parks a GET until the transfer is staged;
 * the proxy-chosen ``transfer_id`` (echoed by the producer) and the consumer-derived
   ``num_tokens`` that let a proxy post to both instances at once;
-* aborts of in-flight pulls.
+* aborts of in-flight pulls, including the CANCEL the producer remembers for a transfer
+  it has not staged yet, and DONE/CANCEL never queueing behind parked pulls.
 
 No Mooncake engine and no device: the engine is a stub whose ``transfer_sync_read``
 is a same-process memcpy, and the model import is a recorded stub module.
@@ -33,6 +34,7 @@ from vllm_tt_plugin.kv_connector import tt_mooncake_connector as mc
 from vllm_tt_plugin.kv_connector.tt_mooncake_connector import (
     RecvReq,
     StageReq,
+    TTMooncakeConnectorMetadata,
     _HostBufferPool,
     _SchedulerSide,
     _Staged,
@@ -130,10 +132,12 @@ def consumer(small_pool):
     w.engine = FakeEngine()
     w.pool = _HostBufferPool(w.engine, w._engine_lock, "receive")
     w._pool = ThreadPoolExecutor(max_workers=1)
+    w._ctrl_pool = ThreadPoolExecutor(max_workers=1)
     w.runner = SimpleNamespace(pd_pending_gdn={})
     w.model = object()
     yield w
     w._pool.shutdown(wait=True)
+    w._ctrl_pool.shutdown(wait=True)
 
 
 @pytest.fixture
@@ -144,6 +148,7 @@ def fake_pd_transfer(monkeypatch):
     mod.import_kv_blocks = lambda model, block_ids, kv: calls.append(
         (list(block_ids), kv)
     )
+    mod.export_kv_blocks = lambda model, block_ids: _payload()[0]
     parent = None
     for i, name in enumerate(["models", "demos", "blackhole", "qwen36", "tt"]):
         full = ".".join(["models", "demos", "blackhole", "qwen36", "tt"][: i + 1])
@@ -365,10 +370,11 @@ def test_pull_maps_same_host_segment_and_defers_done(consumer, monkeypatch):
         assert _inside(f.buf, seg) and f.buf.numel() == header["nbytes"]
         _, rec2, _ = unpack_payload(f.buf, header)
         assert torch.equal(rec2, rec)
-        # DONE only when the consumer releases the mapping
+        # DONE only when the consumer releases the mapping (through the control
+        # executor, never the pull workers)
         assert [m["op"] for m in sent] == ["GET"]
         f.release()
-        w._pool.shutdown(wait=True)
+        w._ctrl_pool.shutdown(wait=True)
         assert [m["op"] for m in sent] == ["GET", "DONE"]
         # a second request on the same segment reuses the mapping
         w._pull(_rr("r2"))
@@ -464,7 +470,11 @@ def test_finished_request_aborts_its_inflight_pull(
     # the request finishes (client hang-up) while the pull polls the producer
     threading.Timer(0.05, lambda: w.take_finished({rr.req_id})).start()
     w._pull(rr)
-    assert w._fetched.empty() and calls and calls[-1]["op"] == "GET"
+    w._ctrl_pool.shutdown(wait=True)
+    assert w._fetched.empty() and calls and calls[0]["op"] == "GET"
+    # the producer is told (it may still stage the transfer later)
+    assert [m["op"] for m in calls if m["op"] != "GET"] == ["CANCEL"]
+    assert calls[-1] == {"op": "CANCEL", "transfer_id": rr.transfer_id}
     w._drain_fetched()
     assert fake_pd_transfer == []
     assert rr.req_id not in w._inflight and rr.req_id not in w._aborted
@@ -493,6 +503,155 @@ def test_parked_import_of_a_finished_request_is_released(consumer, fake_pd_trans
     # aborted after the import was parked but before it got a decode slot
     w.take_finished({rr.req_id})
     assert rr.req_id not in w.runner.pd_pending_gdn and released == [1]
+
+
+# ---- DONE/CANCEL never queue behind parked pulls; CANCEL before stage ----------------
+
+
+def _stage_on(producer, tid, num_tokens=7):
+    kv, rec, taps = _payload()
+    buf = producer.pool.acquire(payload_nbytes(kv, rec, taps))
+    buf, header = pack_payload(kv, rec, taps, num_tokens, 2, out=buf)
+    with producer._lock:
+        producer._staged[tid] = _Staged(
+            buf,
+            buf.data_ptr(),
+            header["nbytes"],
+            header,
+            time.time(),
+            producer.pool.shm_name(buf),
+        )
+    return buf
+
+
+def _wait_until(pred, timeout=5.0):
+    t0 = time.perf_counter()
+    while not pred():
+        if time.perf_counter() - t0 > timeout:
+            return False
+        time.sleep(0.002)
+    return True
+
+
+def _rr_on(producer, req_id, tid, num_tokens=7):
+    return RecvReq(req_id, [3, 4], "127.0.0.1", producer.c._side_port, tid, num_tokens)
+
+
+@needs_shm
+def test_release_done_reaches_producer_while_every_pull_worker_is_parked(
+    producer, consumer, monkeypatch
+):
+    """A release issued while the (single) pull worker is parked on the producer for a
+    not-yet-staged transfer frees the producer's staging promptly: DONE goes through
+    the control executor, not the pull FIFO."""
+    monkeypatch.setattr(mc, "_GET_WAIT_S", 3.0)
+    p, w = producer, consumer
+    _stage_on(p, "tid-a")
+    w._pull(_rr_on(p, "ra", "tid-a"))  # inline: fetched via shm, DONE deferred
+    f = w._fetched.get_nowait()
+    assert f.via == "shm" and p.pool._free == [] and "tid-a" in p._staged
+    # the only pull worker parks on the producer (tid-b is not staged)
+    rr_b = _rr_on(p, "rb", "tid-b")
+    w._inflight[rr_b.req_id] = rr_b
+    fut = w._pool.submit(w._pull, rr_b)
+    time.sleep(0.1)
+    assert not fut.done()
+    t0 = time.perf_counter()
+    f.release()
+    assert _wait_until(lambda: "tid-a" not in p._staged, timeout=1.0)
+    assert time.perf_counter() - t0 < 1.0 and len(p.pool._free) == 1
+    assert not fut.done()  # the pull is still parked; DONE did not wait for it
+    # let the parked pull finish: staging tid-b answers its GET
+    _stage_on(p, "tid-b")
+    fut.result(timeout=5)
+    assert w._fetched.get(timeout=1).via == "shm"
+
+
+def test_cancel_before_stage_is_remembered_and_the_stage_is_dropped(
+    producer, fake_pd_transfer
+):
+    p = producer
+    kv, rec, taps = _payload()
+    released = []
+    p.runner = SimpleNamespace(_req_state_slot={"r": 0})
+    p.model = SimpleNamespace(
+        pd_gdn_capture={0: (rec, taps)},
+        pd_gdn_snapshot_release=lambda r, c: released.append(1),
+    )
+    rep = _WorkerSide._side_channel_call(
+        "127.0.0.1", p.c._side_port, {"op": "CANCEL", "transfer_id": "tid-c"}
+    )
+    assert rep == {"status": "ok"} and "tid-c" in p._cancelled
+    meta = TTMooncakeConnectorMetadata(stage=[StageReq("r", [0, 1], 7, "tid-c")])
+    p.stage_after_step(meta)
+    # nothing staged, no buffer acquired, snapshot given back, scheduler still told
+    assert "tid-c" not in p._staged and p._cancelled == {}
+    assert p.pool.total == 0 and p.pool._free == []
+    assert released == [1] and p.model.pd_gdn_capture == {}
+    assert p.take_finished(set()) == ({"r"}, None)
+
+
+def test_cancel_racing_the_stage_puts_the_buffer_back_in_the_pool(
+    producer, fake_pd_transfer, monkeypatch
+):
+    p = producer
+    kv, rec, taps = _payload()
+    p.runner = SimpleNamespace(_req_state_slot={"r": 0})
+    p.model = SimpleNamespace(pd_gdn_capture={0: (rec, taps)})
+    real_pack = mc.pack_payload
+
+    def pack_then_cancel(*a, **k):
+        out = real_pack(*a, **k)
+        p._release("tid-d", remember_cancel=True)  # CANCEL lands mid-stage
+        return out
+
+    monkeypatch.setattr(mc, "pack_payload", pack_then_cancel)
+    p.stage_after_step(
+        TTMooncakeConnectorMetadata(stage=[StageReq("r", [0, 1], 7, "tid-d")])
+    )
+    assert "tid-d" not in p._staged and p._cancelled == {}
+    assert len(p.pool._free) == 1 and p.pool.total > 0  # acquired, then freed
+    assert p.take_finished(set()) == ({"r"}, None)
+
+
+def test_abort_during_parked_get_cancels_on_the_producer(
+    producer, consumer, fake_pd_transfer, monkeypatch
+):
+    """End to end over the real side channel: the request finishes while its GET is
+    parked -> CANCEL -> the producer's later stage is dropped, not held for the GC."""
+    monkeypatch.setattr(mc, "_GET_WAIT_S", 0.2)
+    monkeypatch.setattr(mc, "_GET_POLL_S", 0.001)
+    p, w = producer, consumer
+    rr = _rr_on(p, "re", "tid-e")
+    w._inflight[rr.req_id] = rr
+    threading.Timer(0.05, lambda: w.take_finished({rr.req_id})).start()
+    w._pull(rr)  # GET parks 0.2 s, comes back "pending", the abort is seen
+    w._ctrl_pool.shutdown(wait=True)
+    assert "tid-e" in p._cancelled and w.take_finished(set()) == (None, {rr.req_id})
+    kv, rec, taps = _payload()
+    released = []
+    p.runner = SimpleNamespace(_req_state_slot={"r": 0})
+    p.model = SimpleNamespace(
+        pd_gdn_capture={0: (rec, taps)},
+        pd_gdn_snapshot_release=lambda r, c: released.append(1),
+    )
+    p.stage_after_step(
+        TTMooncakeConnectorMetadata(stage=[StageReq("r", [0, 1], 7, "tid-e")])
+    )
+    assert "tid-e" not in p._staged and released == [1] and p.pool.total == 0
+
+
+def test_stale_cancel_memory_expires_with_the_gc(producer, fake_pd_transfer):
+    p = producer
+    kv, rec, taps = _payload()
+    p.runner = SimpleNamespace(_req_state_slot={"r": 0})
+    p.model = SimpleNamespace(pd_gdn_capture={0: (rec, taps)})
+    p._cancelled["old"] = time.time() - mc._GET_TIMEOUT_S - 1
+    p._cancelled["fresh"] = time.time()
+    p.stage_after_step(
+        TTMooncakeConnectorMetadata(stage=[StageReq("r", [0, 1], 7, "tid-f")])
+    )
+    assert "tid-f" in p._staged and set(p._cancelled) == {"fresh"}
 
 
 # ---- H: proxy-chosen transfer_id, consumer-derived num_tokens ------------------------
