@@ -357,16 +357,40 @@ class TTKVWorker:
     def _poll_ready(self, r: str, job: LoadJob) -> None:
         """PENDING_READY -> IMPORTING_KV when the header is READY (shm) / the
         claim-gated fabric xfer is sent and at the channel head; called at step
-        begin and again at step end (``_run_kv_imports``)."""
-        expiry = job.meta.xfer.expiry
-        if expiry is not None and time.time() > float(expiry):
-            # The producer's janitor sweeps an unclaimed segment past its lease;
-            # claiming it now would race that sweep (audit: janitor-vs-claim). The
-            # lease was valid at the offer (``_lease_ok``), it ran out while
-            # PENDING_SLOT: recompute. A fabric claim already made is dropped by
-            # release_remote (fence, then drain if the producer had sent).
-            self._fail(r, job, "lease expired before the claim", handle=None)
-            return
+        begin and again at step end (``_run_kv_imports``).
+
+        Lease clock: until the claim, the descriptor's READY lease (started at the
+        producer's publish).  Once a fabric claim of ours exists, the transport's
+        ``claim_deadline`` rules instead: it is clocked from the CLAIM (claim +
+        ``claim_lease_s``, the hard bound a dead producer is caught by) and restarted
+        at the producer's send marker -- the prefill rank runs a whole prompt per
+        step and pumps at its end, so a claim waits one full prefill of the next
+        queued request (26 s @32k), which must not expire the READY lease (30 s).
+        shm has no ``claim_deadline``: the READY lease applies throughout."""
+        now = time.time()
+        deadline = self._claim_deadline(job)
+        if deadline is not None:
+            if now > deadline:
+                # The producer never sent (dead / stuck past claim_lease_s) or the
+                # xfer never reached the channel head: release_remote fences the
+                # claim, drains it when the producer had sent; recompute.
+                self._fail(
+                    r,
+                    job,
+                    "claim lease expired (producer never sent or channel head never "
+                    "reached)",
+                    handle=None,
+                )
+                return
+        else:
+            expiry = job.meta.xfer.expiry
+            if expiry is not None and now > float(expiry):
+                # The producer's janitor sweeps an unclaimed segment past its lease;
+                # claiming it now would race that sweep (audit: janitor-vs-claim).
+                # The lease was valid at the offer (``_lease_ok``), it ran out while
+                # PENDING_SLOT: recompute.
+                self._fail(r, job, "lease expired before the claim", handle=None)
+                return
         h = self.transport.open_get(job.meta.xfer)
         if h is None:
             return  # still WRITING, or (fabric) claimed and waiting for the sends
@@ -377,6 +401,22 @@ class TTKVWorker:
         job.handle = h
         job.state = LoadState.IMPORTING_KV
         self._step_progress = True
+
+    def _claim_deadline(self, job: LoadJob) -> float | None:
+        """The transport's deadline for a pending CLAIM of ours on this job's xfer
+        (fabric ``claim_deadline``: wall time, None when no claim is pending); None
+        for a transport without the method (shm).  A raising transport is logged
+        and treated as 'no claim' (the READY lease applies)."""
+        fn = getattr(self.transport, "claim_deadline", None)
+        if fn is None:
+            return None
+        xid = job.meta.xfer.xfer_id
+        try:
+            d = fn(xid)
+        except Exception:
+            logger.exception("PD: transport.claim_deadline(%s) raised", xid)
+            return None
+        return None if d is None else float(d)
 
     # ------------------------------------------------------------------ #
     # step-END

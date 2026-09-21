@@ -1499,6 +1499,172 @@ def test_release_racing_the_send_leaves_an_orphan_marker_drained_by_pump(tmp_pat
     D.shutdown()
 
 
+def test_marker_landing_between_the_release_check_and_the_drop_survives(tmp_path):
+    """The other half of the residual window (review MAJOR 1): the producer listed
+    the OPEN claim before the consumer's fence and its marker lands AFTER the
+    consumer's absent-marker read but BEFORE the drop.  The drop must not unlink a
+    marker it never read: it survives as an ORPHAN, ``wants_pump`` is True, the
+    pump drains every parked item and the next export flows at seq 1.  (The
+    sibling test above fires the release before the marker write; this one hooks
+    the consumer's marker read so the producer writes right after the None.)"""
+    world, clock, P, D = started_pair(tmp_path)
+    rng = np.random.default_rng(7)
+    m = manifest(kv_layers=1)  # 6 kv + 2 rec items
+    publish(P, 0, m, rng)
+    claim(D, 0)
+    exp = P._exports[xfer(0)]
+    orig_marker = D._marker
+    fired: list[int] = []
+
+    def marker_then_the_producer_lands(engine, hx):
+        got = orig_marker(engine, hx)
+        if got is None and not fired:
+            fired.append(1)
+            with P._lock:  # P snapshotted the OPEN claim before our fence: finishes now
+                P._send_export(exp)
+            assert os.path.exists(marker_path(D, 0))
+        return got
+
+    D._marker = marker_then_the_producer_lands
+    try:
+        D.release_remote(xfer(0))  # lease expiry / abort / demotion after the claim
+    finally:
+        D._marker = orig_marker
+    assert fired and exp.sent and exp.seq == 0
+    assert world.channel.pending_sends == 8
+    assert os.path.exists(marker_path(D, 0)), "the drop unlinked a marker it never read"
+    assert D.stats["late_markers"] == 1
+    assert xfer(0) not in D._xfers and len(D._rec_sets) == 2
+    assert not any(os.path.isdir(d) for d in seg_dirs(D, 0))
+    assert D.wants_pump()  # the orphan marker: the idle ticker wakes the engine
+    D.pump()  # the consumer's next step / idle tick
+    assert world.channel.pending_sends == 0 and D.pending_receive_seq() == 1
+    assert D.stats["orphan_markers"] == 1 and D.stats["drains"] == 8
+    assert not os.path.exists(marker_path(D, 0)) and not D.wants_pump()
+    P.pump()
+    assert P.outstanding_exports() == 0 and P._kv_pool.free == 16
+    mB = manifest(num_tokens=100, kv_layers=1)
+    _, wantB = publish(P, 1, mB, rng)
+    gB = claim_and_send(P, D, 1)
+    assert load_json(marker_path(D, 1))["seq"] == 1
+    got = import_like_hook(gB, mB, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
+    assert all(np.array_equal(got[k], wantB[k]) for k in got)
+    D.finish_import(gB, ok=True)
+    assert not os.path.exists(marker_path(D, 1))  # an ADOPTED marker is unlinked
+    P.shutdown()
+    D.shutdown()
+
+
+def test_claim_deadline_is_clocked_from_the_claim_then_from_the_marker(tmp_path):
+    """The claim lease (review MAJOR 2): after D's claim, P is mid-prefill of the
+    next queued request for longer than one READY lease (a whole prompt per P
+    step, 26 s @32k).  The transport's claim deadline is claim + claim_lease_s
+    (default 3 x lease: the hard bound a dead producer is caught by) until the
+    marker, then marker + lease for the channel head; the transfer completes
+    byte-exact although the READY lease is long gone."""
+    world, clock, P, D = started_pair(tmp_path)  # lease 30 -> claim lease 90
+    assert D.cfg.claim_lease_s == 90.0 and P.cfg.claim_lease_s == 90.0
+    rng = np.random.default_rng(31)
+    m = manifest(kv_layers=1)
+    _, want = publish(P, 0, m, rng)
+    assert D.claim_deadline(xfer(0)) is None  # not claimed: the READY lease applies
+    t_claim = clock.now
+    claim(D, 0)
+    assert D.claim_deadline(xfer(0)) == t_claim + 90.0
+    clock.now += 45.0  # P busy: one full prefill of the next prompt, > one lease
+    assert D.open_get(Desc(xfer(0))) is None  # still waiting; no expiry here
+    assert D.claim_deadline(xfer(0)) == t_claim + 90.0  # the hard bound, unchanged
+    P.pump()  # P's step ended: the marker lands 45 s after READY
+    assert D.claim_deadline(xfer(0)) == t_claim + 90.0  # not read by D yet
+    g = D.open_get(Desc(xfer(0)))
+    assert g is not None and g.ready()
+    assert D.claim_deadline(xfer(0)) is None  # posted at the head: nothing to time out
+    # restart from the marker: B is claimed and sent while A holds the head
+    mB = manifest(num_tokens=100, kv_layers=1)
+    _, wantB = publish(P, 1, mB, rng)
+    claim(D, 1)
+    clock.now += 40.0
+    P.pump()  # B seq 1, behind A on the channel
+    clock.now += 1.0
+    t_seen_b = clock.now  # D reads the marker at its next poll: the lease restarts here
+    assert D.open_get(Desc(xfer(1))) is None  # A is the head
+    assert D.claim_deadline(xfer(1)) == t_seen_b + 30.0  # restarted from the marker
+    clock.now += 5.0
+    assert D.claim_deadline(xfer(1)) == t_seen_b + 30.0
+    staging = [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)]
+    got = import_like_hook(g, m, staging)
+    assert all(np.array_equal(got[k], want[k]) for k in got)
+    D.finish_import(g, ok=True)
+    gB = D.open_get(Desc(xfer(1)))
+    assert gB is not None and gB.ready() and D.claim_deadline(xfer(1)) is None
+    got = import_like_hook(gB, mB, staging)
+    assert all(np.array_equal(got[k], wantB[k]) for k in got)
+    D.finish_import(gB, ok=True)
+    assert D.claim_deadline(xfer(1)) is None and not D.wants_pump()
+    P.pump()
+    assert P.outstanding_exports() == 0
+    P.shutdown()
+    D.shutdown()
+
+
+def test_claim_lease_knob(monkeypatch):
+    """claim_lease_s: default 3 x lease; fabric_claim_lease_s and
+    TT_PD_FABRIC_CLAIM_LEASE_S override; a claim lease below the READY lease is
+    refused."""
+    t = FabricSocketTransport(engine_id="p", lease_duration=20.0)
+    assert t.cfg.claim_lease_s == 60.0
+    t = FabricSocketTransport(
+        engine_id="p", lease_duration=20.0, extra_config={"fabric_claim_lease_s": 45}
+    )
+    assert t.cfg.claim_lease_s == 45.0
+    monkeypatch.setenv("TT_PD_FABRIC_CLAIM_LEASE_S", "120")
+    assert FabricSocketTransport(engine_id="p").cfg.claim_lease_s == 120.0
+    monkeypatch.setenv("TT_PD_FABRIC_CLAIM_LEASE_S", "0")  # 0 = derived
+    assert FabricSocketTransport(engine_id="p").cfg.claim_lease_s == 90.0
+    with pytest.raises(ValueError, match="fabric_claim_lease_s"):
+        FabricSocketTransport(engine_id="p", lease_duration=30.0, claim_lease_s=10.0)
+
+
+def test_producer_skips_a_claim_whose_consumer_pid_is_dead(tmp_path, monkeypatch):
+    """A consumer that dies right after claiming must not trigger the sends: nobody
+    would post the recvs and the channel would park until the janitor sweeps the
+    dead claim.  The producer's pump reads consumer.pid and skips a dead one (the
+    janitor then frees the buffers); a live claim is sent for as before."""
+    from vllm_tt_plugin.kv_transfer.transport import shm as shm_mod
+
+    world, clock, P, D = started_pair(tmp_path)
+    rng = np.random.default_rng(21)
+    publish(P, 0, manifest(kv_layers=1), rng)
+    mine = claim(D, 0)
+    pid_path = os.path.join(mine, shm_mod.CONSUMER_PID_FILE)
+    with open(pid_path) as f:
+        assert int(f.read()) == os.getpid()
+    dead_pid = 4194303
+    monkeypatch.setattr(shm_mod, "pid_alive", lambda pid: pid != dead_pid)
+    with open(pid_path, "w") as f:
+        f.write(str(dead_pid))  # the consumer died right after the claim
+    P.pump()
+    P.pump()
+    assert world.channel.pending_sends == 0 and P.stats["sends"] == 0
+    assert P.stats["dead_claims_skipped"] == 2 and not P._exports[xfer(0)].sent
+    assert not os.path.exists(marker_path(D, 0))
+    P.control.janitor_once()  # the C2 rule sweeps the dead claim
+    assert not os.path.isdir(mine) and P.control.stats["stale_claims"] == 1
+    P.pump()
+    assert P.outstanding_exports() == 0 and P._kv_pool.free == 16
+    # control: a live consumer's claim is sent for
+    D.release_remote(xfer(0))  # D's view of the dead claim: gone, nothing to drain
+    m = manifest(num_tokens=100, kv_layers=1)
+    _, want = publish(P, 1, m, rng)
+    g = claim_and_send(P, D, 1)
+    assert load_json(marker_path(D, 1))["seq"] == 0 and P.stats["exports_sent"] == 1
+    got = import_like_hook(g, m, [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)])
+    assert all(np.array_equal(got[k], want[k]) for k in got)
+    D.finish_import(g, ok=True)
+    P.shutdown()
+    D.shutdown()
+
+
 def test_claim_wait_spins_for_an_idle_producers_marker(tmp_path):
     """The common 1-user path: the producer's idle tick answers the claim within a
     few ms; the FIRST open_get after the claim spins up to claim_wait_s so the

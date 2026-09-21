@@ -810,6 +810,82 @@ def test_pending_ready_claim_that_becomes_ready_during_the_forward_imports_same_
     assert "import_kv_blocks" in model.names()
 
 
+def _claimed_then_gated(tr, deadlines):
+    """A fabric-shaped FakeTransport: open_get claims (None) until ``gate['open']``
+    and reports a claim deadline from ``deadlines`` (claim_deadline seam)."""
+    gate = {"open": False}
+    orig = tr.open_get
+    tr.claim_deadline = lambda xid: deadlines.get(xid)
+
+    def open_get(desc):
+        if not gate["open"]:
+            tr.calls.append(("open_get", desc.xfer_id))
+            return None  # claimed; the producer has not pumped yet
+        return orig(desc)
+
+    tr.open_get = open_get
+    return gate
+
+
+def test_claimed_job_outlives_the_ready_lease_while_the_producer_is_busy():
+    """Claim-gated fabric: the READY lease started at P's publish, but P is
+    mid-prefill of the NEXT queued request (a whole prompt per P step: 26 s @32k,
+    longer than the 30 s lease above ~36k tokens).  After the claim the worker
+    asks the transport for the CLAIM deadline and keeps polling; the import
+    completes when the marker lands."""
+    w, tr, model, runner = make_worker()
+    rm = recv_meta("r1")
+    rm.xfer.expiry = time.time() + 3600.0  # valid at the offer
+    tr.publish(rm.xfer.xfer_id, "READY")
+    deadlines = {rm.xfer.xfer_id: time.time() + 3600.0}  # claim + claim_lease_s
+    gate = _claimed_then_gated(tr, deadlines)
+    fin, inv, wm = step(w, meta(reqs_to_recv={"r1": rm}))
+    assert w.loads()["r1"].state == LoadState.PENDING_READY and fin == (None, None)
+    rm.xfer.expiry = time.time() - 1.0  # the READY lease ran out while P prefills
+    for _ in range(3):
+        fin, inv, wm = step(w)
+        assert w.loads()["r1"].state == LoadState.PENDING_READY, (
+            "must not expire on the READY lease once the claim is made"
+        )
+        assert fin == (None, None) and inv == set()
+    assert tr.count("release_remote", rm.xfer.xfer_id) == 0
+    gate["open"] = True  # the marker landed: P's step ended
+    fin, inv, wm = step(w)
+    assert w.loads()["r1"].state == LoadState.KV_DONE and fin == (None, {"r1"})
+    assert "import_kv_blocks" in model.names()
+
+
+def test_claimed_job_fails_at_the_claim_deadline_and_releases():
+    """The hard bound: a producer that never sends (dead / stuck) is caught at the
+    transport's claim deadline (claim + claim_lease_s), even though the READY
+    lease is still valid; the claim is released (fence + drop) and the request
+    recomputes.  A raising claim_deadline falls back to the READY lease."""
+    w, tr, model, runner = make_worker()
+    rm = recv_meta("r1")
+    rm.xfer.expiry = time.time() + 3600.0
+    tr.publish(rm.xfer.xfer_id, "READY")
+    deadlines: dict = {}
+    _claimed_then_gated(tr, deadlines)
+    fin, inv, wm = step(w, meta(reqs_to_recv={"r1": rm}))
+    assert w.loads()["r1"].state == LoadState.PENDING_READY
+    deadlines[rm.xfer.xfer_id] = time.time() - 1.0  # claim lease ran out
+    fin, inv, wm = step(w)
+    assert fin == (None, {"r1"}) and inv == set(rm.local_block_ids)
+    assert tr.count("release_remote", rm.xfer.xfer_id) == 1
+    assert "r1" not in w.loads() and model.calls == []
+
+    def boom(xid):
+        raise RuntimeError("no such claim")
+
+    tr.claim_deadline = boom
+    rm2 = recv_meta("r2")
+    rm2.xfer.expiry = time.time() - 1.0  # READY lease gone, deadline unknown
+    tr.publish(rm2.xfer.xfer_id, "READY")
+    fin, inv, wm = step(w, meta(reqs_to_recv={"r2": rm2}))
+    assert fin == (None, {"r2"}) and inv == set(rm2.local_block_ids)
+    assert tr.count("open_get", rm2.xfer.xfer_id) == 0  # READY lease rule applied
+
+
 def test_end_step_pumps_a_transport_that_has_pump_and_survives_its_errors():
     """The claim-gated protocol's per-step clock lives in end_step: a transport
     with pump() is pumped after the exports / imports of every step, a raising

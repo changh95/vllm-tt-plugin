@@ -81,13 +81,34 @@ Claim-gated sends (the D5 fix)
       present -> the items are parked, drained at their channel turn.  The one
       residual window: the producer listed the claim, enqueued the sends and is
       about to write the marker while the consumer fences -> the marker lands
-      after the consumer's check, as an ORPHAN MARKER (no claim of ours); the
-      consumer's ``pump()`` (every step + idle tick) drains it at its turn, so the
-      producer's CQ is parked for at most one consumer step / idle tick, never a
-      lease.
+      after the consumer's check (or between that check and the drop), as an
+      ORPHAN MARKER (no claim of ours).  The consumer never unlinks a marker it
+      has not read (``_finalize`` unlinks only an ADOPTED marker; ``_drop_unsent``
+      re-reads after the drop and reports a late one), so the orphan survives and
+      the consumer's ``pump()`` (every step + idle tick) drains it at its turn:
+      the producer's CQ is parked for at most one consumer step / idle tick, never
+      a lease.
     * the common-path cost: the sends start at the producer's next ``pump`` after
-      the claim -- at most the idle-tick period when P is idle, one P step when P
-      is mid-prefill for another request (today the sends were enqueued at READY).
+      the claim -- at most the idle-tick period when P is idle.  When P is
+      mid-prefill for another request the pump runs at that STEP's end, and the
+      prefill rank runs a WHOLE prompt per step (``pd_launch_config`` emits
+      ``--max-num-batched-tokens`` = ctx), so the claim waits one FULL prefill of
+      the next queued request (run 2 step lengths: 6.4 s @8k, 26 s @32k tokens);
+      the old protocol had the sends on the channel at READY and the next prefill
+      merely queued behind them for one D poll.  This is the price of option (a)
+      of PHASE3_RESULTS 12.
+    * the claim lease: the consumer's wait for the marker is clocked from the
+      CLAIM, not from READY (``claim_deadline``, asked by ``TTKVWorker._poll_ready``):
+      a claimed xfer fails at claim + ``claim_lease_s`` (``TT_PD_FABRIC_CLAIM_LEASE_S``
+      / ``fabric_claim_lease_s``, default 3 x ``lease_duration`` = 90 s: the HARD
+      BOUND by which a dead or stuck producer is detected -- a producer mid-prefill
+      of the next queued request is not dead); once the marker is seen the lease
+      restarts from the marker (``lease_duration`` for the xfer to reach the channel
+      head; an expiry there releases the claim = a drain at its turn, never a hang).
+      Worst case claim -> failure = ``claim_lease_s`` + ``lease_duration`` (4 x
+      lease).  With the READY lease alone, back-to-back prompts whose prefill
+      exceeds the lease (~36k tokens at CTX 65536) expired deterministically while
+      P was busy and D recomputed.  shm (no claim gating) keeps the READY lease.
 
 Single-channel discipline
     * ``seq`` = send order per producer epoch, recorded in the marker; the sidecar
@@ -299,6 +320,12 @@ class FabricConfig:
     # send marker (an idle producer answers within its idle tick, ~5 ms); after
     # that the worker re-polls at every step begin / end.  0 = never spin.
     claim_wait_s: float = 0.010
+    # consumer: the lease of a CLAIM of ours, measured from the claim, until the
+    # producer's send marker (the hard bound a dead / stuck producer is caught by;
+    # a producer mid-prefill of the next queued request needs up to one full
+    # prefill).  None / 0 = 3 x lease_duration.  After the marker the wait for the
+    # channel head is clocked from the marker with lease_duration.
+    claim_lease_s: float | None = None
     # DEBUG ONLY (p3 device validation): skip the warm-up send/recv in start() so a
     # pair can reach READY on a fabric link that does not pass payloads (the first
     # real export then compiles the programs and PARKS both CQs if the link is dead)
@@ -325,6 +352,7 @@ class FabricConfig:
         "fabric_socket_timeout_s": "socket_timeout_s",
         "fabric_skip_warmup": "skip_warmup",
         "fabric_claim_wait_s": "claim_wait_s",
+        "fabric_claim_lease_s": "claim_lease_s",
     }
 
     @classmethod
@@ -339,6 +367,7 @@ class FabricConfig:
             rec_sets=_env_int("TT_PD_FABRIC_REC_SETS", 4),
             socket_timeout_s=_env_float("TT_PD_FABRIC_SOCKET_TIMEOUT_S", 300.0),
             claim_wait_s=_env_float("TT_PD_FABRIC_CLAIM_WAIT_S", 0.010),
+            claim_lease_s=_env_float("TT_PD_FABRIC_CLAIM_LEASE_S", 0.0) or None,
             skip_warmup=os.environ.get("TT_PD_FABRIC_SKIP_WARMUP", "0") == "1",
         )
         for k, v in (extra or {}).items():
@@ -367,6 +396,15 @@ class FabricConfig:
         if cfg.claim_wait_s < 0:
             raise ValueError(
                 f"fabric_claim_wait_s must be >= 0 (got {cfg.claim_wait_s})"
+            )
+        if cfg.claim_lease_s in (None, "", "0", 0):
+            cfg.claim_lease_s = 3.0 * cfg.lease_duration
+        cfg.claim_lease_s = float(cfg.claim_lease_s)
+        if cfg.claim_lease_s < cfg.lease_duration:
+            raise ValueError(
+                f"fabric_claim_lease_s ({cfg.claim_lease_s}) must be >= the lease "
+                f"({cfg.lease_duration}): the claim lease covers the producer's "
+                "prefill of the next queued request on top of the READY lease"
             )
         cfg.skip_warmup = str(cfg.skip_warmup).lower() in ("1", "true", "yes")
         if cfg.sender_rank == cfg.receiver_rank:
@@ -500,6 +538,22 @@ class _ControlSegments(ShmTransport):
             if ".claimed-" in n and not n.endswith(CLOSING_SUFFIX)
         }
 
+    def dead_claim_hexes(self, engine: str, names: set[str]) -> set[str]:
+        """xfer hexes of the OPEN claim dirs in ``names`` whose consumer pid is dead
+        (``consumer.pid`` + ``os.kill(pid, 0)``, the janitor's ``_claim_is_stale``
+        rule; a legacy claim without a pid file counts as live until the janitor's
+        age rule).  The producer must not send for them: nobody would post the
+        recvs, the channel would park until the janitor sweeps the dir."""
+        edir = self._engine_dir(engine)
+        now = self._clock()
+        dead: set[str] = set()
+        for n in names:
+            if ".claimed-" not in n or n.endswith(CLOSING_SUFFIX):
+                continue
+            if self._claim_is_stale(os.path.join(edir, n), now)[0]:
+                dead.add(n.split(".claimed-", 1)[0])
+        return dead
+
     def fence_claim(self, xfer_id: str) -> str | None:
         """Consumer: rename our open claim dir to its ``.closing`` fence (atomic) so
         the producer's next ``pump`` will not start sends for it; the claim state
@@ -608,6 +662,7 @@ class _Export:
     sent: bool = False  # sends enqueued (or attempted) and the marker written
     abandoned: bool = False  # abandon() after publish: never send
     ready_ts: float = 0.0  # perf_counter at READY publish (handoff evidence)
+    dead_claim_warned: bool = False  # one log line per export for a dead consumer
 
 
 class FabricSink(Sink):
@@ -725,7 +780,10 @@ class _Xfer:
     posted: bool = False  # READY handle issued: the hook posts the recvs
     released: bool = False  # drop the claim; drain the sent items at their turn
     send_failed: bool = False  # the producer's enqueue raised part-way (marker FAILED)
-    claimed_ts: float = 0.0
+    claimed_ts: float = 0.0  # perf_counter at the claim (handoff evidence)
+    marker_seen: bool = False  # a marker of ours was READ (only then may we unlink it)
+    claimed_at: float = 0.0  # transport clock at the claim (claim_deadline)
+    marker_at: float = 0.0  # transport clock when the marker was adopted
 
     @property
     def nitems(self) -> int:
@@ -877,6 +935,8 @@ class FabricSocketTransport(TTKVTransport):
             "exports_failed": 0,
             "imports": 0,  # claims
             "orphan_markers": 0,
+            "late_markers": 0,  # marker landed between our absent-check and the drop
+            "dead_claims_skipped": 0,  # producer pumps skipping a dead consumer's claim
             "warm_programs": 0,
         }
 
@@ -1411,9 +1471,14 @@ class FabricSocketTransport(TTKVTransport):
 
     def _send_claimed(self) -> int:
         """Enqueue the sends of every published export the consumer has CLAIMED
-        (open ``.claimed-*`` dir, not a ``.closing`` fence), in publish order, one
-        ``seq`` each in send order, then write the marker.  Engine thread only
-        (device ops).  Returns the number of exports sent."""
+        (open ``.claimed-*`` dir of a LIVE consumer pid, not a ``.closing`` fence),
+        in ``open_put`` order (= publish order: the prefill rank runs
+        ``max_num_seqs`` 1), one ``seq`` each in send order, then write the marker.
+        A claim whose consumer pid is dead is left to the janitor: sending for it
+        would park the channel with nobody to post the recvs (this narrows, not
+        closes, the die-after-check window; the pair is one tt-run job, so a dead
+        consumer means a restart anyway).  Engine thread only (device ops).
+        Returns the number of exports sent."""
         if not self._exports:
             return 0
         ctrl = self.control
@@ -1425,12 +1490,25 @@ class FabricSocketTransport(TTKVTransport):
             ]
             if not pending:
                 return 0
-            claimed = ctrl.claimed_hexes(ctrl.list_engine_dir(self.engine_id))
+            names = ctrl.list_engine_dir(self.engine_id)
+            claimed = ctrl.claimed_hexes(names)
+            dead = ctrl.dead_claim_hexes(self.engine_id, names) if claimed else set()
             n = 0
             for exp in pending:
-                if exp.hx in claimed:
-                    self._send_export(exp)
-                    n += 1
+                if exp.hx not in claimed:
+                    continue
+                if exp.hx in dead:
+                    self.stats["dead_claims_skipped"] += 1
+                    if not exp.dead_claim_warned:
+                        exp.dead_claim_warned = True
+                        logger.warning(
+                            "PD fabric: %s is claimed by a dead consumer; not sending "
+                            "(the janitor sweeps the claim, the buffers come back)",
+                            exp.xfer_id,
+                        )
+                    continue
+                self._send_export(exp)
+                n += 1
             return n
 
     def _send_export(self, exp: _Export) -> None:
@@ -1642,6 +1720,8 @@ class FabricSocketTransport(TTKVTransport):
         epoch = str(m.get("epoch"))
         if epoch != self._recv_epoch:
             self._adopt_epoch(epoch)
+        xf.marker_seen = True  # from here on _finalize may unlink it
+        xf.marker_at = float(self._clock())
         xf.items = [tuple(x) for x in m.get("items", [])]
         xf.n_kv = int(m.get("n_kv", 0))
         xf.index_items()
@@ -1763,7 +1843,12 @@ class FabricSocketTransport(TTKVTransport):
         )
 
     def _finalize(self, xf: _Xfer) -> None:
-        """Forget a claim of ours: rec set back, marker gone, indexes cleared."""
+        """Forget a claim of ours: rec set back, indexes cleared, and the marker
+        gone -- but ONLY a marker we have read (``_adopt_marker``).  A marker we
+        never read may be landing right now (the producer listed the claim before
+        our fence and is finishing its enqueue): unlinking it blind would leave its
+        sends parked on the channel with no record to drain by (the D5 shape).
+        Such a marker is an ORPHAN the pump drains at its turn."""
         if xf.rec_set is not None:
             self._rec_sets.append(xf.rec_set)
             xf.rec_set = None
@@ -1774,14 +1859,33 @@ class FabricSocketTransport(TTKVTransport):
         if xf.seq is not None:
             self._by_seq.pop(xf.seq, None)
         peer = self.peer_engine_id
-        if peer is not None:
+        if peer is not None and xf.marker_seen:
             self._unlink_marker(peer, xf.hx)
+        else:
+            self._markers.pop(xf.hx, None)
 
     def _drop_unsent(self, xf: _Xfer, why: str) -> None:
         """Drop a claim nothing was (or will be) sent for: no drain, claim dir
-        removed, the producer's buffers come back through its ``_reclaim``."""
+        removed, the producer's buffers come back through its ``_reclaim``.  The
+        caller fenced the claim and found no marker; the marker path is left alone
+        (``_finalize`` unlinks only an adopted marker) and re-read once the drop is
+        done: a marker that landed meanwhile is an orphan for ``pump`` to drain
+        (``wants_pump`` lists it, so the idle ticker wakes the engine for it)."""
+        engine = parse_xfer_id(xf.xfer_id)[0]
         self._finalize(xf)
         self.control.release_remote(xf.xfer_id)
+        late = None if xf.marker_seen else self._read_marker_file(engine, xf.hx)
+        if late is not None and late.get("seq") is not None:
+            self.stats["late_markers"] += 1
+            logger.info(
+                "PD fabric: dropped claim %s (%s) but the producer's marker landed "
+                "meanwhile (seq %s, %d items): orphan, drained by the pump at its turn",
+                xf.xfer_id,
+                why,
+                late.get("seq"),
+                int(late.get("nitems", 0)),
+            )
+            return
         logger.info(
             "PD fabric: dropped claim %s (%s; nothing on the channel)", xf.xfer_id, why
         )
@@ -1867,7 +1971,14 @@ class FabricSocketTransport(TTKVTransport):
                 return g
             rec_set = self._rec_sets.popleft() if n_rec > 0 else None
             xf = _Xfer(
-                xfer_id, hx, None, items, n_kv, rec_set, claimed_ts=time.perf_counter()
+                xfer_id,
+                hx,
+                None,
+                items,
+                n_kv,
+                rec_set,
+                claimed_ts=time.perf_counter(),
+                claimed_at=float(self._clock()),
             )
             xf.index_items()
             self._xfers[xfer_id] = xf
@@ -2136,6 +2247,26 @@ class FabricSocketTransport(TTKVTransport):
 
     def pending_receive_seq(self) -> int:
         return self._next_recv_seq
+
+    def claim_deadline(self, xfer_id: str) -> float | None:
+        """Consumer, host-only (any thread): the deadline (transport ``clock``, wall
+        time in production) of our pending CLAIM on ``xfer_id`` for the worker's
+        lease check (``TTKVWorker._poll_ready``); None when we hold no pending claim
+        (not claimed yet: the descriptor's READY lease applies; posted / released /
+        finished: nothing left to time out).  Before the marker: claim +
+        ``claim_lease_s`` (the hard bound; a producer mid-prefill of the next queued
+        request is alive and needs up to one full prefill, a dead one is caught
+        here).  After the marker: marker + ``lease_duration`` for the xfer to reach
+        the channel head (an expiry there releases the claim = a drain at its turn,
+        never a hang).  Worst case claim -> failure = ``claim_lease_s`` +
+        ``lease_duration``."""
+        with self._lock:
+            xf = self._xfers.get(xfer_id)
+            if xf is None or xf.posted or xf.released:
+                return None
+            if not xf.marker_seen:
+                return xf.claimed_at + float(self.cfg.claim_lease_s)
+            return xf.marker_at + float(self.cfg.lease_duration)
 
 
 __all__ = [
