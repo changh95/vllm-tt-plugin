@@ -711,7 +711,7 @@ def test_consumer_derives_num_tokens_when_the_proxy_omits_it():
     assert sched._to_recv["d-2"].num_tokens == 4
 
 
-# ---- producer: every request that finished in its prefill step is staged; strays never reach vLLM's assert ----
+# ---- producer: staged whenever the prefill step finished; strays never reach vLLM ----
 
 
 def test_producer_delays_the_free_for_a_stopped_first_token():
