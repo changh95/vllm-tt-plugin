@@ -426,6 +426,17 @@ def test_argv_value_forms():
 # --------------------------------------------------------------------------- #
 # rank binding
 # --------------------------------------------------------------------------- #
+def test_global_env_passes_the_host_sampler_knob():
+    """TT_HOST_SAMPLER_FAST (plugin host sampler, no TT_PD_/QWEN36_ prefix) must
+    reach the ranks: the knobs-off reference boot of laneE_RESULTS.md 2.3 and a
+    container profile env both set it; ranks inherit nothing else from the shell."""
+    s = lc.PairSettings()
+    g = lc.collect_global_env(base_env(TT_HOST_SAMPLER_FAST="0"), s, "/pd/x.json")
+    assert g["TT_HOST_SAMPLER_FAST"] == "0"
+    g0 = lc.collect_global_env(base_env(), s, "/pd/x.json")
+    assert "TT_HOST_SAMPLER_FAST" not in g0
+
+
 def test_render_rank_binding_prod_and_test():
     for pair, chips in (("prod", ("0", "3")), ("test", ("1", "2"))):
         s = lc.PairSettings(pair=pair, d_gdn_fused=2, allow_fused_conv=1)

@@ -118,6 +118,7 @@ GLOBAL_ENV_NAMES: tuple[str, ...] = (
     "TT_PD_FABRIC_DIR",
     "TRANSFORMERS_OFFLINE",
     "TOKENIZERS_PARALLELISM",
+    "TT_HOST_SAMPLER_FAST",  # plugin host sampler knob (host_sampler.py; 0 = upstream)
 )
 GLOBAL_ENV_PREFIXES: tuple[str, ...] = (
     "VLLM_",
