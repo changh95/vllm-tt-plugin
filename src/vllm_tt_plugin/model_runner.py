@@ -32,7 +32,6 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
@@ -51,6 +50,7 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_ragged,
     is_tt_block_output_model,
 )
+from vllm_tt_plugin.host_sampler import make_host_sampler
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
     CachedRequestState,
@@ -330,7 +330,10 @@ class TTModelRunner:
 
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
-        self.host_sampler = Sampler()
+        # vLLM's Sampler with the compact top-k/top-p path (host_sampler.py): the
+        # full-vocab sort + noise of the upstream top-p path cost 14-41 ms per
+        # decode step at a 248k vocab (TT_HOST_SAMPLER_FAST=0 restores upstream).
+        self.host_sampler = make_host_sampler()
 
         # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
         # custom logits processors). Used by the host sampler when device
