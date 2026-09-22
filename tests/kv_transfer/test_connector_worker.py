@@ -1025,7 +1025,7 @@ def test_hold_knob_defaults_from_env(monkeypatch):
     monkeypatch.delenv("TT_PD_IMPORT_AT_BEGIN")
     monkeypatch.delenv("TT_PD_CHUNK_PUMP")
     w, *_ = make_worker("both")
-    assert w.hold_s == 0.05 and w.import_at_begin and w.chunk_pump
+    assert w.hold_s == 0.25 and w.import_at_begin and w.chunk_pump
 
 
 def test_chunk_pump_is_wired_into_a_model_that_offers_the_seam():

@@ -140,13 +140,15 @@ class TTKVWorker:
         self.stats = stats
         # Claim-wait knobs (p1d1_opt lane B). hold_s: at step BEGIN the producer holds
         # the step up to hold_s after the READY publish of an export still waiting for
-        # its claim (TT_PD_FABRIC_HOLD_S, 0 = off). import_at_begin: the consumer posts
+        # its claim (TT_PD_FABRIC_HOLD_S, 0 = off; 0.25 covers a busy consumer's step:
+        # laneB_RESULTS 3.5 -- every claim caught, p50 92 ms, TPOT unchanged, mean TTFT
+        # -0.9 s at 2048x4 vs 0.05). import_at_begin: the consumer posts
         # the recvs of a claim answered at step begin right there
         # (TT_PD_IMPORT_AT_BEGIN).
         # chunk_pump: the model runs the transport pump at every prefill chunk
         # boundary (TT_PD_CHUNK_PUMP; needs a model with set_kv_transfer_pump).
         self.hold_s = float(
-            os.environ.get("TT_PD_FABRIC_HOLD_S", "0.05") if hold_s is None else hold_s
+            os.environ.get("TT_PD_FABRIC_HOLD_S", "0.25") if hold_s is None else hold_s
         )
         self.import_at_begin = (
             os.environ.get("TT_PD_IMPORT_AT_BEGIN", "1") != "0"
