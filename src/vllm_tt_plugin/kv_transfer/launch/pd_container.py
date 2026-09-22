@@ -31,14 +31,20 @@ Everything else comes from the environment (the profile's ``env``): ``TT_PD_CHIP
 dev box keeps the on-package-pair refusal), ``TT_PD_TAG`` (``ttm``: scopes the shm
 control dir, engine ids and the launch dir), ``TT_PD_P_POOL`` / ``TT_PD_D_POOL``,
 ``TT_PD_CONNS``, ``TT_PD_PKT``, ``TT_PD_LEASE``, ``TT_PD_EXPORT_SLOTS``,
-``TT_PD_MIN_REMOTE``, ``TT_PD_SSE_KEEPALIVE`` (proxy; 0 = none, what ``vllm bench
-serve`` needs), ``TT_PD_BOOT_TIMEOUT`` (P/D health, s), ``TT_METAL_CACHE`` (the tool's
-``/cache`` mount: per-rank kernel caches ``<cache>/pd/metal_rank{0,1}`` and the launch
-dir ``<cache>/pd-launch/<tag>/`` with the children's logs and rendered files),
-``TT_CACHE_PATH`` (converted weights; per rank under ``<TT_CACHE_PATH>/tp1-rank{0,1}``
-unless ``TT_PD_SHARED_TENSOR_CACHE=1``), ``TT_PD_OMPI_BIN`` (prepended to PATH when
-it exists; the image's OpenMPI bin dir is not on PATH), ``TT_PD_MGD`` (two-mesh MGD;
-default = the packaged ``data/pd_two_p150_mesh_graph_descriptor.textproto``).
+``TT_PD_MIN_REMOTE``, ``TT_PD_SSE_KEEPALIVE`` (proxy; default 0 = no keep-alive
+comments: ``vllm bench serve`` 0.26 counts a stream whose first token arrives after a
+keep-alive comment as FAILED, laneB_RESULTS 1.4), ``TT_PD_GDN_FUSED`` (the DECODE rank's
+``QWEN36_GDN_DECODE_FUSED``; default 2 = fused GDN decode + fused conv, "M2"),
+``TT_PD_ALLOW_FUSED_CONV`` (default 1: the connector accepts the fused-conv decode node,
+whose parity-safe slot remap is validated), ``TT_PD_P_GDN_FUSED`` (the PREFILL rank's
+value; default 0 = the model default, that rank never decodes), ``TT_PD_BOOT_TIMEOUT``
+(P/D health, s), ``TT_METAL_CACHE`` (the tool's ``/cache`` mount: per-rank kernel caches
+``<cache>/pd/metal_rank{0,1}`` and the launch dir ``<cache>/pd-launch/<tag>/`` with the
+children's logs and rendered files), ``TT_CACHE_PATH`` (converted weights; per rank
+under ``<TT_CACHE_PATH>/tp1-rank{0,1}`` unless ``TT_PD_SHARED_TENSOR_CACHE=1``),
+``TT_PD_OMPI_BIN`` (prepended to PATH when it exists; the image's OpenMPI bin dir is not
+on PATH), ``TT_PD_MGD`` (two-mesh MGD; default = the packaged
+``data/pd_two_p150_mesh_graph_descriptor.textproto``).
 
 Launch order = ``profiles/pd/run_pd_pair_fabric.sh up``: front-ends (``python -m
 vllm.entrypoints.cli.main serve <node argv>``) -> both handshake ROUTERs listening ->
@@ -439,7 +445,12 @@ def build_pair_settings(
         d_pool=_env_int(env, "TT_PD_D_POOL", 163840),
         d_conc=req.max_num_seqs,
         lease=_env_float(env, "TT_PD_LEASE", 30.0),
-        gdn_fused=_env_int(env, "TT_PD_GDN_FUSED", 0),
+        # decode rank: fused GDN decode + fused conv (2, M2) is the validated
+        # default; the prefill rank never decodes and keeps the model default
+        # (0). laneE_RESULTS.md 6.
+        gdn_fused=_env_int(env, "TT_PD_P_GDN_FUSED", 0),
+        d_gdn_fused=_env_int(env, "TT_PD_GDN_FUSED", 2),
+        allow_fused_conv=_env_int(env, "TT_PD_ALLOW_FUSED_CONV", 1),
         min_remote=_env_int(env, "TT_PD_MIN_REMOTE", 2),
         trace_region=req.trace_region_size,
         l1_small=req.l1_small_size,

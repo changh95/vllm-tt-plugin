@@ -107,7 +107,15 @@ def test_settings_defaults_match_run_pd_pair_sh():
     assert s.max_num_seqs("prefill") == 1 and s.max_num_seqs("decode") == 8
     assert s.weights.endswith("/weights_qwen38")
     assert s.metal_cache("decode").endswith("tt_cache_pd/metal_rank1")
-    assert s.d_gdn_fused == s.gdn_fused == 0
+    # lane E: the DECODE rank defaults to the fused GDN decode + fused conv (M2)
+    # with the connector gate open; the prefill rank keeps the model default
+    # (laneE_RESULTS.md 6)
+    assert (s.gdn_fused, s.d_gdn_fused, s.allow_fused_conv) == (0, 2, 1)
+    fe = lc.PairSettings.from_env
+    assert fe({}).d_gdn_fused == 2
+    assert fe({"D_GDN_FUSED": "0"}).d_gdn_fused == 0
+    assert fe({"D_GDN_FUSED": "-1", "GDN_FUSED": "1"}).d_gdn_fused == 1
+    assert fe({"ALLOW_FUSED_CONV": "0"}).allow_fused_conv == 0
     assert s.pkt == 8704 and s.conns == 2 and s.fifo_bytes == 128
     # export pool derived from CTX: one max-length export = 1024 buffers = 2.125 GiB
     assert s.export_slots == 1

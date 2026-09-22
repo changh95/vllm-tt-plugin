@@ -356,6 +356,40 @@ def test_serve_argv_env_knobs_and_dev_box_pair():
         pc.build_pair_settings(req, container_env("/tmp/y", TT_PD_CHIPS="0"))
 
 
+def test_pair_defaults_to_the_m2_decode_node_and_the_env_knobs_override_it():
+    """lane E (laneE_RESULTS.md 6): `tt-model serve --profile p1d1` gets the
+    validated configuration without extra env: decode rank
+    QWEN36_GDN_DECODE_FUSED=2 + TT_PD_ALLOW_FUSED_CONV=1, prefill rank at the
+    model default, proxy keep-alive off."""
+    req = pc.parse_serve_argv(TOOL_ARGV, fake_serve_parser)
+    env = container_env("/tmp/z")
+    s, _ = pc.build_pair_settings(req, env)
+    assert (s.gdn_fused, s.d_gdn_fused, s.allow_fused_conv) == (0, 2, 1)
+    ov_p = lc.rank_env_overrides(s, "prefill")
+    ov_d = lc.rank_env_overrides(s, "decode")
+    assert ov_p["QWEN36_GDN_DECODE_FUSED"] == "0"
+    assert "TT_PD_ALLOW_FUSED_CONV" not in ov_p
+    assert ov_d["QWEN36_GDN_DECODE_FUSED"] == "2"
+    assert ov_d["TT_PD_ALLOW_FUSED_CONV"] == "1"
+    assert pc.ContainerKnobs.from_env(env).sse_keepalive == 0.0
+    # the knobs keep their meaning: TT_PD_GDN_FUSED = the decode rank, TT_PD_P_GDN_FUSED
+    # = the prefill rank, TT_PD_ALLOW_FUSED_CONV = the connector's fused-conv gate
+    s2, _ = pc.build_pair_settings(
+        req,
+        container_env(
+            "/tmp/z",
+            TT_PD_GDN_FUSED="0",
+            TT_PD_ALLOW_FUSED_CONV="0",
+            TT_PD_P_GDN_FUSED="2",
+            TT_PD_SSE_KEEPALIVE="5",
+        ),
+    )
+    assert (s2.gdn_fused, s2.d_gdn_fused, s2.allow_fused_conv) == (2, 0, 0)
+    assert lc.rank_env_overrides(s2, "decode")["QWEN36_GDN_DECODE_FUSED"] == "0"
+    env5 = container_env("/tmp/z", TT_PD_SSE_KEEPALIVE="5")
+    assert pc.ContainerKnobs.from_env(env5).sse_keepalive == 5.0
+
+
 @pytest.mark.parametrize(
     "argv, match",
     [

@@ -238,9 +238,15 @@ class PairSettings:
         "dumpfile"  # hook warm-up contract; the connector descriptor carries it
     )
     lease: float = 30.0
+    # QWEN36_GDN_DECODE_FUSED per rank. The prefill rank never runs a decode step (T-1
+    # protocol) and keeps the model default (0 = composite); the DECODE rank runs the
+    # fused GDN decode + fused conv (2, Phase 2's "M2") with the connector's fused-conv
+    # gate opened -- the validated p1d1 default (profiles/p1d1_opt/laneE_RESULTS.md:
+    # TPOT 1.3-1.5x vs composite, identity = the fused single-die class, parity remap
+    # soak clean). -1 = follow gdn_fused (the pre-lane-E behaviour).
     gdn_fused: int = 0
-    d_gdn_fused: int = -1  # default = gdn_fused
-    allow_fused_conv: int = 0
+    d_gdn_fused: int = 2
+    allow_fused_conv: int = 1
     strict: int = 1
     min_remote: int = 2
     trace_region: int = 536870912
@@ -423,7 +429,7 @@ class PairSettings:
             shm_mode=e.get("SHM_MODE", cls.shm_mode),
             lease=_env_float(e, "LEASE", cls.lease),
             gdn_fused=_env_int(e, "GDN_FUSED", cls.gdn_fused),
-            d_gdn_fused=_env_int(e, "D_GDN_FUSED", -1),
+            d_gdn_fused=_env_int(e, "D_GDN_FUSED", cls.d_gdn_fused),
             allow_fused_conv=_env_int(e, "ALLOW_FUSED_CONV", cls.allow_fused_conv),
             strict=_env_int(e, "STRICT", cls.strict),
             min_remote=_env_int(e, "MIN_REMOTE", cls.min_remote),
