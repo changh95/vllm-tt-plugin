@@ -709,3 +709,41 @@ def test_consumer_derives_num_tokens_when_the_proxy_omits_it():
     params2 = dict(params, do_remote_prefill=True, num_tokens=4)
     sched.update_state_after_alloc(_request("d-2", params2, 10), blocks, 9)
     assert sched._to_recv["d-2"].num_tokens == 4
+
+
+# ---- producer: every request that finished in its prefill step is staged; strays never reach vLLM's assert ----
+
+
+def test_producer_delays_the_free_for_a_stopped_first_token():
+    """P's one-token completion may finish STOPPED (EOS / stop string as the first token): the worker still stages
+    it in that step, so the free must be delayed exactly as for the length-capped case -- vLLM asserts that every
+    finished_sending id is still tracked (scheduler._update_from_kv_xfer_finished), and 2026-09-22's grid lost P's
+    engine to that assert."""
+    sched = _SchedulerSide(_connector_stub(True, 18100))
+    req = _request("chatcmpl-eos-1a2b3c4d", {"do_remote_decode": True}, 9)
+    req.status = RequestStatus.FINISHED_STOPPED
+    ok, out = sched.request_finished(req, [1])
+    assert (
+        ok
+        and out["do_remote_prefill"]
+        and out["transfer_id"] == "chatcmpl-eos-1a2b3c4d"
+    )
+    aborted = _request("chatcmpl-abort-1a2b3c4d", {"do_remote_decode": True}, 9)
+    aborted.status = RequestStatus.FINISHED_ABORTED
+    assert sched.request_finished(aborted, [2]) == (False, None)
+
+
+def test_stray_finished_sending_ids_are_dropped_before_vllm_sees_them():
+    sched = _SchedulerSide(_connector_stub(True, 18100))
+    kept = _request("chatcmpl-kept-1a2b3c4d", {"do_remote_decode": True}, 9)
+    assert sched.request_finished(kept, [1])[0]
+    out = SimpleNamespace(
+        finished_sending={"chatcmpl-kept-1a2b3c4d", "chatcmpl-gone-1a2b3c4d"},
+        finished_recving=None,
+    )
+    sched.update_connector_output(out)
+    assert out.finished_sending == {"chatcmpl-kept-1a2b3c4d"}
+    assert not sched._delayed_free  # reported once, then forgotten
+    empty = SimpleNamespace(finished_sending=None, finished_recving=None)
+    sched.update_connector_output(empty)  # None stays None
+    assert empty.finished_sending is None

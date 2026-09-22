@@ -563,6 +563,9 @@ class _SchedulerSide:
         self._to_stage: dict[str, StageReq] = {}
         self._to_recv: dict[str, RecvReq] = {}
         self._to_cancel: list[tuple[str, int, str]] = []
+        # request ids whose request_finished() delayed the block free (producer): the
+        # only ids vLLM may see in finished_sending
+        self._delayed_free: set[str] = set()
         self._staged_params: dict[
             str, dict[str, Any]
         ] = {}  # producer: req_id -> params handed to the proxy
@@ -675,6 +678,22 @@ class _SchedulerSide:
             self._to_recv.pop(req_id, None)
         for req_id in connector_output.finished_sending or ():
             self._to_stage.pop(req_id, None)
+        # vLLM asserts every finished_sending id is still a tracked request and frees
+        # its blocks; only the requests whose request_finished() delayed the free are.
+        # A request the worker staged after the scheduler already freed it (aborted
+        # while its stage metadata was in flight) must not reach that assert: drop it
+        # here (the staging itself is pulled or garbage-collected as usual).
+        if connector_output.finished_sending:
+            stray = connector_output.finished_sending - self._delayed_free
+            if stray:
+                logger.warning(
+                    "[pd] finished_sending for %d request(s) the scheduler no longer "
+                    "tracks (aborted before/while staging): %s",
+                    len(stray),
+                    sorted(stray)[:4],
+                )
+                connector_output.finished_sending -= stray
+            self._delayed_free -= connector_output.finished_sending
 
     def request_finished(
         self, request: Request, block_ids: list[int]
@@ -699,13 +718,19 @@ class _SchedulerSide:
             return False, None
         if not params.get("do_remote_decode") or not self.c._is_producer:
             return False, None
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
-            # aborted / stopped early: the worker staged (or will stage) nothing useful;
-            # free now
+        if request.status not in (
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ):
+            # aborted: the worker staged (or will stage) nothing useful; free now
             return False, None
-        # The worker stages synchronously in wait_for_save of the prefill step and
-        # reports the request in finished_sending in that same step's output; the
-        # scheduler frees the blocks from that report.
+        # The request finished in the step that prefilled it -- by its one-token
+        # length cap, or STOPPED when that token was EOS / a stop string (the payload
+        # is just as valid; the consumer decides what to do with the token). The
+        # worker stages synchronously in wait_for_save of that step and reports the
+        # request in finished_sending in the same step's output; the scheduler frees
+        # the blocks from that report, so the free is delayed until then.
+        self._delayed_free.add(request.request_id)
         return True, {
             "do_remote_prefill": True,
             "do_remote_decode": False,
