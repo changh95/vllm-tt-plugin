@@ -999,6 +999,12 @@ def rank_env_overrides(s: PairSettings, role: str) -> dict[str, str]:
         "QWEN36_GDN_DECODE_FUSED": str(
             s.gdn_fused if role == "prefill" else s.d_gdn_fused
         ),
+        # Each rank owns an independent (1,1) mesh and its own tensor cache: ttnn's
+        # default cache dump (DISTRIBUTED_GATHER) would all-gather across the MPI
+        # world and let only world rank 0 write, so the decode rank's cache would
+        # never be written and every converted tensor would be a cross-rank barrier
+        # (2026-09-22: the container pair wedged at the transport rendezvous).
+        "TTNN_TENSOR_CACHE_DUMP_MODE": "local",
     }
     if role == "decode":
         ov["TT_PD_ALLOW_FUSED_CONV"] = str(s.allow_fused_conv)

@@ -1876,3 +1876,12 @@ def test_engine_lock_treats_a_replayed_pid_as_stale(tmp_path):
     assert lc.engine_in_use(seg, "d-x") is not None  # our own fresh lock IS live
     lock.release()
     assert not os.path.exists(path)
+
+
+def test_rank_env_overrides_make_the_tensor_cache_dump_local(tmp_path):
+    """Both ranks run independent (1,1) meshes with their own tensor caches, so ttnn's
+    cache dump must be LOCAL: the default DISTRIBUTED_GATHER lets only world rank 0
+    write (the decode rank's cache was never written) and barriers per tensor."""
+    s = lc.PairSettings.from_env({"TAG": "x", "P_CHIP": "0", "D_CHIP": "3"})
+    for role in ("prefill", "decode"):
+        assert lc.rank_env_overrides(s, role)["TTNN_TENSOR_CACHE_DUMP_MODE"] == "local"
