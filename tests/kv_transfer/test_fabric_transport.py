@@ -2352,3 +2352,72 @@ def test_rec_chunk_device_tensor_is_the_received_buffer_without_a_copy(tmp_path)
     P.pump()
     P.shutdown()
     D.shutdown()
+
+
+# --- rendezvous: wait for a late peer, ignore a dead peer's leftover, time out ------
+# A rank with a warm tensor cache reaches start() in seconds while its peer converts
+# a cold cache for minutes; the peer's rendezvous file must be awaited, not read once
+# (2026-09-22: the p1d1 container's prefill rank failed "peer rank 1 left no
+# rank1.json" and the pair wedged).
+
+
+def _peer_file(t, role, pid):
+    d = dict(t.cfg.spec_table(), engine_id="peer", role=role, epoch="e1", pid=pid)
+    peer_rank = t.cfg.receiver_rank if t.is_producer else t.cfg.sender_rank
+    p = t._rendezvous_path(peer_rank)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, p)
+    return p
+
+
+def test_rendezvous_waits_for_a_late_peer(tmp_path):
+    world, clock, P, D = make_pair(tmp_path)
+    P.cfg.socket_timeout_s = 5.0
+    t = threading.Timer(0.3, _peer_file, args=(P, "consumer", os.getpid()))
+    t0 = time.monotonic()
+    t.start()
+    try:
+        P._read_peer_rendezvous()
+    finally:
+        t.join()
+    assert P._peer["role"] == "consumer"
+    assert 0.25 <= time.monotonic() - t0 < 4.0
+
+
+def test_rendezvous_ignores_a_dead_peers_leftover(tmp_path):
+    world, clock, P, D = make_pair(tmp_path)
+    P.cfg.socket_timeout_s = 5.0
+    dead = 2**22 + 12345  # beyond pid_max on this box: certainly not alive
+    stale = _peer_file(P, "consumer", dead)
+    t = threading.Timer(0.3, _peer_file, args=(P, "consumer", os.getpid()))
+    t.start()
+    try:
+        P._read_peer_rendezvous()
+    finally:
+        t.join()
+    assert P._peer["pid"] == os.getpid()
+    assert os.path.exists(stale)  # replaced by the live peer's file
+
+
+def test_rendezvous_times_out_with_a_clear_message(tmp_path):
+    world, clock, P, D = make_pair(tmp_path)
+    P.cfg.socket_timeout_s = 0.3
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="left no .*rank1.json within 0 s"):
+        P._read_peer_rendezvous()
+    assert time.monotonic() - t0 < 3.0
+
+
+def test_rendezvous_consumer_waits_for_producer(tmp_path):
+    world, clock, P, D = make_pair(tmp_path)
+    D.cfg.socket_timeout_s = 5.0
+    t = threading.Timer(0.2, _peer_file, args=(D, "producer", os.getpid()))
+    t.start()
+    try:
+        D._read_peer_rendezvous()
+    finally:
+        t.join()
+    assert D._recv_epoch == "e1" and D.pending_receive_seq() == 0

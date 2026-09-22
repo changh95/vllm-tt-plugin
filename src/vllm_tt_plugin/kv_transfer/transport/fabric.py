@@ -205,6 +205,7 @@ from .shm import (
     RELEASED,
     ShmTransport,
     parse_xfer_id,
+    pid_alive,
     read_header,
     write_status,
 )
@@ -1162,17 +1163,75 @@ class FabricSocketTransport(TTKVTransport):
             json.dump(d, f)
         os.replace(tmp, p)
 
+    def _wait_peer_rendezvous(self, p: str, peer_rank: int) -> dict:
+        """Wait up to ``cfg.socket_timeout_s`` for the peer rank's rendezvous file.
+
+        The peer may still be loading its model when this rank reaches ``start()`` --
+        a cold tensor cache on ONE rank only (a crash mid-conversion, a decode-node
+        weight layout the prefill node does not have) converts for minutes while the
+        other rank loads warm in seconds -- so the file is polled, not read once.  A
+        file whose writer pid is dead is a leftover of a previous run: removed and
+        ignored (the peer of this run writes a fresh one).  Progress is logged every
+        30 s so a hung peer is visible in the ranks log.
+        """
+        timeout_s = float(self.cfg.socket_timeout_s or 300.0)
+        t0 = time.monotonic()
+        deadline = t0 + timeout_s
+        next_log = t0 + 30.0
+        while True:
+            peer = None
+            try:
+                with open(p) as f:
+                    peer = json.load(f)
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError):
+                peer = None  # being written / unreadable: retry
+            if peer is not None:
+                pid = peer.get("pid")
+                if isinstance(pid, int) and pid > 0 and not pid_alive(pid):
+                    logger.warning(
+                        "fabric rendezvous: %s was left by a dead process (pid %d); "
+                        "removing it and waiting for the peer of this run",
+                        p,
+                        pid,
+                    )
+                    with contextlib.suppress(OSError):
+                        os.unlink(p)
+                else:
+                    waited = time.monotonic() - t0
+                    if waited > 1.0:
+                        logger.info(
+                            "fabric rendezvous: peer rank %d arrived after %.1f s",
+                            peer_rank,
+                            waited,
+                        )
+                    return peer
+            now = time.monotonic()
+            if now >= deadline:
+                raise RuntimeError(
+                    f"fabric rendezvous: peer rank {peer_rank} left no {p} within "
+                    f"{timeout_s:.0f} s; both engines must use the same "
+                    "fabric_control_dir on one host, and the peer engine must reach "
+                    "its transport start (a rank converting a cold tensor cache needs "
+                    "minutes: raise TT_PD_FABRIC_SOCKET_TIMEOUT_S)"
+                )
+            if now >= next_log:
+                logger.info(
+                    "fabric rendezvous: waiting for peer rank %d (%s) for %.0f s, "
+                    "%.0f s left",
+                    peer_rank,
+                    p,
+                    now - t0,
+                    deadline - now,
+                )
+                next_log = now + 30.0
+            time.sleep(0.05)
+
     def _read_peer_rendezvous(self) -> None:
         peer_rank = self.cfg.receiver_rank if self.is_producer else self.cfg.sender_rank
         p = self._rendezvous_path(peer_rank)
-        try:
-            with open(p) as f:
-                peer = json.load(f)
-        except (OSError, ValueError) as e:
-            raise RuntimeError(
-                f"fabric rendezvous: peer rank {peer_rank} left no {p} ({e}); both "
-                "engines must use the same fabric_control_dir on one host"
-            ) from e
+        peer = self._wait_peer_rendezvous(p, peer_rank)
         mine = self.cfg.spec_table()
         theirs = {k: peer.get(k) for k in mine}
         if theirs != mine:
