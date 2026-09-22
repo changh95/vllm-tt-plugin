@@ -1774,3 +1774,53 @@ def test_script_refuses_in_use_and_dumps_stacks_before_kill():
     assert down.index("kill_ranks") < down.index("sweep_stale_rendezvous")
     assert "SHM_DIR=${SHM_DIR:-/dev/shm/tt_pd_$TAG}" in body
     assert "CTRL_DIR=${CTRL_DIR:-/dev/shm/tt_pd_fabric_$TAG}" in body
+
+
+class _FakeTorch:
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.calls: list[int] = []
+
+    def get_num_threads(self) -> int:
+        return self.n
+
+    def set_num_threads(self, n: int) -> None:
+        self.calls.append(n)
+        self.n = n
+
+
+def test_configure_torch_threads_restores_the_forked_engines_count_under_mpi():
+    """Under prterun MKL reports 1 thread and torch copies it (the F0 TPOT penalty at
+    4-8 users: the host sampler's sort runs single-threaded).  auto -> the physical
+    cores of the affinity mask, unless OMP_NUM_THREADS/MKL_NUM_THREADS is set (torch
+    honours those); 0 = leave torch alone (previous behaviour); N = explicit; junk
+    raises."""
+    assert rank_mod.default_torch_threads(16, 2) == 8
+    assert rank_mod.default_torch_threads(1, 2) == 1
+    assert rank_mod.default_torch_threads(12, 1) == 12
+    t = _FakeTorch(1)
+    info = rank_mod.configure_torch_threads(torch_module=t, env={})
+    want = rank_mod.default_torch_threads()
+    assert info["mode"].startswith("auto") and info["before"] == 1
+    assert info["after"] == want == t.n and t.calls == [want]
+    t = _FakeTorch(1)
+    info = rank_mod.configure_torch_threads(
+        torch_module=t, env={"OMP_NUM_THREADS": "6"}
+    )
+    assert info["mode"].startswith("env") and t.calls == [] and info["after"] == 1
+    t = _FakeTorch(1)
+    info = rank_mod.configure_torch_threads(
+        torch_module=t, env={rank_mod.TORCH_THREADS_ENV: "0"}
+    )
+    assert info["mode"] == "off" and t.calls == []
+    t = _FakeTorch(8)
+    info = rank_mod.configure_torch_threads(value="3", torch_module=t, env={})
+    assert info["mode"] == "explicit" and t.calls == [3] and info["after"] == 3
+    t = _FakeTorch(8)
+    info = rank_mod.configure_torch_threads(value="8", torch_module=t, env={})
+    assert t.calls == [] and info["after"] == 8  # already there: no call
+    for bad in ("x", "-2", "1.5"):
+        with pytest.raises(ValueError, match=rank_mod.TORCH_THREADS_ENV):
+            rank_mod.configure_torch_threads(
+                value=bad, torch_module=_FakeTorch(1), env={}
+            )

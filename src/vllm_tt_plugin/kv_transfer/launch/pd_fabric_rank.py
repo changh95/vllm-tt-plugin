@@ -77,6 +77,19 @@ wait for the producer's next step (= the lease, then D recomputes).  It wraps
 ``EngineCoreProc.run_busy_loop`` (start / stop around the loop) and raises at install
 when the vLLM in use lacks any attribute it relies on.
 
+``TT_PD_TORCH_THREADS`` (``configure_torch_threads``, default ``auto``): a rank launched
+by ``mpirun``/``prterun`` gets ONE torch intra-op thread -- MKL's thread detection
+returns 1 under an MPI launcher (``OMPI_*`` environment, affinity untouched) and torch
+copies it on first use (``init_num_threads`` ->
+``omp_set_num_threads(mkl_get_max_threads())``) although ``OMP_NUM_THREADS`` is unset
+and libgomp itself sees every CPU.  The host
+sampler's ``logits.sort`` of the ``[B, vocab]`` batch then runs single-threaded (71 ms
+vs 11 ms at B=8 on this host): the F0 shape's TPOT penalty at 4-8 users (PHASE3 7).
+``auto`` restores what a forked ``vllm serve`` engine gets (the physical cores of the
+affinity mask) on the engine thread before the engine starts; ``0`` leaves torch alone
+(the previous behaviour); ``N`` forces N; an ``OMP_NUM_THREADS`` / ``MKL_NUM_THREADS``
+already in the environment wins (torch honours it).
+
 ``--dry-run`` builds and prints the resolved config without MPI, ttnn or a device.
 Fallback if this shape fails on hardware: F2 (single engine, ``create_socket_pair`` on
 two (1,1) submeshes) -- see profiles/pd/p3_device_validation_plan.md; nothing here
@@ -583,6 +596,88 @@ def install_dist_cleanup_patch(
     return cleanup_dist_env_tt
 
 
+TORCH_THREADS_ENV = "TT_PD_TORCH_THREADS"
+
+
+def _threads_per_core() -> int:
+    """SMT siblings of cpu0 from sysfs (2 on this host); 2 when unreadable (an
+    under-count is the safe side with two ranks on one host)."""
+    try:
+        with open("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list") as f:
+            txt = f.read().strip()
+    except OSError:
+        return 2
+    n = 0
+    for part in txt.split(","):
+        if "-" in part:
+            a, b = part.split("-", 1)
+            n += int(b) - int(a) + 1
+        elif part:
+            n += 1
+    return max(1, n)
+
+
+def default_torch_threads(
+    affinity_cpus: int | None = None, threads_per_core: int | None = None
+) -> int:
+    """What torch picks OUTSIDE an MPI launcher: ``mkl_get_max_threads()`` = the
+    physical cores of the process affinity mask (16 CPUs / 2 SMT = 8 here)."""
+    if affinity_cpus is None:
+        try:
+            affinity_cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            affinity_cpus = os.cpu_count() or 1
+    if threads_per_core is None:
+        threads_per_core = _threads_per_core()
+    return max(1, int(affinity_cpus) // max(1, int(threads_per_core)))
+
+
+def configure_torch_threads(
+    value: str | None = None,
+    torch_module: Any = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Set torch's intra-op thread count for this process (module docstring,
+    ``TT_PD_TORCH_THREADS``).  Call on the ENGINE thread (the main thread) before the
+    engine starts: ``torch.set_num_threads`` stores the count for every thread's lazy
+    init as well.  Returns the facts for the log line."""
+    env = dict(os.environ if env is None else env)
+    if value is None:
+        value = env.get(TORCH_THREADS_ENV, "auto")
+    value = str(value).strip().lower() or "auto"
+    if torch_module is None:
+        import torch as torch_module  # noqa: PLC0415
+    before = int(torch_module.get_num_threads())
+    info: dict[str, Any] = {"knob": value, "before": before, "after": before}
+    if value in ("0", "off", "none"):
+        info["mode"] = "off"
+        return info
+    env_set = [k for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS") if env.get(k)]
+    if value == "auto":
+        if env_set:
+            info["mode"] = f"env ({', '.join(f'{k}={env[k]}' for k in env_set)})"
+            return info
+        target = default_torch_threads()
+        info["mode"] = "auto (physical cores of the affinity mask)"
+    else:
+        try:
+            target = int(value)
+        except ValueError as e:
+            raise ValueError(
+                f"{TORCH_THREADS_ENV} must be auto, 0 or a positive integer "
+                f"(got {value!r})"
+            ) from e
+        if target <= 0:
+            raise ValueError(
+                f"{TORCH_THREADS_ENV} must be > 0 when numeric (got {value!r})"
+            )
+        info["mode"] = "explicit"
+    if target != before:
+        torch_module.set_num_threads(target)
+    info["after"] = int(torch_module.get_num_threads())
+    return info
+
+
 IDLE_TICK_S = 0.005  # default period of install_idle_ticker (TT_PD_FABRIC_IDLE_TICK_S)
 
 
@@ -971,6 +1066,17 @@ def _main_locked(
 
     if not ctx.under_mpi:
         raise RuntimeError("refusing to open a device outside tt-run/MPI")
+    tinfo = configure_torch_threads()
+    log.info(
+        "pd_fabric_rank: torch intra-op threads %d -> %d (%s, %s=%s; the MPI "
+        "launcher leaves MKL/torch at 1 thread: the host sampler's sort of the "
+        "[B, vocab] logits would run single-threaded)",
+        tinfo["before"],
+        tinfo["after"],
+        tinfo["mode"],
+        TORCH_THREADS_ENV,
+        tinfo["knob"],
+    )
     install_mesh_hooks(
         fabric_config=args.fabric_config,
         reliability=args.reliability,
