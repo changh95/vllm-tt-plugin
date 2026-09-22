@@ -333,7 +333,10 @@ class TTModelRunner:
         # vLLM's Sampler with the compact top-k/top-p path (host_sampler.py): the
         # full-vocab sort + noise of the upstream top-p path cost 14-41 ms per
         # decode step at a 248k vocab (TT_HOST_SAMPLER_FAST=0 restores upstream).
-        self.host_sampler = make_host_sampler()
+        # logprobs_mode follows the served ModelConfig, as upstream's runners do.
+        self.host_sampler = make_host_sampler(
+            logprobs_mode=getattr(self.model_config, "logprobs_mode", "raw_logprobs")
+        )
 
         # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
         # custom logits processors). Used by the host sampler when device
