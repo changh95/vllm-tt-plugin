@@ -37,6 +37,7 @@ the FULL local block list in the SAME step (I8).
 from __future__ import annotations
 
 import enum
+import os
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -108,6 +109,9 @@ class TTKVWorker:
         sync_device: Callable[[], None] | None = None,
         xfer_id_fn: Callable[[str], str] | None = None,
         stats: Any = None,
+        hold_s: float | None = None,
+        import_at_begin: bool | None = None,
+        chunk_pump: bool | None = None,
     ):
         self.connector = connector
         self.runner = runner
@@ -134,9 +138,32 @@ class TTKVWorker:
 
             stats = TTKVConnectorStats()
         self.stats = stats
+        # Claim-wait knobs (p1d1_opt lane B). hold_s: at step BEGIN the producer holds
+        # the step up to hold_s after the READY publish of an export still waiting for
+        # its claim (TT_PD_FABRIC_HOLD_S, 0 = off). import_at_begin: the consumer posts
+        # the recvs of a claim answered at step begin right there
+        # (TT_PD_IMPORT_AT_BEGIN).
+        # chunk_pump: the model runs the transport pump at every prefill chunk
+        # boundary (TT_PD_CHUNK_PUMP; needs a model with set_kv_transfer_pump).
+        self.hold_s = float(
+            os.environ.get("TT_PD_FABRIC_HOLD_S", "0.05") if hold_s is None else hold_s
+        )
+        self.import_at_begin = (
+            os.environ.get("TT_PD_IMPORT_AT_BEGIN", "1") != "0"
+            if import_at_begin is None
+            else bool(import_at_begin)
+        )
+        self.chunk_pump = (
+            os.environ.get("TT_PD_CHUNK_PUMP", "1") != "0"
+            if chunk_pump is None
+            else bool(chunk_pump)
+        )
 
         # producer
         self._pending_saves: dict[str, SaveMeta] = {}
+        self._open_exports: dict[
+            str, Any
+        ] = {}  # req id -> PutHandle opened at step begin
         self._exports: dict[str, ExportState] = {}
         self._armed: dict[str, float] = {}
         # consumer
@@ -155,6 +182,19 @@ class TTKVWorker:
         self._step_progress: bool = False
         self._step_device_ms: float = 0.0
         self._step_touched: set[str] = set()
+        self._wire_chunk_pump()
+
+    def _wire_chunk_pump(self) -> None:
+        """Producer: hand the transport pump to the model, which runs it at every
+        prefill chunk boundary (a claim that lands mid-prefill is answered within
+        one chunk instead of at the step's end)."""
+        if not (self.is_producer and self.chunk_pump):
+            return
+        if getattr(self.transport, "pump", None) is None:
+            return
+        fn = getattr(self.model, "set_kv_transfer_pump", None)
+        if callable(fn):
+            fn(self._pump_transport)
 
     # ------------------------------------------------------------------ #
     # small helpers
@@ -251,10 +291,15 @@ class TTKVWorker:
             raise RuntimeError(f"PD: join ids {sorted(join)} on a producer-only node")
 
     def _begin_producer(self, meta: TTKVConnectorMetadata, finished: set[str]) -> None:
+        # An export published at the previous step's end is still waiting for its
+        # consumer's claim: hold this step (<= hold_s after its READY) so the sends
+        # are enqueued BEFORE this step's prefill rather than after it.
+        self._hold_for_claims()
         self._pending_saves.update(meta.reqs_to_save)
         for r in meta.reqs_not_processed:
             s = self._pending_saves.pop(r, None)
             self._exports.pop(r, None)
+            self._drop_open_export(r)
             try:
                 x = s.xfer_id if s is not None else self._xfer_id(r)
                 self.transport.abandon(x)
@@ -267,6 +312,82 @@ class TTKVWorker:
             except Exception:
                 logger.exception("PD: abandon(%s) raised", r)
         self._armed.update(meta.reqs_to_send)  # armed exactly once per id
+        # Open this step's exports NOW: the model mirrors each prefill chunk's K/V into
+        # the export's pool buffers as the prefill runs (begin_export), so the step-end
+        # export writes only the GDN row (and any chunk the mirror missed).
+        for r, s in meta.reqs_to_save.items():
+            if r in self._pending_saves:
+                self._preopen_export(r, s)
+
+    def _preopen_export(self, r: str, s: SaveMeta) -> None:
+        try:
+            manifest = self.model.describe_request_state(s.num_tokens, s.block_ids)
+            h = self.transport.open_put(s.xfer_id, manifest)
+        except Exception:
+            logger.exception(
+                "PD: pre-open of %s at step begin failed; opening at step end", r
+            )
+            return
+        if h is None:
+            return  # refused now (pool short): _run_exports retries at step end
+        self._open_exports[r] = h
+        begin = getattr(self.model, "begin_export", None)
+        if callable(begin):
+            try:
+                begin(s.block_ids, s.num_tokens, h.sinks)
+            except Exception:
+                logger.exception(
+                    "PD: model.begin_export(%s) raised; step-end gather", r
+                )
+
+    def _drop_open_export(self, r: str) -> None:
+        if self._open_exports.pop(r, None) is not None:
+            self._end_model_export()
+
+    def _end_model_export(self) -> None:
+        fn = getattr(self.model, "end_export", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                logger.exception("PD: model.end_export raised")
+
+    def _hold_for_claims(self) -> None:
+        """Producer step BEGIN: wait (<= hold_s after its READY) for the consumer's
+        claim of an export still unsent, sending it right away. A transport without
+        the seam (shm) or hold_s <= 0 is a no-op."""
+        if self.hold_s <= 0:
+            return
+        wait = getattr(self.transport, "wait_for_claims", None)
+        oldest = getattr(self.transport, "oldest_unsent_ready_ts", None)
+        if wait is None or oldest is None:
+            return
+        t0 = time.perf_counter()
+        try:
+            ts = oldest()
+            if ts is None:
+                return
+            deadline = float(ts) + self.hold_s
+            if t0 >= deadline:
+                return
+            n = int(wait(deadline))
+        except Exception:
+            logger.exception("PD: hold for the consumer's claim raised")
+            return
+        held_ms = (time.perf_counter() - t0) * 1e3
+        if n > 0:
+            logger.info(
+                "PD: step begin held %.1f ms for the consumer's claim: %d export(s) "
+                "sent",
+                held_ms,
+                n,
+            )
+        else:
+            logger.info(
+                "PD: step begin held %.1f ms: no claim yet (the sends follow the next "
+                "pump)",
+                held_ms,
+            )
 
     def _begin_consumer(
         self, meta: TTKVConnectorMetadata, finished: set[str], join: set[str]
@@ -353,6 +474,12 @@ class TTKVWorker:
                 logger.info("PD: %s claimed state slot %d", r, slot)
             if job.state == LoadState.PENDING_READY:
                 self._poll_ready(r, job)
+        if self.import_at_begin:
+            # A claim answered within the spin (an idle or HOLDING producer) is READY
+            # now: post the recvs + fills before this step's forward, so the producer's
+            # parked sends complete within the wire time and the row joins one step
+            # earlier. Request-private blocks only (the batch never reads them).
+            self._import_ready_jobs()
 
     def _poll_ready(self, r: str, job: LoadJob) -> None:
         """PENDING_READY -> IMPORTING_KV when the header is READY (shm) / the
@@ -453,8 +580,16 @@ class TTKVWorker:
             nbytes = 0
             t0 = time.perf_counter()
             try:
-                manifest = self.model.describe_request_state(s.num_tokens, s.block_ids)
-                h = self.transport.open_put(s.xfer_id, manifest)
+                h = self._open_exports.pop(
+                    r, None
+                )  # opened at step begin (mirror path)
+                if h is None:
+                    manifest = self.model.describe_request_state(
+                        s.num_tokens, s.block_ids
+                    )
+                    h = self.transport.open_put(s.xfer_id, manifest)
+                else:
+                    manifest = h.manifest
                 if h is None:
                     logger.warning(
                         "PD: open_put(%s) refused (budget/tmpfs); export of %s FAILED",
@@ -475,6 +610,7 @@ class TTKVWorker:
                     self.transport.finish_export(h, "READY" if ok else "FAILED")
             except Exception:
                 logger.exception("PD: export of %s failed before the data plane", r)
+            self._end_model_export()
             ms = (time.perf_counter() - t0) * 1e3
             self._step_device_ms += ms
             self._step_touched.add(r)
@@ -493,8 +629,6 @@ class TTKVWorker:
         self._pending_saves.clear()
 
     def _run_kv_imports(self) -> None:
-        budget: int | None = self.max_import_chunks_per_step or None
-        progressed = False
         # Re-poll the claims still waiting at step begin: over the fabric the
         # producer enqueues the sends at ITS next pump after our claim, typically
         # during our forward; polling again here lets the recvs go out in this
@@ -502,6 +636,33 @@ class TTKVWorker:
         for r, job in list(self._loads.items()):
             if job.state == LoadState.PENDING_READY and r not in self._step_finished:
                 self._poll_ready(r, job)
+        progressed = self._import_ready_jobs()
+        self._step_progress = self._step_progress or progressed
+        waiting = any(
+            j.state
+            in (LoadState.PENDING_SLOT, LoadState.PENDING_READY, LoadState.IMPORTING_KV)
+            for j in self._loads.values()
+        )
+        idle_step = (
+            self._step_scheduled_tokens == 0
+            if self._step_scheduled_tokens is not None
+            else not (getattr(self.runner, "requests", None) or {})
+        )
+        if (
+            self.idle_sleep_s > 0
+            and waiting
+            and idle_step
+            and not self._step_progress
+            and not self._events_this_step
+        ):
+            time.sleep(self.idle_sleep_s)  # R13: D idles on zero-token steps
+
+    def _import_ready_jobs(self) -> bool:
+        """K/V block imports of every IMPORTING_KV job (FIFO, shared chunk budget),
+        then ``validate_gdn_parts`` + KV_DONE; from step END, and from step BEGIN
+        when ``import_at_begin``. Returns whether any chunk was imported."""
+        budget: int | None = self.max_import_chunks_per_step or None
+        progressed = False
         for r, job in list(self._loads.items()):
             if job.state != LoadState.IMPORTING_KV or r in self._step_finished:
                 # a finished id's blocks may already belong to another request:
@@ -553,24 +714,7 @@ class TTKVWorker:
                 self._step_device_ms += (time.perf_counter() - t0) * 1e3
                 self._step_touched.add(r)
         self._step_progress = self._step_progress or progressed
-        waiting = any(
-            j.state
-            in (LoadState.PENDING_SLOT, LoadState.PENDING_READY, LoadState.IMPORTING_KV)
-            for j in self._loads.values()
-        )
-        idle_step = (
-            self._step_scheduled_tokens == 0
-            if self._step_scheduled_tokens is not None
-            else not (getattr(self.runner, "requests", None) or {})
-        )
-        if (
-            self.idle_sleep_s > 0
-            and waiting
-            and idle_step
-            and not self._step_progress
-            and not self._events_this_step
-        ):
-            time.sleep(self.idle_sleep_s)  # R13: D idles on zero-token steps
+        return progressed
 
     def _fail(self, r: str, job: LoadJob, reason: str, *, handle: Any) -> None:
         self._invalid_block_ids |= set(job.meta.local_block_ids)  # ALWAYS the full list
@@ -610,6 +754,7 @@ class TTKVWorker:
         for r in finished:
             s = self._pending_saves.pop(r, None)
             if s is not None:  # aborted mid-step
+                self._drop_open_export(r)
                 try:
                     self.transport.abandon(s.xfer_id)
                     logger.info(

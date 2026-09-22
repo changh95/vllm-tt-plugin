@@ -825,6 +825,16 @@ class FabricChunk(SourceChunk):
             "(read_into_device); a fresh tensor would not be device-readable in order"
         )
 
+    def device_tensor(self) -> Any:
+        """Rec items only: the received pool buffer ITSELF (no staging copy).  The
+        hook reads it in place (``fill_cache`` into the slot row); it stays valid
+        until ``finish_import`` / ``release_remote`` hands the rec set back."""
+        if self.spec.kind != "gdn_rec":
+            raise NotImplementedError(
+                "device_tensor is for rec items (K/V is received into staging)"
+            )
+        return self._t._rec_item_tensor(self._xf, self.spec.name)
+
 
 class FabricSource(Source):
     def __init__(
@@ -2114,6 +2124,25 @@ class FabricSocketTransport(TTKVTransport):
             self._active = None
         self._next_recv_seq = max(self._next_recv_seq, int(xf.seq) + 1)
 
+    def _rec_item_tensor(self, xf: _Xfer, part: str) -> Any:
+        """The received rec buffer of ``part`` (the same checks as ``_copy_rec_item``,
+        no copy); the caller must not deallocate it."""
+        with self._lock:
+            if xf.failed:
+                raise RuntimeError(
+                    f"PD fabric: {xf.xfer_id} already failed: {xf.failed}"
+                )
+            if not xf.complete:
+                raise RuntimeError(
+                    f"PD fabric: {xf.xfer_id} rec {part} requested before the K/V "
+                    "items "
+                    f"were all received ({xf.cursor}/{xf.nitems})"
+                )
+            k = xf.rec_index.get(part)
+            if k is None or xf.rec_set is None:
+                raise RuntimeError(f"PD fabric: {xf.xfer_id} has no rec item {part}")
+            return xf.rec_set[k].tensor
+
     def _copy_rec_item(self, xf: _Xfer, part: str, rec_staging: Any) -> None:
         with self._lock:
             if xf.failed:
@@ -2244,6 +2273,38 @@ class FabricSocketTransport(TTKVTransport):
                 return True
             peer = self.peer_engine_id
             return peer is not None and bool(self._list_markers(peer))
+
+    def oldest_unsent_ready_ts(self) -> float | None:
+        """Producer, host-only: ``time.perf_counter()`` of the READY publish of the
+        oldest export still waiting for its consumer's claim (None when none)."""
+        if not self._started or not self.is_producer:
+            return None
+        with self._lock:
+            ts = [
+                e.ready_ts
+                for e in self._exports.values()
+                if e.published and not e.sent and not e.abandoned and e.ready_ts
+            ]
+        return min(ts) if ts else None
+
+    def wait_for_claims(self, deadline: float, poll_s: float = 0.0005) -> int:
+        """Producer, ENGINE THREAD ONLY (device ops): pump repeatedly until a claim
+        of a published-unsent export arrived (its sends are enqueued right here) or
+        ``deadline`` (``time.perf_counter()``) passed; returns the exports sent.
+        ``TTKVWorker._hold_for_claims`` calls it at step BEGIN so the sends go out
+        before the next prefill instead of after it (the claim wait)."""
+        if not self._started or not self.is_producer:
+            return 0
+        n = 0
+        while True:
+            n += self._send_claimed()
+            if n or self.oldest_unsent_ready_ts() is None:
+                self._reclaim()
+                return n
+            now = time.perf_counter()
+            if now >= deadline:
+                return n
+            time.sleep(min(poll_s, deadline - now))
 
     def pending_receive_seq(self) -> int:
         return self._next_recv_seq

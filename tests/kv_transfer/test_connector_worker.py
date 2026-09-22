@@ -289,7 +289,9 @@ def step(w, m=None, finished=(), join=()):
 # consumer: happy path and ORDER (I11)
 # --------------------------------------------------------------------------- #
 def test_consumer_two_phase_import_order_and_exactly_once():
-    w, tr, model, runner = make_worker()
+    # the shm-era two-phase contract (claim at begin, import at end); the fabric
+    # pair imports a READY claim at step begin too (import_at_begin, tested below)
+    w, tr, model, runner = make_worker(import_at_begin=False)
     rm = recv_meta("r1")
     tr.publish(rm.xfer.xfer_id)
     # step k: admission. begin -> claim + poll only;
@@ -414,14 +416,14 @@ def test_validate_failure_fails_load_same_call():
 
 
 def test_import_exception_fails_load_and_oom_reraises():
-    w, tr, model, runner = make_worker()
+    w, tr, model, runner = make_worker(import_at_begin=False)
     rm = recv_meta("r1")
     tr.publish(rm.xfer.xfer_id)
     model.import_error = RuntimeError("paged_fill_cache failed")
     fin, inv, wm = step(w, meta(reqs_to_recv={"r1": rm}))
     assert fin == (None, {"r1"}) and inv == set(rm.local_block_ids)
     # OOM: bookkeeping first, then the exception propagates (R17)
-    w2, tr2, model2, runner2 = make_worker()
+    w2, tr2, model2, runner2 = make_worker(import_at_begin=False)
     rm2 = recv_meta("r2")
     tr2.publish(rm2.xfer.xfer_id)
     model2.import_error = RuntimeError(
@@ -478,7 +480,7 @@ def test_abort_while_pending_slot_releases_and_emits_meta():
 
 
 def test_abort_while_importing_after_ready_finish_imports_failed():
-    w, tr, model, runner = make_worker()
+    w, tr, model, runner = make_worker(import_at_begin=False)
     rm = recv_meta("r1")
     tr.publish(rm.xfer.xfer_id, "WRITING")
     step(w, meta(reqs_to_recv={"r1": rm}))
@@ -530,7 +532,9 @@ def test_release_remote_twice_and_duplicate_recv_are_harmless():
 # consumer: chunked import, slot capacity, worker meta
 # --------------------------------------------------------------------------- #
 def test_chunk_cursor_resumes_and_install_uses_slot_read_at_join():
-    w, tr, model, runner = make_worker(max_import_chunks_per_step=1)
+    w, tr, model, runner = make_worker(
+        import_at_begin=False, max_import_chunks_per_step=1
+    )
     rm = recv_meta("r1", num_tokens=4095)  # 64 blocks -> 2 chunks of 32
     tr.publish(rm.xfer.xfer_id, num_tokens=4095)
     fin, inv, wm = step(w, meta(reqs_to_recv={"r1": rm}))
@@ -559,7 +563,9 @@ def test_chunk_cursor_resumes_and_install_uses_slot_read_at_join():
 
 
 def test_budget_is_shared_fifo_across_jobs():
-    w, tr, model, runner = make_worker(max_import_chunks_per_step=2)
+    w, tr, model, runner = make_worker(
+        import_at_begin=False, max_import_chunks_per_step=2
+    )
     a, b = recv_meta("a", num_tokens=4095), recv_meta("b", num_tokens=4095)
     tr.publish(a.xfer.xfer_id, num_tokens=4095)
     tr.publish(b.xfer.xfer_id, num_tokens=4095)
@@ -732,7 +738,7 @@ def test_end_step_skips_ids_finished_after_step_begin():
     """Critic NIT-5: ``end_step`` takes this step's finished ids too, so an
     aborted IMPORTING_KV job never imports a chunk into blocks that may already
     belong to another request -- even when ``begin_step`` did not see the id."""
-    w, tr, model, runner = make_worker()
+    w, tr, model, runner = make_worker(import_at_begin=False)
     rm = recv_meta("r1")
     tr.publish(rm.xfer.xfer_id)
     w.begin_step(meta(reqs_to_recv={"r1": rm}), set(), set())
@@ -911,3 +917,163 @@ def test_end_step_pumps_a_transport_that_has_pump_and_survives_its_errors():
     step(w)  # no raise
     del tr.pump
     step(w)  # shm shape: no pump attribute, no-op
+
+
+# --------------------------------------------------------------------------- #
+# p1d1_opt lane B: pre-opened exports (mirror path), the step-begin hold, the
+# step-begin import and the chunk-boundary pump wiring
+# --------------------------------------------------------------------------- #
+def _save(rid="p1", blocks=(4, 5, 6), num_tokens=129):
+    return xfer_id_for("p0", rid), SaveMeta(
+        block_ids=list(blocks), num_tokens=num_tokens, xfer_id=xfer_id_for("p0", rid)
+    )
+
+
+def test_producer_preopens_the_export_at_step_begin_and_exports_into_it():
+    """The export of the request whose prefill runs in this step is opened at step
+    BEGIN (one open_put), the model is told its sinks (begin_export) so it mirrors
+    the K/V chunks as the prefill runs, and the step-end export reuses the very
+    handle, then end_export closes the window."""
+    w, tr, model, runner = make_worker("producer")
+    runner._req_state_slot["p1"] = 0
+    log: list = []
+    model.begin_export = lambda b, n, sinks: log.append(("begin", list(b), n, sinks))
+    model.end_export = lambda: log.append(("end",))
+    orig_export = model.export_request_state
+    model.export_request_state = lambda b, n, s, sinks: (
+        log.append(("export", sinks)),
+        orig_export(b, n, s, sinks),
+    )[1]
+    xid, sm = _save()
+    w.begin_step(meta(reqs_to_save={"p1": sm}), set(), set())
+    assert tr.calls == [("open_put", xid)]
+    assert log[0][:3] == ("begin", [4, 5, 6], 129) and "p1" in w._open_exports
+    sinks = log[0][3]
+    w.end_step()
+    assert tr.count("open_put") == 1 and tr.segments[xid] == "READY"
+    assert [e[0] for e in log] == ["begin", "export", "end"]
+    assert log[1][1] is sinks  # the pre-opened handle's sinks, not a second open
+    assert "p1" not in w._open_exports
+    # a refused pre-open (pool short) is retried at step end, no begin_export
+    tr.refuse_put = True
+    xid2, sm2 = _save("p2")
+    w.begin_step(meta(reqs_to_save={"p2": sm2}), set(), set())
+    assert "p2" not in w._open_exports and log[-1] == ("end",)
+    tr.refuse_put = False
+    w.end_step()
+    assert tr.count("open_put", xid2) == 2 and tr.segments[xid2] == "READY"
+
+
+def test_preopened_export_of_a_request_aborted_mid_step_is_abandoned_and_closed():
+    w, tr, model, runner = make_worker("producer")
+    log: list = []
+    model.begin_export = lambda b, n, sinks: log.append("begin")
+    model.end_export = lambda: log.append("end")
+    xid, sm = _save()
+    w.begin_step(meta(reqs_to_save={"p1": sm}), set(), set())
+    assert log == ["begin"] and "p1" in w._open_exports
+    # execute_model raised: no end_step; the id finishes -> abandon + end_export
+    fin = w.get_finished({"p1"})
+    assert ("abandon", xid) in tr.calls and log == ["begin", "end"]
+    assert "p1" not in w._open_exports and fin == (None, None)
+    w.end_step()
+    assert tr.count("finish_export") == 0  # nothing left to export
+
+
+def test_producer_holds_step_begin_for_the_consumers_claim_through_the_seam():
+    """hold_s: at step begin, an export published <= hold_s ago and still unsent
+    keeps the step waiting (transport.wait_for_claims until READY + hold_s) so its
+    sends precede this step's prefill. No unsent export, an older READY, hold_s 0
+    or a transport without the seam (shm): no hold."""
+    w, tr, model, runner = make_worker("producer", hold_s=0.05)
+    waits: list = []
+    ts = {"ready": time.perf_counter() - 0.01}
+    tr.oldest_unsent_ready_ts = lambda: ts["ready"]
+
+    def wait_for_claims(deadline):
+        waits.append(deadline - time.perf_counter())
+        return 1
+
+    tr.wait_for_claims = wait_for_claims
+    w.begin_step(meta(), set(), set())
+    assert len(waits) == 1 and 0.02 < waits[0] <= 0.045
+    ts["ready"] = None  # nothing unsent
+    w.begin_step(meta(), set(), set())
+    ts["ready"] = time.perf_counter() - 1.0  # READY long ago: the window passed
+    w.begin_step(meta(), set(), set())
+    assert len(waits) == 1
+    ts["ready"] = time.perf_counter()
+    w.hold_s = 0.0
+    w.begin_step(meta(), set(), set())
+    assert len(waits) == 1
+    w.hold_s = 0.05
+    del tr.wait_for_claims  # shm shape
+    w.begin_step(meta(), set(), set())
+    assert len(waits) == 1
+    # a raising seam is logged, never takes the step down
+    tr.wait_for_claims = lambda deadline: 1 / 0
+    w.begin_step(meta(), set(), set())
+
+
+def test_hold_knob_defaults_from_env(monkeypatch):
+    monkeypatch.setenv("TT_PD_FABRIC_HOLD_S", "0.25")
+    monkeypatch.setenv("TT_PD_IMPORT_AT_BEGIN", "0")
+    monkeypatch.setenv("TT_PD_CHUNK_PUMP", "0")
+    w, *_ = make_worker("both")
+    assert w.hold_s == 0.25 and w.import_at_begin is False and w.chunk_pump is False
+    monkeypatch.delenv("TT_PD_FABRIC_HOLD_S")
+    monkeypatch.delenv("TT_PD_IMPORT_AT_BEGIN")
+    monkeypatch.delenv("TT_PD_CHUNK_PUMP")
+    w, *_ = make_worker("both")
+    assert w.hold_s == 0.05 and w.import_at_begin and w.chunk_pump
+
+
+def test_chunk_pump_is_wired_into_a_model_that_offers_the_seam():
+    """A producer whose transport pumps hands its pump to the model (run at every
+    prefill chunk boundary); no pump (shm) or chunk_pump off: nothing wired."""
+    tr, runner = FakeTransport(), FakeRunner(8)
+    tr.pump = lambda: None
+    model = FakeModel()
+    model.set_kv_transfer_pump = lambda fn: setattr(model, "pump_fn", fn)
+    kw = dict(
+        model=model,
+        is_producer=True,
+        is_consumer=False,
+        block_size=BLOCK,
+        xfer_id_fn=lambda r: xfer_id_for("p0", r),
+    )
+    w = TTKVWorker(None, runner, None, tr, **kw)
+    assert model.pump_fn == w._pump_transport
+    model2 = FakeModel()
+    model2.set_kv_transfer_pump = lambda fn: setattr(model2, "pump_fn", fn)
+    TTKVWorker(None, runner, None, tr, **{**kw, "model": model2, "chunk_pump": False})
+    assert not hasattr(model2, "pump_fn")
+    model3 = FakeModel()
+    model3.set_kv_transfer_pump = lambda fn: setattr(model3, "pump_fn", fn)
+    TTKVWorker(None, runner, None, FakeTransport(), **{**kw, "model": model3})
+    assert not hasattr(model3, "pump_fn")  # shm: no pump to hand out
+
+
+def test_consumer_imports_a_ready_claim_at_step_begin():
+    """import_at_begin: a claim answered at step begin (idle or holding producer)
+    posts its recvs + fills right there -> KV_DONE before this step's forward, one
+    step earlier than the step-end import; never imported twice."""
+    w, tr, model, runner = make_worker()
+    rm = recv_meta("r1")
+    tr.publish(rm.xfer.xfer_id)
+    w.begin_step(meta(reqs_to_recv={"r1": rm}), set(), set())
+    assert model.names() == ["import_kv_blocks", "validate_gdn_parts"]
+    assert w.loads()["r1"].state == LoadState.KV_DONE and w._syncs == [1]
+    assert "r1" in runner._remote_ready
+    w.end_step()
+    assert model.names() == ["import_kv_blocks", "validate_gdn_parts"]
+    assert w.get_finished(set()) == (None, {"r1"})
+    # a claim still gated at begin (producer mid-prefill) imports at end as before
+    rm2 = recv_meta("r2")
+    tr.publish(rm2.xfer.xfer_id)
+    gate = _claimed_then_gated(tr, {})
+    w.begin_step(meta(reqs_to_recv={"r2": rm2}), set(), set())
+    assert w.loads()["r2"].state == LoadState.PENDING_READY
+    gate["open"] = True
+    w.end_step()
+    assert w.loads()["r2"].state == LoadState.KV_DONE

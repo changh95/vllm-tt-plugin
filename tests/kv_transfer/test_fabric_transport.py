@@ -2260,3 +2260,79 @@ def test_spec_nbytes_matches_wire_layout():
     assert spec_nbytes(REC) == 3_145_728
     assert spec_nbytes(((4, 10240), "bfloat16", "ROW_MAJOR")) == 81_920
     assert spec_nbytes(((1, 4, 2048, 256), "bfloat16", "TILE")) == 4_194_304
+
+
+# --------------------------------------------------------------------------- #
+# p1d1_opt lane B: the step-begin hold seam and the zero-copy rec buffer
+# --------------------------------------------------------------------------- #
+def test_wait_for_claims_sends_at_the_claim_and_returns_at_the_deadline(tmp_path):
+    """The producer's step-begin hold: wait_for_claims pumps until a claim of a
+    published-unsent export arrives (its sends go out inside the call, marker
+    written) or the deadline passes (nothing enqueued, 0 returned);
+    oldest_unsent_ready_ts is the hold's clock (None = nothing to wait for)."""
+    world, clock, P, D = started_pair(tmp_path, kv_bufs=32, rec_sets=4)
+    rng = np.random.default_rng(3)
+    assert P.oldest_unsent_ready_ts() is None
+    assert P.wait_for_claims(time.perf_counter() + 0.02) == 0  # nothing unsent
+    publish(P, 0, manifest(), rng)
+    ts = P.oldest_unsent_ready_ts()
+    assert ts is not None and ts <= time.perf_counter()
+    t0 = time.perf_counter()
+    assert P.wait_for_claims(t0 + 0.03) == 0  # no claim: full hold, nothing sent
+    assert 0.025 <= time.perf_counter() - t0 < 1.0
+    assert world.channel.pending_sends == 0 and P.unsent_exports() == 1
+    # a claim landing during the hold is answered inside it
+    th = threading.Timer(0.02, lambda: claim(D, 0))
+    th.start()
+    t0 = time.perf_counter()
+    n = P.wait_for_claims(t0 + 2.0)
+    dt = time.perf_counter() - t0
+    th.join()
+    assert n == 1 and 0.015 <= dt < 1.0, (n, dt)
+    assert os.path.isfile(marker_path(D, 0)) and world.channel.pending_sends == 14
+    assert P.oldest_unsent_ready_ts() is None and P.unsent_exports() == 0
+    # the oldest of two unsent exports clocks the hold
+    publish(P, 1, manifest(num_tokens=100, kv_layers=1), rng)
+    t1 = P.oldest_unsent_ready_ts()
+    publish(P, 2, manifest(num_tokens=100, kv_layers=1), rng)
+    assert P.oldest_unsent_ready_ts() == t1
+    # a consumer has nothing to hold for
+    assert D.oldest_unsent_ready_ts() is None
+    assert D.wait_for_claims(time.perf_counter() + 0.01) == 0
+    g = D.open_get(Desc(xfer(0)))
+    assert g is not None and g.ready()
+    P.shutdown()
+    D.shutdown()
+
+
+def test_rec_chunk_device_tensor_is_the_received_buffer_without_a_copy(tmp_path):
+    """install_gdn_state fill_cache's the rec row straight from the received pool
+    buffer: device_tensor() hands out that buffer (same bytes as the staging copy
+    path), only for rec items and only once every K/V item was received."""
+    world, clock, P, D = started_pair(tmp_path)
+    m = manifest()
+    rng = np.random.default_rng(5)
+    h, want = publish(P, 0, m, rng)
+    claim(D, 0)
+    P.pump()
+    g = D.open_get(Desc(xfer(0)))
+    assert g is not None and g.ready()
+    rec_src = g.sources[rec_parts(m)[0].name].chunk(0)
+    with pytest.raises(RuntimeError, match="before the K/V items"):
+        rec_src.device_tensor()
+    with pytest.raises(NotImplementedError):
+        g.sources[kv_parts(m)[0].name].chunk(0).device_tensor()
+    staging = [FakeTensor.zeros(KV_HM), FakeTensor.zeros(KV_HM)]
+    import_like_hook(g, m, staging)  # every K/V item received -> the recs are posted
+    for p in rec_parts(m):
+        src = g.sources[p.name].chunk(0)
+        t = src.device_tensor()
+        assert t.spec == REC and np.array_equal(t.data, want[p.name])
+        assert t is g.sources[p.name].chunk(0).device_tensor()  # the pool buffer itself
+        st = FakeTensor.zeros(REC)
+        src.read_into_device(st)
+        assert np.array_equal(st.data, t.data)
+    D.finish_import(g, ok=True)
+    P.pump()
+    P.shutdown()
+    D.shutdown()
