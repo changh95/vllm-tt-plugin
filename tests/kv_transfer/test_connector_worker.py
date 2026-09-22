@@ -938,7 +938,7 @@ def test_producer_preopens_the_export_at_step_begin_and_exports_into_it():
     runner._req_state_slot["p1"] = 0
     log: list = []
     model.begin_export = lambda b, n, sinks: log.append(("begin", list(b), n, sinks))
-    model.end_export = lambda: log.append(("end",))
+    model.end_export = lambda sinks=None: log.append(("end", sinks))
     orig_export = model.export_request_state
     model.export_request_state = lambda b, n, s, sinks: (
         log.append(("export", sinks)),
@@ -953,12 +953,13 @@ def test_producer_preopens_the_export_at_step_begin_and_exports_into_it():
     assert tr.count("open_put") == 1 and tr.segments[xid] == "READY"
     assert [e[0] for e in log] == ["begin", "export", "end"]
     assert log[1][1] is sinks  # the pre-opened handle's sinks, not a second open
+    assert log[2][1] is sinks  # end_export closes THAT window, not whichever is open
     assert "p1" not in w._open_exports
     # a refused pre-open (pool short) is retried at step end, no begin_export
     tr.refuse_put = True
     xid2, sm2 = _save("p2")
     w.begin_step(meta(reqs_to_save={"p2": sm2}), set(), set())
-    assert "p2" not in w._open_exports and log[-1] == ("end",)
+    assert "p2" not in w._open_exports and log[-1][0] == "end"
     tr.refuse_put = False
     w.end_step()
     assert tr.count("open_put", xid2) == 2 and tr.segments[xid2] == "READY"
@@ -968,7 +969,7 @@ def test_preopened_export_of_a_request_aborted_mid_step_is_abandoned_and_closed(
     w, tr, model, runner = make_worker("producer")
     log: list = []
     model.begin_export = lambda b, n, sinks: log.append("begin")
-    model.end_export = lambda: log.append("end")
+    model.end_export = lambda sinks=None: log.append("end")
     xid, sm = _save()
     w.begin_step(meta(reqs_to_save={"p1": sm}), set(), set())
     assert log == ["begin"] and "p1" in w._open_exports
@@ -988,7 +989,7 @@ def test_producer_holds_step_begin_for_the_consumers_claim_through_the_seam():
     w, tr, model, runner = make_worker("producer", hold_s=0.05)
     waits: list = []
     ts = {"ready": time.perf_counter() - 0.01}
-    tr.oldest_unsent_ready_ts = lambda: ts["ready"]
+    tr.newest_unsent_ready_ts = lambda: ts["ready"]
 
     def wait_for_claims(deadline):
         waits.append(deadline - time.perf_counter())
@@ -1034,7 +1035,9 @@ def test_chunk_pump_is_wired_into_a_model_that_offers_the_seam():
     tr, runner = FakeTransport(), FakeRunner(8)
     tr.pump = lambda: None
     model = FakeModel()
-    model.set_kv_transfer_pump = lambda fn: setattr(model, "pump_fn", fn)
+    model.set_kv_transfer_pump = lambda fn, wants=None: setattr(
+        model, "pump_fn", (fn, wants)
+    )
     kw = dict(
         model=model,
         is_producer=True,
@@ -1043,7 +1046,18 @@ def test_chunk_pump_is_wired_into_a_model_that_offers_the_seam():
         xfer_id_fn=lambda r: xfer_id_for("p0", r),
     )
     w = TTKVWorker(None, runner, None, tr, **kw)
-    assert model.pump_fn == w._pump_transport
+    assert model.pump_fn == (w._pump_transport, w._pump_could_send)
+    # wants(): a published export waiting for its claim (transport.unsent_exports)
+    assert w._pump_could_send() is True  # no seam on the FakeTransport: conservative
+    tr.unsent_exports = lambda: 0
+    assert w._pump_could_send() is False
+    tr.unsent_exports = lambda: 2
+    assert w._pump_could_send() is True
+    # an older model seam without the wants argument still gets the pump
+    model_old = FakeModel()
+    model_old.set_kv_transfer_pump = lambda fn: setattr(model_old, "pump_fn", fn)
+    w_old = TTKVWorker(None, runner, None, tr, **{**kw, "model": model_old})
+    assert model_old.pump_fn == w_old._pump_transport
     model2 = FakeModel()
     model2.set_kv_transfer_pump = lambda fn: setattr(model2, "pump_fn", fn)
     TTKVWorker(None, runner, None, tr, **{**kw, "model": model2, "chunk_pump": False})
@@ -1077,3 +1091,29 @@ def test_consumer_imports_a_ready_claim_at_step_begin():
     gate["open"] = True
     w.end_step()
     assert w.loads()["r2"].state == LoadState.KV_DONE
+
+
+def test_preopen_rearms_the_model_when_the_export_is_already_open():
+    """A forward that raised leaves the pre-opened handle in place; the request's next
+    prefill step must re-arm the model on the SAME sinks (open_put would refuse the
+    in-flight xfer), so its chunk bookkeeping restarts instead of skipping the chunks
+    the failed run mirrored (review finding 5)."""
+    w, tr, model, runner = make_worker("producer")
+    runner._req_state_slot["p1"] = 0
+    log: list = []
+    model.begin_export = lambda b, n, sinks: log.append(("begin", sinks))
+    model.end_export = lambda sinks=None: log.append(("end", sinks))
+    xid, sm = _save()
+    w.begin_step(meta(reqs_to_save={"p1": sm}), set(), set())
+    h = w._open_exports["p1"]
+    assert tr.count("open_put", xid) == 1 and log == [("begin", h.sinks)]
+    # the forward raised: no end_step. The next step schedules the same save again.
+    w.begin_step(meta(reqs_to_save={"p1": sm}), set(), set())
+    assert tr.count("open_put", xid) == 1  # no second open_put for an open handle
+    assert w._open_exports["p1"] is h and log == [
+        ("begin", h.sinks),
+        ("begin", h.sinks),
+    ]
+    w.end_step()
+    assert tr.segments[xid] == "READY" and log[-1] == ("end", h.sinks)
+    assert "p1" not in w._open_exports

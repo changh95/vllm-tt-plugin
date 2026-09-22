@@ -345,6 +345,15 @@ def check_config_for_role(cfg: Any, ctx: RankContext) -> dict[str, Any]:
                 # DEBUG knob: visible here so a leaked value shows in the boot
                 # summary, not only in the transport's WARNING deep in the log
                 "TT_PD_FABRIC_SKIP_WARMUP",
+                # p1d1_opt lane B handoff / claim-wait knobs
+                # (profiles/p1d1_opt/laneB_RESULTS.md section 2)
+                "TT_PD_FABRIC_HOLD_S",
+                "TT_PD_IMPORT_AT_BEGIN",
+                "TT_PD_CHUNK_PUMP",
+                "TT_PD_CHUNK_SYNC",
+                "TT_PD_EXPORT_MIRROR",
+                "TT_PD_TAPS_WRITE",
+                "TT_PD_TAPS_SPLIT",
             )
         },
     }
