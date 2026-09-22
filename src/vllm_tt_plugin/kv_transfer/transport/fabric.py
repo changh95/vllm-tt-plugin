@@ -205,7 +205,7 @@ from .shm import (
     RELEASED,
     ShmTransport,
     parse_xfer_id,
-    pid_alive,
+    pid_wrote_at,
     read_header,
     write_status,
 )
@@ -1189,10 +1189,20 @@ class FabricSocketTransport(TTKVTransport):
                 peer = None  # being written / unreadable: retry
             if peer is not None:
                 pid = peer.get("pid")
-                if isinstance(pid, int) and pid > 0 and not pid_alive(pid):
+                try:
+                    written_at: float | None = os.stat(p).st_mtime
+                except OSError:
+                    written_at = None
+                # a dead writer, or a pid that is alive again but started AFTER the
+                # file was written (pid reuse; a restarted container replays pids)
+                if (
+                    isinstance(pid, int)
+                    and pid > 0
+                    and not pid_wrote_at(pid, written_at)
+                ):
                     logger.warning(
-                        "fabric rendezvous: %s was left by a dead process (pid %d); "
-                        "removing it and waiting for the peer of this run",
+                        "fabric rendezvous: %s was left by a dead or replaced process "
+                        "(pid %d); removing it and waiting for the peer of this run",
                         p,
                         pid,
                     )

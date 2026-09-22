@@ -1843,3 +1843,36 @@ def test_configure_torch_threads_restores_the_forked_engines_count_under_mpi():
             rank_mod.configure_torch_threads(
                 value=bad, torch_module=_FakeTorch(1), env={}
             )
+
+
+def test_engine_lock_treats_a_replayed_pid_as_stale(tmp_path):
+    """A restarted container replays the same pids, so a lock left by a dead rank
+    can name a pid that is alive again: the holder must have started before the
+    lock was written (2026-09-22: the p1d1 container refused to restart because
+    the previous run's decode lock named pid 358 = the new decode rank's pid)."""
+    seg = str(tmp_path / "ctrl")
+    os.makedirs(seg)
+    path = lc.engine_lock_path(seg, "d-x")
+    me = os.getpid()
+    with open(path, "w") as f:
+        json.dump(
+            {
+                "pid": me,
+                "engine_id": "d-x",
+                "role": "decode",
+                "tag": "x",
+                "created_ts": 1.0,
+            },
+            f,
+        )
+    assert (
+        lc.engine_in_use(seg, "d-x") is None
+    )  # alive pid, but it could not have written this
+    lock = lc.EngineLock(
+        seg, "d-x", role="decode", tag="x"
+    ).acquire()  # replaces the stale file
+    with open(path) as f:
+        assert json.load(f)["created_ts"] > 1.0
+    assert lc.engine_in_use(seg, "d-x") is not None  # our own fresh lock IS live
+    lock.release()
+    assert not os.path.exists(path)

@@ -62,7 +62,13 @@ from ..transport.fabric import (
     export_pool_bytes,
     max_export_kv_buffers,
 )
-from ..transport.shm import CONSUMER_PID_FILE, parse_xfer_id, pid_alive, read_header
+from ..transport.shm import (
+    CONSUMER_PID_FILE,
+    parse_xfer_id,
+    pid_alive,
+    pid_wrote_at,
+    read_header,
+)
 
 # --------------------------------------------------------------------------- #
 # role table
@@ -859,7 +865,8 @@ def read_engine_lock(path: str) -> dict[str, Any] | None:
 def engine_in_use(segment_dir: str, engine_id: str) -> str | None:
     """Why ``(segment_dir, engine_id)`` belongs to a LIVE process, else ``None``.
 
-    1. its lock file names a live pid (an engine started by ``pd_fabric_rank``);
+    1. its lock file names a live pid that started before the lock was written
+       (an engine started by ``pd_fabric_rank``; a replayed/reused pid is stale);
     2. a segment under ``{segment_dir}/{engine_id}`` has a live header
        ``producer_pid`` (a lock-less producer: ``run_pd_pair.sh``'s ``vllm serve``);
     3. a ``.claimed-*`` dir there names a live ``consumer.pid`` (a new producer's
@@ -869,7 +876,11 @@ def engine_in_use(segment_dir: str, engine_id: str) -> str | None:
     """
     lock_path = engine_lock_path(segment_dir, engine_id)
     lock = read_engine_lock(lock_path)
-    if lock is not None and pid_alive(int(lock.get("pid", 0) or 0)):
+    # (pid, created_ts): a pid is reused after a crash and REPLAYED by a restarted
+    # container, so the holder must also have started before it wrote the lock
+    if lock is not None and pid_wrote_at(
+        int(lock.get("pid", 0) or 0), lock.get("created_ts")
+    ):
         return (
             f"lock {lock_path} held by live pid {lock['pid']} "
             f"(role {lock.get('role')!r}, tag {lock.get('tag')!r})"

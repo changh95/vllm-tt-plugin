@@ -399,6 +399,51 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def proc_start_time(pid: int) -> float | None:
+    """Wall-clock start time of ``pid`` from ``/proc`` (Linux), else ``None``.
+
+    Field 22 of ``/proc/<pid>/stat`` (clock ticks since boot) plus ``btime`` of
+    ``/proc/stat``.  ``None`` when the process is gone or /proc is unavailable.
+    """
+    if pid <= 0:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        with open("/proc/stat") as f:
+            btime = next(int(ln.split()[1]) for ln in f if ln.startswith("btime "))
+        ticks = os.sysconf("SC_CLK_TCK")
+    except (OSError, StopIteration, ValueError, AttributeError):
+        return None
+    # comm (field 2) may contain spaces and parentheses: split after the last ')'
+    rest = stat[stat.rfind(")") + 2 :].split()
+    try:
+        return btime + int(rest[19]) / float(ticks)
+    except (IndexError, ValueError):
+        return None
+
+
+def pid_wrote_at(pid: int, ts: float | None, slack_s: float = 5.0) -> bool:
+    """``True`` when a LIVE process ``pid`` can be the writer of a record written
+    at wall time ``ts``: alive, and started no later than ``ts`` (plus slack).
+
+    A pid alone is not an identity: after a crash the same pid is reused, and a
+    container restart replays the same pids (its process tree is deterministic),
+    so a lock / rendezvous file left by a dead process can name a pid that is
+    alive again.  A process cannot have written a file before it started, which
+    tells the two apart.  Without ``/proc`` (start time unknown) or without a
+    timestamp this degrades to ``pid_alive``.
+    """
+    if not pid_alive(pid):
+        return False
+    if ts is None:
+        return True
+    started = proc_start_time(pid)
+    if started is None:
+        return True
+    return started <= float(ts) + slack_s
+
+
 # --- crc32c -------------------------------------------------------------------------
 
 try:  # pragma: no cover - optional accelerator

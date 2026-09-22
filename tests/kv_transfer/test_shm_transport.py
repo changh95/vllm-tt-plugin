@@ -1115,3 +1115,20 @@ def test_dumpfile_taps_rows_file_is_compact_for_a_view_of_a_larger_storage(tmp_p
     back = torch.load(path, weights_only=True)
     assert torch.equal(back, big[3]) and back.untyped_storage().nbytes() == nb
     assert st.written == {"gdn.L3.taps": {0}}
+
+
+# --- process identity: pid + start time (pid reuse / container pid replay) ------------
+def test_proc_start_time_and_pid_wrote_at_for_our_own_process():
+    from vllm_tt_plugin.kv_transfer.transport.shm import pid_wrote_at, proc_start_time
+
+    me = os.getpid()
+    started = proc_start_time(me)
+    assert started is not None and started <= time.time()
+    # we started before "now": we can be the writer of a record written now
+    assert pid_wrote_at(me, time.time()) is True
+    # ...but not of a record written long before our process existed
+    assert pid_wrote_at(me, started - 3600.0) is False
+    # unknown timestamp degrades to liveness
+    assert pid_wrote_at(me, None) is True
+    assert pid_wrote_at(2**22 + 12345, time.time()) is False
+    assert proc_start_time(2**22 + 12345) is None

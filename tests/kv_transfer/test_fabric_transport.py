@@ -2421,3 +2421,27 @@ def test_rendezvous_consumer_waits_for_producer(tmp_path):
     finally:
         t.join()
     assert D._recv_epoch == "e1" and D.pending_receive_seq() == 0
+
+
+def test_rendezvous_ignores_a_replayed_pids_leftover(tmp_path):
+    """The leftover names a LIVE pid (ours) but was written before that process
+    started (pid replay after a container restart): stale, replaced by the peer."""
+    world, clock, P, D = make_pair(tmp_path)
+    P.cfg.socket_timeout_s = 5.0
+    stale = _peer_file(P, "consumer", os.getpid())
+    old = time.time() - 7 * 24 * 3600
+    os.utime(stale, (old, old))
+    seen = []
+
+    def fresh():
+        seen.append(_peer_file(P, "consumer", os.getpid()))
+
+    t = threading.Timer(0.3, fresh)
+    t.start()
+    try:
+        P._read_peer_rendezvous()
+    finally:
+        t.join()
+    assert (
+        seen and os.stat(stale).st_mtime > old + 1
+    )  # the fresh file replaced the stale one
