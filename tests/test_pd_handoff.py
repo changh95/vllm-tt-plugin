@@ -715,10 +715,11 @@ def test_consumer_derives_num_tokens_when_the_proxy_omits_it():
 
 
 def test_producer_delays_the_free_for_a_stopped_first_token():
-    """P's one-token completion may finish STOPPED (EOS / stop string as the first token): the worker still stages
-    it in that step, so the free must be delayed exactly as for the length-capped case -- vLLM asserts that every
-    finished_sending id is still tracked (scheduler._update_from_kv_xfer_finished), and 2026-09-22's grid lost P's
-    engine to that assert."""
+    """P's one-token completion may finish STOPPED (EOS / stop string as the first
+    token): the worker still stages it in that step, so the free must be delayed
+    exactly as for the length-capped case -- vLLM asserts that every finished_sending
+    id is still tracked (scheduler._update_from_kv_xfer_finished), and 2026-09-22's
+    grid lost P's engine to that assert."""
     sched = _SchedulerSide(_connector_stub(True, 18100))
     req = _request("chatcmpl-eos-1a2b3c4d", {"do_remote_decode": True}, 9)
     req.status = RequestStatus.FINISHED_STOPPED
