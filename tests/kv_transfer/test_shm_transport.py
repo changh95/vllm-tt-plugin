@@ -1077,3 +1077,41 @@ def test_janitor_renames_before_rmtree_so_a_racing_claim_misses(tmp_path, monkey
     P.janitor_once()
     assert seen == [(f"{XFER_HEX}{shm.EXPIRED_MARK}{os.getpid()}", "MISSING", False)]
     assert P.stats["swept"] == 1 and list(edir.iterdir()) == []
+
+
+def test_dumpfile_taps_rows_file_is_compact_for_a_view_of_a_larger_storage(tmp_path):
+    """The hook hands the taps sink a slice of its batched [n_layers, K, D] read;
+    torch.save would serialize the view's WHOLE 3.75 MiB storage per part (48 x =
+    50 ms on the prefill node, py-spy 2026-09-22). The sink writes a compact 80 KiB
+    file either way."""
+    import os
+
+    import torch
+
+    from vllm_tt_plugin.kv_transfer.metadata import PartSpec
+    from vllm_tt_plugin.kv_transfer.transport.shm import DumpfileSink, _PutState
+
+    nb = 4 * 10240 * 2
+    spec = PartSpec(
+        name="gdn.L3.taps",
+        kind="gdn_taps",
+        shape=(4, 10240),
+        dtype="bfloat16",
+        layout="ROW_MAJOR",
+        nchunks=1,
+        chunk_nbytes=nb,
+        chunk_offsets=[0],
+        nbytes=nb,
+    )
+    st = _PutState(
+        "p:0", "0" * 32, str(tmp_path), str(tmp_path / "header"), None, 0, 0.0
+    )
+    sink = DumpfileSink(spec, str(tmp_path), None, st)
+    big = torch.randn(48, 4, 10240).to(torch.bfloat16)
+    sink.write_rows(big[3])  # a view sharing the 3.75 MiB storage
+    path = tmp_path / "gdn.L3.taps.rows.pt"
+    size = os.path.getsize(path)
+    assert size < 2 * nb, size  # 80 KiB + pickle overhead, not 3.75 MiB
+    back = torch.load(path, weights_only=True)
+    assert torch.equal(back, big[3]) and back.untyped_storage().nbytes() == nb
+    assert st.written == {"gdn.L3.taps": {0}}

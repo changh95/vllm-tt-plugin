@@ -658,10 +658,12 @@ class DumpfileSink(Sink):
         import torch  # noqa: PLC0415
 
         _check_rows(rows, self.spec)
-        torch.save(
-            rows.contiguous().cpu(),
-            os.path.join(self._dir, f"{self.spec.name}.rows.pt"),
-        )
+        rows = rows.detach().contiguous().cpu()
+        if rows.untyped_storage().nbytes() != rows.numel() * rows.element_size():
+            # a view of a larger storage (the hook's batched taps read): torch.save
+            # serializes the WHOLE storage, 3.75 MiB instead of 80 KiB per part
+            rows = rows.clone()
+        torch.save(rows, os.path.join(self._dir, f"{self.spec.name}.rows.pt"))
         self._st.note(self.spec.name, 0)
 
     def write_host(self, host_tensor: Any, *, chunk: int) -> None:
