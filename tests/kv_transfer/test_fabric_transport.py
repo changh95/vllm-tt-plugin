@@ -2269,13 +2269,13 @@ def test_wait_for_claims_sends_at_the_claim_and_returns_at_the_deadline(tmp_path
     """The producer's step-begin hold: wait_for_claims pumps until a claim of a
     published-unsent export arrives (its sends go out inside the call, marker
     written) or the deadline passes (nothing enqueued, 0 returned);
-    oldest_unsent_ready_ts is the hold's clock (None = nothing to wait for)."""
+    newest_unsent_ready_ts is the hold's clock (None = nothing to wait for)."""
     world, clock, P, D = started_pair(tmp_path, kv_bufs=32, rec_sets=4)
     rng = np.random.default_rng(3)
-    assert P.oldest_unsent_ready_ts() is None
+    assert P.newest_unsent_ready_ts() is None
     assert P.wait_for_claims(time.perf_counter() + 0.02) == 0  # nothing unsent
     publish(P, 0, manifest(), rng)
-    ts = P.oldest_unsent_ready_ts()
+    ts = P.newest_unsent_ready_ts()
     assert ts is not None and ts <= time.perf_counter()
     t0 = time.perf_counter()
     assert P.wait_for_claims(t0 + 0.03) == 0  # no claim: full hold, nothing sent
@@ -2290,14 +2290,30 @@ def test_wait_for_claims_sends_at_the_claim_and_returns_at_the_deadline(tmp_path
     th.join()
     assert n == 1 and 0.015 <= dt < 1.0, (n, dt)
     assert os.path.isfile(marker_path(D, 0)) and world.channel.pending_sends == 14
-    assert P.oldest_unsent_ready_ts() is None and P.unsent_exports() == 0
-    # the oldest of two unsent exports clocks the hold
+    assert P.newest_unsent_ready_ts() is None and P.unsent_exports() == 0
+    # the NEWEST of two unsent exports clocks the hold (review finding 2: an orphan
+    # published long ago must not disable the hold for a fresh export)
     publish(P, 1, manifest(num_tokens=100, kv_layers=1), rng)
-    t1 = P.oldest_unsent_ready_ts()
+    t1 = P.newest_unsent_ready_ts()
+    P._exports[
+        xfer(1)
+    ].ready_ts -= 100.0  # the orphan: READY 100 s "ago", never claimed
+    assert P.newest_unsent_ready_ts() == t1 - 100.0
     publish(P, 2, manifest(num_tokens=100, kv_layers=1), rng)
-    assert P.oldest_unsent_ready_ts() == t1
+    t2 = P.newest_unsent_ready_ts()
+    assert t2 > t1 - 50.0 and t2 <= time.perf_counter()
+    # ... and the hold waits for the fresh export's claim although the orphan is stale
+    th = threading.Timer(0.02, lambda: claim(D, 2))
+    th.start()
+    t0 = time.perf_counter()
+    n = P.wait_for_claims(t2 + 2.0)
+    th.join()
+    assert n == 1 and 0.015 <= time.perf_counter() - t0 < 1.0
+    assert (
+        os.path.isfile(marker_path(D, 2)) and P.unsent_exports() == 1
+    )  # the orphan stays
     # a consumer has nothing to hold for
-    assert D.oldest_unsent_ready_ts() is None
+    assert D.newest_unsent_ready_ts() is None
     assert D.wait_for_claims(time.perf_counter() + 0.01) == 0
     g = D.open_get(Desc(xfer(0)))
     assert g is not None and g.ready()

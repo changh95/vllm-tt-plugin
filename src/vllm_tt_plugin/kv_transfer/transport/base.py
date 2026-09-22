@@ -407,6 +407,12 @@ class SourceChunk(ABC):
     def read_device(self, mesh_device: Any) -> Any:
         """dumpfile: materialize a fresh device tensor of ``spec.shape``."""
 
+    def device_tensor(self) -> Any:
+        """OPTIONAL (fabric rec items): the received device buffer ITSELF, valid until
+        ``finish_import`` / ``release_remote``; the hook reads it in place (no staging
+        copy).  Default: unsupported -> the hook uses ``read_into_device``."""
+        raise NotImplementedError("device_tensor is not offered by this transport")
+
 
 class Source(ABC):
     spec: PartSpec
@@ -444,6 +450,28 @@ class GetHandle:
 
     def ready(self) -> bool:
         return self.status == "READY"
+
+
+# OPTIONAL transport seams (duck-typed: the worker probes them with ``getattr``; shm
+# offers none, fabric all).  Every device op among them runs on the ENGINE THREAD only.
+#   pump() -> None: the claim-gated protocol's clock (step end, idle ticker, chunk
+#       boundary)
+#   wants_pump() -> bool: host-only, would pump() have something to do soon?
+#   unsent_exports() -> int: published exports waiting for their consumer's claim
+#   newest_unsent_ready_ts() -> float | None: perf_counter of the newest unsent
+#       export's READY publish (the step-begin hold's clock)
+#   wait_for_claims(deadline) -> int: pump until a claim arrived (its sends enqueued)
+#       or the deadline passed; the number of exports sent
+#   claim_deadline(xfer_id) -> float | None: consumer, the pending claim's lease
+#       deadline (worker _poll_ready)
+OPTIONAL_TRANSPORT_SEAMS = (
+    "pump",
+    "wants_pump",
+    "unsent_exports",
+    "newest_unsent_ready_ts",
+    "wait_for_claims",
+    "claim_deadline",
+)
 
 
 class TTKVTransport(ABC):

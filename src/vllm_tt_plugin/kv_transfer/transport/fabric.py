@@ -2274,9 +2274,12 @@ class FabricSocketTransport(TTKVTransport):
             peer = self.peer_engine_id
             return peer is not None and bool(self._list_markers(peer))
 
-    def oldest_unsent_ready_ts(self) -> float | None:
+    def newest_unsent_ready_ts(self) -> float | None:
         """Producer, host-only: ``time.perf_counter()`` of the READY publish of the
-        oldest export still waiting for its consumer's claim (None when none)."""
+        NEWEST export still waiting for its consumer's claim (None when none).  The
+        step-begin hold is clocked from it: an older orphan (a demoted / rejected
+        handoff nobody claims until the janitor sweeps it at lease expiry) must not
+        disable the hold for the exports published after it."""
         if not self._started or not self.is_producer:
             return None
         with self._lock:
@@ -2285,7 +2288,7 @@ class FabricSocketTransport(TTKVTransport):
                 for e in self._exports.values()
                 if e.published and not e.sent and not e.abandoned and e.ready_ts
             ]
-        return min(ts) if ts else None
+        return max(ts) if ts else None
 
     def wait_for_claims(self, deadline: float, poll_s: float = 0.0005) -> int:
         """Producer, ENGINE THREAD ONLY (device ops): pump repeatedly until a claim
@@ -2298,13 +2301,14 @@ class FabricSocketTransport(TTKVTransport):
         n = 0
         while True:
             n += self._send_claimed()
-            if n or self.oldest_unsent_ready_ts() is None:
-                self._reclaim()
-                return n
+            if n or self.unsent_exports() == 0:
+                break
             now = time.perf_counter()
             if now >= deadline:
-                return n
+                break
             time.sleep(min(poll_s, deadline - now))
+        self._reclaim()
+        return n
 
     def pending_receive_seq(self) -> int:
         return self._next_recv_seq

@@ -200,8 +200,40 @@ HOOK_METHODS = (
 )
 
 
+@runtime_checkable
+class TTKVMirrorSeams(Protocol):
+    """OPTIONAL producer seams (p1d1_opt lane B; the Qwen hook implements them, the
+    worker probes them with ``getattr`` and falls back to the step-end gather):
+
+    * ``begin_export(block_ids, num_tokens, sinks) -> bool`` at step BEGIN, before the
+      request's prefill: the model mirrors every prefill chunk's K/V into ``sinks``
+      as it goes (True = mirror active, False = ``export_request_state`` gathers all).
+    * ``end_export(sinks=None)`` closes that window (``sinks``: only if it is the open
+      one; a stale close must not drop a newer window).
+    * ``set_kv_transfer_pump(fn, wants=None)``: ``fn()`` (the transport pump) runs on
+      the engine thread at every non-final prefill chunk boundary; ``wants()`` is a
+      host-only check whether it could send anything now (gates the per-chunk device
+      sync).  See ``M/kv_transfer.py`` for the model side."""
+
+    def begin_export(
+        self, block_ids: list[int], num_tokens: int, sinks: Mapping[str, Any]
+    ) -> bool: ...
+
+    def end_export(self, sinks: Mapping[str, Any] | None = None) -> None: ...
+
+    def set_kv_transfer_pump(self, fn: Any, wants: Any = None) -> None: ...
+
+
+MIRROR_METHODS = ("begin_export", "end_export", "set_kv_transfer_pump")
+
+
 def implements_kv_transfer(model: Any) -> bool:
     return all(callable(getattr(model, m, None)) for m in HOOK_METHODS)
+
+
+def implements_kv_mirror(model: Any) -> bool:
+    """Every optional mirror seam present (informational; the worker probes each)."""
+    return all(callable(getattr(model, m, None)) for m in MIRROR_METHODS)
 
 
 class DefaultKVTransferable:

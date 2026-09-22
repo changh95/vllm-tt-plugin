@@ -195,8 +195,25 @@ class TTKVWorker:
         if getattr(self.transport, "pump", None) is None:
             return
         fn = getattr(self.model, "set_kv_transfer_pump", None)
-        if callable(fn):
+        if not callable(fn):
+            return
+        try:
+            fn(self._pump_transport, wants=self._pump_could_send)
+        except TypeError:  # an older model seam without the wants() argument
             fn(self._pump_transport)
+
+    def _pump_could_send(self) -> bool:
+        """Host-only: is a published export waiting for its claim? The model syncs the
+        device before a chunk boundary only then (the pump has nothing to do otherwise
+        and a prefill without a pending handoff keeps its host/device pipelining)."""
+        fn = getattr(self.transport, "unsent_exports", None)
+        if fn is None:
+            return True
+        try:
+            return int(fn()) > 0
+        except Exception:
+            logger.exception("PD: transport.unsent_exports() raised")
+            return True
 
     # ------------------------------------------------------------------ #
     # small helpers
@@ -322,17 +339,30 @@ class TTKVWorker:
                 self._preopen_export(r, s)
 
     def _preopen_export(self, r: str, s: SaveMeta) -> None:
-        try:
-            manifest = self.model.describe_request_state(s.num_tokens, s.block_ids)
-            h = self.transport.open_put(s.xfer_id, manifest)
-        except Exception:
-            logger.exception(
-                "PD: pre-open of %s at step begin failed; opening at step end", r
-            )
-            return
+        h = self._open_exports.get(r)
         if h is None:
-            return  # refused now (pool short): _run_exports retries at step end
-        self._open_exports[r] = h
+            try:
+                manifest = self.model.describe_request_state(s.num_tokens, s.block_ids)
+                h = self.transport.open_put(s.xfer_id, manifest)
+            except Exception:
+                logger.exception(
+                    "PD: pre-open of %s at step begin failed; opening at step end", r
+                )
+                return
+            if h is None:
+                return  # refused now (pool short): _run_exports retries at step end
+            self._open_exports[r] = h
+        else:
+            # a handle from an earlier step (a forward that raised and is re-run):
+            # open_put would refuse the in-flight xfer; re-arm the model on the same
+            # sinks so its chunk bookkeeping starts fresh instead of skipping the
+            # chunks the earlier run mirrored
+            logger.warning(
+                "PD: %s already has an open export (%s) from an earlier step; "
+                "re-arming the model on it",
+                r,
+                h.xfer_id,
+            )
         begin = getattr(self.model, "begin_export", None)
         if callable(begin):
             try:
@@ -343,14 +373,22 @@ class TTKVWorker:
                 )
 
     def _drop_open_export(self, r: str) -> None:
-        if self._open_exports.pop(r, None) is not None:
-            self._end_model_export()
+        h = self._open_exports.pop(r, None)
+        if h is not None:
+            self._end_model_export(h.sinks)
 
-    def _end_model_export(self) -> None:
+    def _end_model_export(self, sinks: Any = None) -> None:
+        """Close the model's export window -- only the window opened on ``sinks`` (a
+        stale close never drops a newer window; ``None`` closes whichever is open)."""
         fn = getattr(self.model, "end_export", None)
         if callable(fn):
             try:
-                fn()
+                fn(sinks)
+            except TypeError:  # an older model seam without the sinks argument
+                try:
+                    fn()
+                except Exception:
+                    logger.exception("PD: model.end_export raised")
             except Exception:
                 logger.exception("PD: model.end_export raised")
 
@@ -361,12 +399,15 @@ class TTKVWorker:
         if self.hold_s <= 0:
             return
         wait = getattr(self.transport, "wait_for_claims", None)
-        oldest = getattr(self.transport, "oldest_unsent_ready_ts", None)
-        if wait is None or oldest is None:
+        newest = getattr(self.transport, "newest_unsent_ready_ts", None)
+        if wait is None or newest is None:
             return
         t0 = time.perf_counter()
         try:
-            ts = oldest()
+            # clocked from the NEWEST unsent export: an orphan published up to 30 s ago
+            # (nobody claims it until the janitor sweeps it) must not disable the hold
+            # for the export published at the previous step's end
+            ts = newest()
             if ts is None:
                 return
             deadline = float(ts) + self.hold_s
@@ -612,7 +653,7 @@ class TTKVWorker:
                     self.transport.finish_export(h, "READY" if ok else "FAILED")
             except Exception:
                 logger.exception("PD: export of %s failed before the data plane", r)
-            self._end_model_export()
+            self._end_model_export(getattr(h, "sinks", None))
             ms = (time.perf_counter() - t0) * 1e3
             self._step_device_ms += ms
             self._step_touched.add(r)
