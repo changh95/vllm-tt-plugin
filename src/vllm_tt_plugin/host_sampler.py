@@ -14,10 +14,13 @@ with the k-th value, which the upstream path keeps too), applies the identical
 top-k / top-p masking rule on that compact ascending-sorted set, and samples with
 the same exponential-race estimator over the compact probabilities. The surviving
 token set, their probabilities and therefore the sampling distribution are those of
-the upstream path (the only differences are fp32 reduction order in the softmax /
-cumsum and the noise stream: the per-request generator now draws ``top_k + 32``
-values instead of a full row, so a *seeded* random request produces a different --
-still deterministic -- stream than upstream did). Rows with more than
+the upstream path (the only difference is fp32 reduction order in the softmax /
+cumsum). A *seeded* request draws its noise exactly as upstream does (a
+full-vocabulary row from the request's generator, keeping the candidates' values),
+so seeded sampling reproduces upstream token for token -- except when the top-p
+boundary falls inside a group of equal logits, where upstream itself keeps an
+arbitrary (torch.sort order) subset of the group; unseeded rows draw noise for the
+candidates only. Rows with more than
 ``top_k + 32`` tied candidates, top_k == vocab (no top-k), or a ``logprobs_mode``
 that needs the processed full-vocab logits fall back to the upstream path.
 Greedy rows never reach this code (``Sampler.sample`` argmaxes them first).
@@ -99,13 +102,20 @@ class TTTopKTopPSampler(TopKTopPSampler):
             asc = asc.masked_fill(top_p_mask, -float("inf"))
             comp = asc.flip(1)
         probs = comp.softmax(dim=-1, dtype=torch.float32)
-        q = torch.empty_like(
-            probs, dtype=torch.float64 if self.use_fp64_gumbel else torch.float32
-        )
+        q_dtype = torch.float64 if self.use_fp64_gumbel else torch.float32
+        q = torch.empty_like(probs, dtype=q_dtype)
         if len(generators) != probs.shape[0]:
+            # Unseeded rows: exponential noise for the candidates only (the global
+            # RNG stream is not reproducible across requests anyway).
             q.exponential_()
         for i, generator in generators.items():
-            q[i].exponential_(generator=generator)
+            # Seeded rows draw exactly what upstream draws -- a full-vocabulary row
+            # from the request's generator (q[i].exponential_(generator=...)) -- and
+            # keep the values at the candidate token ids, so the generator advances
+            # identically and the sampled stream equals upstream's token for token.
+            # Costs ~3 ms per seeded row; unseeded rows keep the compact draw.
+            row = torch.empty(vocab, dtype=q_dtype).exponential_(generator=generator)
+            q[i] = row[top_idx[i]]
         pick = probs.div_(q.to(probs.dtype)).argmax(dim=-1, keepdim=True)
         self.compact_steps += 1
         return top_idx.gather(1, pick).squeeze(1), None
