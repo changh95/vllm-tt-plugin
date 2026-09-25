@@ -28,7 +28,38 @@ decoders in the returned ``kv_transfer_params``; a consumer needs no static port
 proxy may pick the ``transfer_id`` itself (``kv_transfer_params.transfer_id`` on the
 producer request; the producer echoes it) and post to the consumer before the
 producer has answered: the consumer derives ``num_tokens`` from its own tokenization
-and its GET blocks on the side channel until the producer has staged."""
+and its GET blocks on the side channel until the producer has staged.
+
+Payload format (``pack_payload`` / ``unpack_payload``; ``header["version"]`` = 2). One
+uint8 buffer, tensors back to back in this order, each described by a header entry
+``{name, dtype, shape, offset, nbytes}``::
+
+  kv.<li>.k, kv.<li>.v  li = 0..n_attn_layers-1: the model's full-attention layers
+                        in model order (Qwen3.x: 16), each [n_blocks, n_dev *
+                        n_local_kv_heads, block_size, head_dim] bf16, dim 0 in the
+                        request's block-id order, dim 1 device-major
+                        (pd_transfer.export_kv_blocks)
+  mtp.kv.<j>.k/.v       j = 0..mtp.n_layers-1 (version 2, only with speculative
+                        decoding configured on the producer): the MTP drafter's own
+                        KV layer(s), same shape/order -- the 17th attention layer of
+                        pd_transfer._attention_layers
+  gdn.rec               [n_dev, L, Nv, Dk, Dv] fp32, the GDN recurrent state of the
+                        L linear-attention layers, device-major
+  gdn.taps              [n_dev, L, K, C] bf16, the K causal-conv taps
+  mtp.hidden            (version 2, with speculative decoding) [dim] bf16: the main
+                        model's post-final-norm hidden row at the last prefilled
+                        position, the drafter's first-step input
+                        (MTPHead.set_hidden_in on the decoder)
+
+Header fields: ``num_tokens`` (the producer's prefilled length), ``n_blocks``,
+``n_attn_layers`` (main layers only, so a version-1 consumer, which reads ``kv.<li>``
+for li < n_attn_layers and ignores unknown names, still decodes a version-2 payload),
+``n_gdn_layers``, ``n_conv``, ``nbytes``, ``tensors`` and, when present, ``mtp`` =
+``{"n_layers": <int>, "hidden": <bool>}``. A version-2 consumer without an MTP head
+imports the main layers only; one with a head fed by a version-1 payload leaves the
+head's blocks zero and gets no hidden row (``unpack_mtp_hidden`` -> None), so it must
+not draft for that request.  The bytes are staged once per request and pulled or
+mapped as-is."""
 
 from __future__ import annotations
 
@@ -203,6 +234,9 @@ def _check_gdn_snapshot(rec_snap, conv_snap) -> None:
         )
 
 
+PAYLOAD_VERSION = 2
+
+
 def pack_payload(
     kv,
     rec_snap,
@@ -210,15 +244,32 @@ def pack_payload(
     num_tokens: int,
     n_blocks: int,
     out: torch.Tensor | None = None,
+    mtp_hidden: torch.Tensor | None = None,
+    n_mtp_layers: int = 0,
 ):
     """Pack one request's KV pairs (per attention layer) and GDN snapshot into one uint8
-    buffer.  Returns ``(buffer, header)``; ``header`` describes every tensor (name,
-    dtype, shape, offset). With ``out`` (a pooled buffer of at least the payload
-    size) the bytes are written into ``out`` and ``out`` is returned; use
-    ``payload_nbytes`` to size it. The GDN snapshot travels as two tensors,
-    ``gdn.rec`` ``[n_dev, L, Nv, Dk, Dv]`` and ``gdn.taps`` ``[n_dev, L, K, C]``
-    (device-major: one memcpy each here, one borrowed upload each on the decoder)."""
+    buffer (the module docstring has the layout).  Returns ``(buffer, header)``;
+    ``header`` describes every tensor (name, dtype, shape, offset). With ``out`` (a
+    pooled buffer of at least the payload size) the bytes are written into ``out`` and
+    ``out`` is returned; use ``payload_nbytes`` to size it. The GDN snapshot travels as
+    two tensors, ``gdn.rec`` ``[n_dev, L, Nv, Dk, Dv]`` and ``gdn.taps``
+    ``[n_dev, L, K, C]`` (device-major: one memcpy each here, one borrowed upload each
+    on the decoder). Speculative decoding: the LAST ``n_mtp_layers`` pairs of ``kv``
+    are the MTP drafter's layers (``mtp.kv.<j>``, kept out of ``n_attn_layers``) and
+    ``mtp_hidden`` ([dim] bf16) is the drafter's hidden row (``mtp.hidden``)."""
     _check_gdn_snapshot(rec_snap, conv_snap)
+    n_mtp_layers = int(n_mtp_layers)
+    if not 0 <= n_mtp_layers <= len(kv):
+        raise ValueError(
+            f"n_mtp_layers {n_mtp_layers} out of range for {len(kv)} KV pairs"
+        )
+    n_main = len(kv) - n_mtp_layers
+    if mtp_hidden is not None:
+        mtp_hidden = torch.as_tensor(mtp_hidden)
+        if mtp_hidden.dim() != 1:
+            raise ValueError(
+                f"mtp_hidden must be a [dim] row, got {tuple(mtp_hidden.shape)}"
+            )
     entries: list[dict[str, Any]] = []
     tensors: list[torch.Tensor] = []
     off = 0
@@ -239,11 +290,16 @@ def pack_payload(
         tensors.append(t)
         off += n
 
-    for li, (k, v) in enumerate(kv):
+    for li, (k, v) in enumerate(kv[:n_main]):
         add(f"kv.{li}.k", k)
         add(f"kv.{li}.v", v)
+    for j, (k, v) in enumerate(kv[n_main:]):
+        add(f"mtp.kv.{j}.k", k)
+        add(f"mtp.kv.{j}.v", v)
     add("gdn.rec", rec_snap)
     add("gdn.taps", conv_snap)
+    if mtp_hidden is not None:
+        add("mtp.hidden", mtp_hidden)
     if out is not None:
         if out.numel() < off:
             raise ValueError(f"pooled buffer {out.numel()} B < payload {off} B")
@@ -253,22 +309,29 @@ def pack_payload(
     for e, t in zip(entries, tensors):
         buf[e["offset"] : e["offset"] + e["nbytes"]].copy_(t.view(-1).view(torch.uint8))
     header = {
+        "version": PAYLOAD_VERSION,
         "num_tokens": int(num_tokens),
         "n_blocks": int(n_blocks),
-        "n_attn_layers": len(kv),
+        "n_attn_layers": n_main,
         "n_gdn_layers": int(rec_snap.shape[1]),
         "n_conv": int(conv_snap.shape[2]),
         "nbytes": int(off),
         "tensors": entries,
     }
+    if n_mtp_layers or mtp_hidden is not None:
+        header["mtp"] = {"n_layers": n_mtp_layers, "hidden": mtp_hidden is not None}
     return buf, header
 
 
-def payload_nbytes(kv, rec_snap, conv_snap) -> int:
+def payload_nbytes(
+    kv, rec_snap, conv_snap, mtp_hidden: torch.Tensor | None = None
+) -> int:
     _check_gdn_snapshot(rec_snap, conv_snap)
     n = sum(k.numel() * k.element_size() + v.numel() * v.element_size() for k, v in kv)
     n += rec_snap.numel() * rec_snap.element_size()
     n += conv_snap.numel() * conv_snap.element_size()
+    if mtp_hidden is not None:
+        n += mtp_hidden.numel() * mtp_hidden.element_size()
     return n
 
 
@@ -365,19 +428,46 @@ def payload_digest(buf: torch.Tensor, nbytes: int) -> str:
     return hashlib.sha1(sample + nbytes.to_bytes(8, "little")).hexdigest()[:12]
 
 
-def unpack_payload(buf: torch.Tensor, header: dict[str, Any]):
-    """Inverse of ``pack_payload``: views into ``buf`` (no copies). Returns
-    ``(kv, rec, taps)`` with the GDN pair in the device-major layout ``pack_payload``
-    documents."""
+def _payload_views(
+    buf: torch.Tensor, header: dict[str, Any]
+) -> dict[str, torch.Tensor]:
     by_name = {}
     for e in header["tensors"]:
         dt = getattr(torch, e["dtype"])
         by_name[e["name"]] = (
             buf[e["offset"] : e["offset"] + e["nbytes"]].view(dt).view(*e["shape"])
         )
+    return by_name
+
+
+def payload_mtp_layers(header: dict[str, Any]) -> int:
+    """How many MTP KV layers the payload carries (0 for a version-1 payload)."""
+    return int((header.get("mtp") or {}).get("n_layers", 0))
+
+
+def unpack_mtp_hidden(buf: torch.Tensor, header: dict[str, Any]) -> torch.Tensor | None:
+    """The payload's ``mtp.hidden`` row ([dim] bf16, a view into ``buf``) or None when
+    the producer shipped none (no speculative decoding there / version 1)."""
+    if not (header.get("mtp") or {}).get("hidden"):
+        return None
+    return _payload_views(buf, header).get("mtp.hidden")
+
+
+def unpack_payload(buf: torch.Tensor, header: dict[str, Any]):
+    """Inverse of ``pack_payload``: views into ``buf`` (no copies). Returns
+    ``(kv, rec, taps)`` with the GDN pair in the device-major layout ``pack_payload``
+    documents; ``kv`` lists the main layers' pairs followed by the MTP layers' (version
+    2, ``payload_mtp_layers(header)`` of them) -- the order
+    ``pd_transfer.import_kv_blocks`` expects, which tolerates a count that differs from
+    its own layer list."""
+    by_name = _payload_views(buf, header)
     kv = [
         (by_name[f"kv.{li}.k"], by_name[f"kv.{li}.v"])
         for li in range(header["n_attn_layers"])
+    ]
+    kv += [
+        (by_name[f"mtp.kv.{j}.k"], by_name[f"mtp.kv.{j}.v"])
+        for j in range(payload_mtp_layers(header))
     ]
     if "gdn.rec" not in by_name or "gdn.taps" not in by_name:
         names = sorted(n for n in by_name if n.startswith("gdn."))
@@ -1126,10 +1216,25 @@ class _WorkerSide:
                     release_snapshot(rec_snap, conv_snap)
                 continue
             kv = pd_transfer.export_kv_blocks(self.model, block_ids)
+            # speculative decoding (model.mtp_head): the drafter's KV layer is the last
+            # export pair(s) and its hidden row travels with the snapshot
+            split = getattr(pd_transfer, "kv_layer_split", None)
+            n_mtp = split(self.model)[1] if split is not None else 0
+            export_hidden = getattr(pd_transfer, "export_mtp_hidden", None)
+            hidden = (
+                export_hidden(self.model, slot) if export_hidden is not None else None
+            )
             t1 = time.perf_counter()
-            pooled = self.pool.acquire(payload_nbytes(kv, rec_snap, conv_snap))
+            pooled = self.pool.acquire(payload_nbytes(kv, rec_snap, conv_snap, hidden))
             buf, header = pack_payload(
-                kv, rec_snap, conv_snap, sr.num_tokens, n_blocks, out=pooled
+                kv,
+                rec_snap,
+                conv_snap,
+                sr.num_tokens,
+                n_blocks,
+                out=pooled,
+                mtp_hidden=hidden,
+                n_mtp_layers=n_mtp,
             )
             if release_snapshot is not None:
                 release_snapshot(rec_snap, conv_snap)
@@ -1159,7 +1264,7 @@ class _WorkerSide:
             self.stats["stage_ms"] += 1e3 * (t2 - t0)
             logger.info(
                 "[pd] staged %s: %d tokens, %d blocks, %.1f MiB (export %.1f ms, "
-                "pack+register %.1f ms) digest %s transfer %s via %s",
+                "pack+register %.1f ms) digest %s transfer %s via %s%s",
                 sr.req_id,
                 sr.num_tokens,
                 n_blocks,
@@ -1169,6 +1274,12 @@ class _WorkerSide:
                 payload_digest(buf, header["nbytes"]),
                 tid,
                 f"shm {shm_name}" if shm_name else "mooncake",
+                (
+                    f" mtp {n_mtp} layer(s)"
+                    f"{' + hidden row' if hidden is not None else ''}"
+                    if n_mtp or hidden is not None
+                    else ""
+                ),
             )
         # garbage-collect stagings nobody pulled (decoder died / aborted upstream) and
         # cancels whose staging never came (the request failed on this instance)
@@ -1427,17 +1538,33 @@ class _WorkerSide:
                 # slot; the runner calls the release when done (for a mapped segment
                 # that is what sends DONE to the producer). ``gdn`` goes in the conv
                 # position: import_gdn_slot / verify_gdn_slot take the prepared form.
-                self.runner.pd_pending_gdn[rr.req_id] = (rec, gdn, buf, f.release)
+                # Entry [4] (speculative decoding): {"mtp_hidden": [dim] bf16 view or
+                # None} -- the runner hands it to the drafter with
+                # pd_transfer.import_mtp_hidden(model, slot, row) when the request
+                # gets its slot (None: the producer ran no MTP prefill; do not draft).
+                self.runner.pd_pending_gdn[rr.req_id] = (
+                    rec,
+                    gdn,
+                    buf,
+                    f.release,
+                    {"mtp_hidden": unpack_mtp_hidden(buf, header)},
+                )
             t1 = time.perf_counter()
             self._finish_recv(rr.req_id)
             self.stats["pulled"] += 1
             self.stats["pulled_bytes"] += header["nbytes"]
             self.stats["pull_ms"] += 1e3 * f.t_pull
             self.stats["import_ms"] += 1e3 * (t1 - t0)
+            mtp_note = (
+                f" mtp {payload_mtp_layers(header)} layer(s)"
+                f"{' + hidden row' if (header.get('mtp') or {}).get('hidden') else ''}"
+                if header.get("mtp")
+                else ""
+            )
             if f.via == "shm":
                 logger.info(
                     "[pd] pulled %s: %d tokens, %.1f MiB via shm (wait %.1f ms, map "
-                    "%.1f ms, prep %.1f ms, KV import %.1f ms) digest %s blocks %s",
+                    "%.1f ms, prep %.1f ms, KV import %.1f ms) digest %s blocks %s%s",
                     rr.req_id,
                     header["num_tokens"],
                     header["nbytes"] / 2**20,
@@ -1447,11 +1574,12 @@ class _WorkerSide:
                     1e3 * (t1 - t0),
                     payload_digest(buf, header["nbytes"]),
                     rr.block_ids[:n_blocks],
+                    mtp_note,
                 )
             else:
                 logger.info(
                     "[pd] pulled %s: %d tokens, %.1f MiB (wait %.1f ms, pull %.1f ms = "
-                    "%.2f GB/s, prep %.1f ms, KV import %.1f ms) digest %s blocks %s",
+                    "%.2f GB/s, prep %.1f ms, KV import %.1f ms) digest %s blocks %s%s",
                     rr.req_id,
                     header["num_tokens"],
                     header["nbytes"] / 2**20,
@@ -1462,6 +1590,7 @@ class _WorkerSide:
                     1e3 * (t1 - t0),
                     payload_digest(buf, header["nbytes"]),
                     rr.block_ids[:n_blocks],
+                    mtp_note,
                 )
         while True:
             try:

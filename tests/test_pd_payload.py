@@ -150,3 +150,103 @@ def test_legacy_per_layer_payload_is_rejected_on_unpack():
     ]
     with pytest.raises(ValueError, match="gdn.0.rec"):
         unpack_payload(buf, legacy)
+
+
+# ---- version 2: the MTP drafter's KV layer(s) + hidden row ---------------------------
+
+
+def test_v2_mtp_layer_and_hidden_row_round_trip():
+    """The last ``n_mtp_layers`` pairs travel as ``mtp.kv.<j>`` (outside
+    ``n_attn_layers``),
+    the hidden row as ``mtp.hidden``; ``unpack_payload`` appends the MTP pairs after the
+    main ones and ``unpack_mtp_hidden`` hands back the row (a view)."""
+    from vllm_tt_plugin.kv_connector.tt_mooncake_connector import (
+        payload_mtp_layers,
+        unpack_mtp_hidden,
+    )
+
+    kv, (rec, taps) = _kv(), _snapshot()
+    g = torch.Generator().manual_seed(3)
+    mtp_pair = (
+        torch.randn(N_BLOCKS, BLOCK, HEADS, HEAD_DIM, generator=g).to(torch.bfloat16),
+        torch.randn(N_BLOCKS, BLOCK, HEADS, HEAD_DIM, generator=g).to(torch.bfloat16),
+    )
+    hidden = torch.randn(40, generator=g).to(torch.bfloat16)
+    kv17 = kv + [mtp_pair]
+
+    buf, header = pack_payload(
+        kv17, rec, taps, 7, N_BLOCKS, mtp_hidden=hidden, n_mtp_layers=1
+    )
+
+    assert header["version"] == 2
+    assert (
+        header["n_attn_layers"] == N_ATTN
+    )  # main layers only: a v1 consumer still decodes
+    assert header["mtp"] == {"n_layers": 1, "hidden": True}
+    assert header["nbytes"] == payload_nbytes(kv17, rec, taps, hidden)
+    names = [e["name"] for e in header["tensors"]]
+    assert names == [f"kv.{li}.{x}" for li in range(N_ATTN) for x in "kv"] + [
+        "mtp.kv.0.k",
+        "mtp.kv.0.v",
+        "gdn.rec",
+        "gdn.taps",
+        "mtp.hidden",
+    ]
+    assert payload_mtp_layers(header) == 1
+
+    kv2, rec2, taps2 = unpack_payload(buf, header)
+    assert len(kv2) == N_ATTN + 1
+    for (k, v), (k2, v2) in zip(kv17, kv2):
+        assert torch.equal(k, k2) and torch.equal(v, v2)
+    assert torch.equal(rec, rec2) and torch.equal(taps, taps2)
+    h2 = unpack_mtp_hidden(buf, header)
+    assert torch.equal(h2, hidden) and h2.dtype == torch.bfloat16 and _inside(h2, buf)
+
+
+def test_v2_payload_without_mtp_has_no_mtp_field_and_reads_like_v1():
+    from vllm_tt_plugin.kv_connector.tt_mooncake_connector import (
+        payload_mtp_layers,
+        unpack_mtp_hidden,
+    )
+
+    kv, (rec, taps) = _kv(), _snapshot()
+    buf, header = pack_payload(kv, rec, taps, 7, N_BLOCKS)
+    assert "mtp" not in header and header["n_attn_layers"] == N_ATTN
+    assert payload_mtp_layers(header) == 0 and unpack_mtp_hidden(buf, header) is None
+    kv2, _, _ = unpack_payload(buf, header)
+    assert len(kv2) == N_ATTN
+
+
+def test_v1_consumer_view_of_a_v2_payload_sees_the_main_layers_only():
+    """A consumer that predates version 2 reads ``kv.<li>`` for li < n_attn_layers and
+    the GDN pair, ignoring unknown tensor names: reconstruct exactly that from a v2
+    header."""
+    kv, (rec, taps) = _kv(), _snapshot()
+    hidden = torch.zeros(8, dtype=torch.bfloat16)
+    buf, header = pack_payload(
+        kv + [kv[0]], rec, taps, 7, N_BLOCKS, mtp_hidden=hidden, n_mtp_layers=1
+    )
+    by_name = {
+        e["name"]: buf[e["offset"] : e["offset"] + e["nbytes"]]
+        .view(getattr(torch, e["dtype"]))
+        .view(*e["shape"])
+        for e in header["tensors"]
+    }
+    old_kv = [
+        (by_name[f"kv.{li}.k"], by_name[f"kv.{li}.v"])
+        for li in range(header["n_attn_layers"])
+    ]
+    assert len(old_kv) == N_ATTN
+    for (k, v), (k2, v2) in zip(kv, old_kv):
+        assert torch.equal(k, k2) and torch.equal(v, v2)
+    assert torch.equal(by_name["gdn.rec"], rec) and torch.equal(
+        by_name["gdn.taps"], taps
+    )
+
+
+def test_v2_rejects_bad_mtp_arguments():
+    kv, (rec, taps) = _kv(), _snapshot()
+    with pytest.raises(ValueError, match="n_mtp_layers"):
+        pack_payload(kv, rec, taps, 7, N_BLOCKS, n_mtp_layers=N_ATTN + 1)
+    with pytest.raises(ValueError, match=r"\[dim\] row"):
+        pack_payload(kv, rec, taps, 7, N_BLOCKS, mtp_hidden=torch.zeros(2, 3))

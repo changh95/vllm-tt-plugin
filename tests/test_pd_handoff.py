@@ -748,3 +748,85 @@ def test_stray_finished_sending_ids_are_dropped_before_vllm_sees_them():
     empty = SimpleNamespace(finished_sending=None, finished_recving=None)
     sched.update_connector_output(empty)  # None stays None
     assert empty.finished_sending is None
+
+
+# ---- speculative decoding: the MTP hidden row rides the parked entry -----------------
+
+
+def test_drain_parks_the_mtp_hidden_row_as_entry_four(consumer, fake_pd_transfer):
+    """A version-2 payload's ``mtp.hidden`` is parked as ``entry[4]["mtp_hidden"]`` (a
+    view into the payload) for the runner's ``pd_transfer.import_mtp_hidden``; a payload
+    without
+    it parks ``None`` there, and entries [0..3] keep their meaning."""
+    w = consumer
+    kv, rec, taps = _payload()
+    hidden = torch.arange(16, dtype=torch.float32).to(torch.bfloat16)
+    buf, header = pack_payload(
+        kv + [kv[0]], rec, taps, 7, 2, mtp_hidden=hidden, n_mtp_layers=1
+    )
+    rr = _rr(num_tokens=7)
+    w._inflight[rr.req_id] = rr
+    released = []
+    w._fetched.put(
+        mc._Fetched(rr, buf, header, lambda: released.append(1), "pull", 0.0, 0.0)
+    )
+    w._drain_fetched()
+    # the drain imported all 3 KV pairs (2 main + 1 MTP) under the request's blocks
+    assert len(fake_pd_transfer) == 1 and fake_pd_transfer[0][0] == [3, 4]
+    assert len(fake_pd_transfer[0][1]) == 3
+    entry = w.runner.pd_pending_gdn[rr.req_id]
+    assert len(entry) == 5 and torch.equal(entry[0], rec)
+    assert torch.equal(entry[4]["mtp_hidden"], hidden) and _inside(
+        entry[4]["mtp_hidden"], buf
+    )
+    entry[3]()
+    assert released == [1]
+
+    buf1, header1 = pack_payload(kv, rec, taps, 7, 2)
+    rr1 = RecvReq("r2", [5, 6], "127.0.0.1", 1, "t2", 7)
+    w._inflight[rr1.req_id] = rr1
+    w._fetched.put(mc._Fetched(rr1, buf1, header1, lambda: None, "pull", 0.0, 0.0))
+    w._drain_fetched()
+    assert w.runner.pd_pending_gdn[rr1.req_id][4] == {"mtp_hidden": None}
+
+
+def test_stage_ships_the_mtp_layer_and_hidden_row_when_the_model_has_a_head(
+    producer, fake_pd_transfer, monkeypatch
+):
+    """The producer asks pd_transfer for the layer split and the slot's hidden row and
+    packs them (``mtp.kv.0``, ``mtp.hidden``); without those helpers (older model side)
+    it stages
+    a version-2 payload without an ``mtp`` field."""
+    import sys
+
+    w = producer
+    mod = sys.modules["models.demos.blackhole.qwen36.tt.pd_transfer"]
+    kv, rec, taps = _payload()
+    hidden = torch.ones(12, dtype=torch.bfloat16)
+    mod.export_kv_blocks = lambda model, block_ids: kv + [kv[1]]
+    mod.kv_layer_split = lambda model: (2, 1)
+    popped = []
+    mod.export_mtp_hidden = lambda model, slot: popped.append(slot) or hidden
+    w.model = SimpleNamespace(pd_gdn_capture={4: (rec, taps)})
+    w.runner = SimpleNamespace(_req_state_slot={"r1": 4})
+    meta = TTMooncakeConnectorMetadata(stage=[StageReq("r1", [3, 4], 7, "t1")])
+    w.stage_after_step(meta)
+    st = w._staged["t1"]
+    assert popped == [4]
+    assert st.header["mtp"] == {"n_layers": 1, "hidden": True}
+    assert st.header["n_attn_layers"] == 2
+    kv2, rec2, _ = unpack_payload(st.buf[: st.nbytes], st.header)
+    assert len(kv2) == 3 and torch.equal(kv2[2][0], kv[1][0]) and torch.equal(rec2, rec)
+    assert torch.equal(mc.unpack_mtp_hidden(st.buf[: st.nbytes], st.header), hidden)
+    w._release("t1")
+
+    del mod.kv_layer_split, mod.export_mtp_hidden
+    mod.export_kv_blocks = lambda model, block_ids: kv
+    w.model = SimpleNamespace(pd_gdn_capture={5: (rec, taps)})
+    w.runner = SimpleNamespace(_req_state_slot={"r2": 5})
+    w.stage_after_step(
+        TTMooncakeConnectorMetadata(stage=[StageReq("r2", [3, 4], 7, "t2")])
+    )
+    st2 = w._staged["t2"]
+    assert "mtp" not in st2.header and st2.header["version"] == 2
+    w._release("t2")
