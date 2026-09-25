@@ -57,6 +57,28 @@ Every `[pd] pulled ...` log line says which path ran (`via shm (... map X ms ...
 Reference implementation of the model side: tt-metal
 `models/demos/blackhole/qwen36/tt/pd_transfer.py`.
 
+## Speculative decoding (MTP drafter) state
+
+With the MTP drafter configured (`QWEN36_SPEC_MTP=1` on the producer; tt-metal `tt/mtp_head.py`) the producer
+also runs the drafter's prefill for every request, and the staged payload (format version 2, laid out in the
+connector's module docstring) additionally carries:
+
+- the drafter's own paged-KV layer as `mtp.kv.0.k/.v` -- the 17th entry of the model's
+  `pd_transfer._attention_layers`, same block ids and block layout as the 16 main layers (`+6.25 %` KV bytes);
+- `mtp.hidden`, the main model's post-final-norm hidden row at the last prefilled position ([dim] bf16, the
+  drafter's first-step input).
+
+`n_attn_layers` in the header keeps counting the main layers only, so a version-1 consumer decodes the payload
+unchanged (it ignores unknown tensor names). A consumer with a drafter imports all 17 layers in one
+`import_kv_blocks` call and parks the hidden row as the fifth element of the request's `pd_pending_gdn` entry
+(`entry[4]["mtp_hidden"]`, `None` when the producer shipped none); the runner hands it to the drafter with
+`pd_transfer.import_mtp_hidden(model, slot, row)` (= `MTPHead.set_hidden_in`) when the request gets its decode
+slot, next to `import_gdn_slot`. After that the decoder holds exactly the state its own prefill of the same
+tokens would have produced (head KV over positions `0..N-2`, hidden row `N-1`), so it can draft immediately.
+A consumer without a drafter drops the extra layer; a drafter fed by a version-1 payload gets zero head blocks
+and no hidden row and must not draft for that request. Round-trip evidence (bitwise KV / hidden row and identical
+committed streams): tt-metal `models/demos/blackhole/qwen36/tests/pd_mtp_transfer_repro.py`.
+
 ## Configuration
 
 Producer (prefill instance):
