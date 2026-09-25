@@ -26,7 +26,7 @@ from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import TTScheduler
 
 #
-# ----------------------------------------------------------------------------------------------
+#
 # policy helpers
 
 
@@ -92,7 +92,7 @@ def test_drafts_for_rows_and_sidecars():
 
 
 #
-# ----------------------------------------------------------------------------------------------
+#
 # platform gate
 
 
@@ -126,7 +126,7 @@ def test_platform_validates_speculative_config():
 
 
 #
-# ----------------------------------------------------------------------------------------------
+#
 # real scheduler
 
 
@@ -289,6 +289,28 @@ def test_real_scheduler_no_hold_when_admission_fits_the_band():
     assert [r.req_id for r in so.scheduled_new_reqs] == ["r1"]
 
 
+def test_real_scheduler_holds_for_a_finished_remote_kv_import():
+    """P/D consumer: an import still in WAITING_FOR_REMOTE_KVS whose transfer has
+    finished is admitted inside the base schedule(), so it counts as ready."""
+    sched = _spec_scheduler(k=3)
+    r0 = _new_request("r0")
+    sched.add_request(r0)
+    so = sched.schedule()
+    out = _output(["r0"], [[7]])
+    spec_mtp.set_tt_spec_hold(
+        out, spec_mtp.HoldInfo(pending_any=True, slots_before_crossing=0)
+    )
+    sched.update_from_output(so, out)
+    r1 = _new_request("r1")
+    r1.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    sched.waiting.add_request(r1)
+    sched.requests["r1"] = r1
+    assert sched._spec_ready_waiting() == []  # transfer in flight: not admitted yet
+    sched.finished_recving_kv_req_ids.add("r1")
+    assert [r.request_id for r in sched._spec_ready_waiting()] == ["r1"]
+    assert sched._spec_hold_step() is not None
+
+
 def test_real_scheduler_holds_for_a_plain_forcing_admission():
     sched = _spec_scheduler(k=3)
     r0 = _new_request("r0")
@@ -307,7 +329,7 @@ def test_real_scheduler_holds_for_a_plain_forcing_admission():
 
 
 #
-# ----------------------------------------------------------------------------------------------
+#
 # runner packing
 
 VOCAB = 64

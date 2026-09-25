@@ -155,12 +155,19 @@ class TTScheduler(AsyncScheduler):
         """Waiting requests the next prefill / import admission could take
         (excluding ones still waiting on a remote KV load or a grammar)."""
         ready: list[Request] = []
+        # A remote-KV import is promoted out of WAITING_FOR_REMOTE_KVS inside the
+        # base scheduler's schedule() once its transfer finished (P/D consumer):
+        # such a request IS admitted this step.
+        kv_done = getattr(self, "finished_recving_kv_req_ids", None) or set()
         for queue in (self.waiting, getattr(self, "skipped_waiting", None)):
             if not queue:
                 continue
             for request in queue:
                 status = getattr(request, "status", RequestStatus.WAITING)
-                if status in _SPEC_NOT_ADMITTABLE:
+                if status in _SPEC_NOT_ADMITTABLE and not (
+                    status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    and request.request_id in kv_done
+                ):
                     continue
                 ready.append(request)
         return ready
@@ -198,7 +205,7 @@ class TTScheduler(AsyncScheduler):
         # Consumed: the flush step's own output republishes the (cleared) state.
         self._tt_spec_hold = None
         self._tt_spec_hold_steps += 1
-        logger.debug(
+        logger.info(
             "TT speculative decoding: holding %d admission(s) for a flush step "
             "(plain-forcing=%s, slots before crossing=%s)",
             len(ready),
