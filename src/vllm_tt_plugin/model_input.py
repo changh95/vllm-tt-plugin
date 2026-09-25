@@ -175,3 +175,9 @@ class TTModelInput:
     # must resolve rows through this. ``None`` for lane builds, whose rows are
     # the persistent slots.
     row_req_ids: list[str] | None = None
+
+    # Decode-only, speculative decoding with a model-owned drafter
+    # (``vllm_tt_plugin.spec_mtp.TTSpecStepInput``): the request / scheduled
+    # drafts per padded row, greedy eligibility and the scheduler's flush
+    # request. ``None`` when speculative decoding is off (byte-identical path).
+    spec: Any = None

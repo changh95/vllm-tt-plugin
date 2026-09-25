@@ -1337,6 +1337,55 @@ class TTPlatform(Platform):
         if current_device is not device:
             ttnn.SetDefaultDevice(device)
 
+    @staticmethod
+    def _validate_speculative_config(
+        vllm_config: "VllmConfig", model_capabilities: dict | None, model_class: type
+    ) -> None:
+        """Speculative decoding on TT means a model-owned drafter: the TT model
+        runs the whole draft -> verify -> commit loop (docs/SPECULATIVE.md) and
+        vLLM keeps the token / KV bookkeeping (``method: mtp``). Anything else
+        (draft models, EAGLE heads, ngram) has no TT executor and is refused."""
+        spec = vllm_config.speculative_config
+        if spec is None:
+            return
+        desc = f"TT model {model_class.__name__} ({model_class.__module__})"
+        supports = bool(
+            model_capabilities.get("supports_speculative_mtp", False)
+            if model_capabilities
+            else False
+        )
+        if not supports:
+            raise ValueError(
+                f"Speculative decoding is not supported for {desc}: the model "
+                "class does not declare model_capabilities['supports_speculative_mtp']"
+            )
+        if spec.method != "mtp":
+            raise ValueError(
+                f"{desc} supports speculative decoding only with its own MTP "
+                f"drafter (speculative_config method 'mtp'), got {spec.method!r}"
+            )
+        if vllm_config.scheduler_config.async_scheduling:
+            raise ValueError(
+                "TT speculative decoding needs synchronous scheduling (the "
+                "drafts of a step come from that step's verify); pass "
+                "--no-async-scheduling"
+            )
+        if is_tt_block_output_model(vllm_config):
+            raise ValueError(
+                "Speculative decoding and block-output models are exclusive"
+            )
+        if getattr(vllm_config.model_config, "logits_processors", None):
+            raise ValueError(
+                "Custom logits processors force host sampling on every step; "
+                "speculative decoding would never run -- drop one of the two"
+            )
+        logger.info(
+            "TT speculative decoding: method=%s num_speculative_tokens=%d "
+            "(model-owned drafter; greedy requests only, others run plain decode)",
+            spec.method,
+            int(spec.num_speculative_tokens),
+        )
+
     @classmethod
     def _resolve_output_tokens_per_step(cls, model_class: type) -> int:
         """Validate and return a model's committed output-width capability."""
@@ -1471,9 +1520,10 @@ class TTPlatform(Platform):
 
     @classmethod
     def _apply_check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
+        # Speculative decoding is validated below against the model class
+        # (``_validate_speculative_config``): only a model that runs its own
+        # draft -> verify -> commit loop (model_capabilities
+        # ``supports_speculative_mtp``) may be started with a speculative_config.
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
@@ -1593,6 +1643,8 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        cls._validate_speculative_config(vllm_config, model_capabilities, model_class)
 
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.

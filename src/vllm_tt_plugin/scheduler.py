@@ -16,6 +16,13 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.spec_mtp import (
+    HoldInfo,
+    get_tt_spec_hold,
+    hold_needed,
+    request_forces_plain,
+    set_tt_spec_flush,
+)
 
 logger = init_tt_logger(__name__)
 
@@ -39,6 +46,15 @@ def get_tt_forced_reset_discard_counts(
     scheduler_output: SchedulerOutput,
 ) -> dict[str, int]:
     return dict(getattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, {}))
+
+
+# Waiting requests the next admission cannot take yet (a remote KV load or a
+# grammar compile in flight); the names differ across vLLM versions.
+_SPEC_NOT_ADMITTABLE = frozenset(
+    getattr(RequestStatus, name)
+    for name in ("WAITING_FOR_REMOTE_KVS", "WAITING_FOR_FSM")
+    if hasattr(RequestStatus, name)
+)
 
 
 class TTSchedulingMode(Enum):
@@ -114,6 +130,11 @@ class TTScheduler(AsyncScheduler):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
+        # Speculative decoding with a model-owned drafter: the runner's hold
+        # info after its last decode step (spec_mtp.HoldInfo), read in
+        # ``update_from_output``; ``_spec_hold_step`` inserts the flush step.
+        self._tt_spec_hold: HoldInfo | None = None
+        self._tt_spec_hold_steps = 0
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         if self._is_block_output_model:
@@ -126,6 +147,71 @@ class TTScheduler(AsyncScheduler):
                 "call made by AsyncScheduler._update_request_with_output and "
                 "must disable prefix caching"
             )
+
+    # ------------------------------------------------------------------
+    # Speculative decoding: the admission-hold protocol (docs/SPECULATIVE.md)
+    # ------------------------------------------------------------------
+    def _spec_ready_waiting(self) -> list[Request]:
+        """Waiting requests the next prefill / import admission could take
+        (excluding ones still waiting on a remote KV load or a grammar)."""
+        ready: list[Request] = []
+        for queue in (self.waiting, getattr(self, "skipped_waiting", None)):
+            if not queue:
+                continue
+            for request in queue:
+                status = getattr(request, "status", RequestStatus.WAITING)
+                if status in _SPEC_NOT_ADMITTABLE:
+                    continue
+                ready.append(request)
+        return ready
+
+    def _spec_hold_step(self) -> SchedulerOutput | None:
+        """Before admitting new work while the model holds accepted-but-lazily-
+        committed prefixes (the runner's ``HoldInfo``): if the admission would
+        force plain decode (a non-greedy / host-sampled request) or would push
+        the batch out of its verify band (more admissions than free rows below
+        the band's width), schedule one decode-only step flagged ``flush`` --
+        the model commits the prefixes with a zero-draft verify step, every
+        scheduled draft is rejected (one token per request), and the admission
+        happens next step. Returns None when no hold is needed."""
+        hold = self._tt_spec_hold
+        if hold is None or not hold.pending_any:
+            return None
+        ready = self._spec_ready_waiting()
+        if not ready:
+            return None
+        if not any(not request.is_prefill_chunk for request in self.running):
+            return None
+        any_plain = any(
+            request_forces_plain(
+                getattr(request, "sampling_params", None),
+                bool(getattr(request, "use_structured_output", False)),
+            )
+            for request in ready
+        )
+        if not hold_needed(hold, len(ready), any_plain):
+            return None
+        result = self._schedule_decode_only()
+        if result.total_num_scheduled_tokens == 0:
+            return None
+        set_tt_spec_flush(result, True)
+        # Consumed: the flush step's own output republishes the (cleared) state.
+        self._tt_spec_hold = None
+        self._tt_spec_hold_steps += 1
+        logger.debug(
+            "TT speculative decoding: holding %d admission(s) for a flush step "
+            "(plain-forcing=%s, slots before crossing=%s)",
+            len(ready),
+            any_plain,
+            hold.slots_before_crossing,
+        )
+        return result
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        hold = get_tt_spec_hold(model_runner_output)
+        if hold is not None:
+            self._tt_spec_hold = hold
+        return super().update_from_output(scheduler_output, model_runner_output)
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -458,6 +544,13 @@ class TTScheduler(AsyncScheduler):
             # No pending prefill: base scheduler naturally runs decode-only.
             result = super().schedule()
             return self._finalize_scheduler_output(result)
+
+        # Speculative decoding: an admission the model's pending prefixes cannot
+        # survive is preceded by one flush step (decode-only, drafts rejected).
+        if has_pending_prefill and has_running_decode:
+            held = self._spec_hold_step()
+            if held is not None:
+                return self._finalize_scheduler_output(held)
 
         # Default mode: Requests whose prefill happened on a remote prefill instance (KV
         # connector, P/D disaggregation) arrive in ``waiting`` already computed up to

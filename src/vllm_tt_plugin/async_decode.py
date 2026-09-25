@@ -16,6 +16,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL, select_live_decode_rows
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.spec_mtp import is_spec_step_result
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 if TYPE_CHECKING:
@@ -834,6 +835,12 @@ class TTAsyncDecodeController:
         # sampling modes. Preserve that behavior for legacy adapters too.
         if model_input.slot_remap is not None:
             kwargs["slot_remap"] = model_input.slot_remap
+        # Speculative decoding (spec_mtp.TTSpecStepInput): the model runs the
+        # draft -> verify -> commit loop and may return a host-side step result
+        # instead of device logits / tokens.
+        spec_step = getattr(model_input, "spec", None)
+        if spec_step is not None:
+            kwargs["spec_step"] = spec_step
 
         # Versioned compatibility seam. Refactored tt-metal adapters opt into
         # the four explicit commands; legacy adapters keep their old call shape.
@@ -895,7 +902,11 @@ class TTAsyncDecodeController:
             self._decode_chain_valid = True
             self._previous_device_sampling = perform_device_sampling
         read_events = None
-        if async_read:
+        if is_spec_step_result(tt_out):
+            # committed tokens per row are already on the host
+            if async_read:
+                raise RuntimeError("speculative steps run on the synchronous path")
+        elif async_read:
             if hasattr(runner.model, "read_decode_output"):
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
@@ -936,6 +947,8 @@ class TTAsyncDecodeController:
         else:
             tt_out = submission.tt_out
 
+        if is_spec_step_result(tt_out):
+            return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=None)
         is_host_output = _is_host_decode_output(tt_out)
         if not is_host_output and hasattr(runner.model, "process_decode_output_host"):
             tt_out = runner.model.process_decode_output_host(

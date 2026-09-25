@@ -517,6 +517,13 @@ class TTWorker(WorkerBase):
         assert self.is_driver_worker, "There should only be one Worker for TT"
         return self.model_runner.sample_tokens(grammar_output)
 
+    def take_draft_token_ids(self):
+        """Speculative decoding: the drafts the last decode step proposed for
+        the next step (``EngineCore.post_step`` ->
+        ``Scheduler.update_draft_token_ids``); ``None`` when none."""
+        assert self.is_driver_worker, "There should only be one Worker for TT"
+        return self.model_runner.take_draft_token_ids()
+
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
         return

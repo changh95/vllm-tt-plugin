@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
     KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -74,6 +75,14 @@ from vllm_tt_plugin.model_input import (
 )
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.spec_mtp import (
+    HoldInfo,
+    TTSpecStepInput,
+    drafts_for_rows,
+    get_tt_spec_flush,
+    is_spec_step_result,
+    set_tt_spec_hold,
+)
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -167,6 +176,11 @@ class TTModelRunner:
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        # Speculative decoding with the model's own drafter (spec_mtp.py,
+        # docs/SPECULATIVE.md): the drafts the last decode step proposed, handed
+        # to the scheduler through ``take_draft_token_ids`` after every step.
+        self._spec_enabled = self.speculative_config is not None
+        self._pending_draft_token_ids: DraftTokenIds | None = None
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
@@ -327,6 +341,17 @@ class TTModelRunner:
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
+        if self._spec_enabled:
+            if self._is_lane_mode or self.tt_data_parallel_size > 1:
+                raise ValueError(
+                    "TT speculative decoding runs on the single-process, non-DP "
+                    "path only"
+                )
+            # The model builds its verify / draft traces for this many drafts per
+            # step at warm-up (tt-metal qwen36_vllm._spec_prepare).
+            self.model.tt_speculative_k = int(
+                self.speculative_config.num_speculative_tokens
+            )
 
     def _uses_async_scheduler(self) -> bool:
         """Whether upstream publishes outputs through placeholder accounting.
@@ -895,6 +920,12 @@ class TTModelRunner:
             entry = pending.pop(req_id)
             rec, conv = entry[0], entry[1]
             release = entry[3] if len(entry) > 3 else None
+            # Speculative decoding: the drafter's hidden row (payload ``mtp.hidden``, a
+            # view into the transfer buffer -> copied before the buffer is released)
+            extra = entry[4] if len(entry) > 4 and isinstance(entry[4], dict) else {}
+            mtp_hidden = extra.get("mtp_hidden")
+            if mtp_hidden is not None:
+                mtp_hidden = mtp_hidden.clone()
             slot = self._alloc_prefill_state_slots([req_id])[0]
             t0 = time.perf_counter()
             try:
@@ -902,6 +933,8 @@ class TTModelRunner:
             finally:
                 if release is not None:
                     release()
+            if mtp_hidden is not None and getattr(inner, "mtp_head", None) is not None:
+                pd_transfer.import_mtp_hidden(inner, slot, mtp_hidden)
             if os.environ.get("QWEN36_PD_VERIFY", "0") == "1":
                 pd_transfer.verify_gdn_slot(inner, slot, rec, conv, tag=req_id)
             imported.add(req_id)
@@ -1663,6 +1696,16 @@ class TTModelRunner:
             # a move that never happened.
             slot_remap = self._decode_state_slot_remap(row_req_ids)
 
+        spec = None
+        if getattr(self, "_spec_enabled", False) and not is_prompt:
+            spec = self._build_spec_step_input(
+                scheduler_output,
+                row_req_ids,
+                int(input_tokens.shape[0]),
+                perform_device_sampling,
+                has_structured,
+            )
+
         return TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -1672,6 +1715,7 @@ class TTModelRunner:
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
             row_req_ids=row_req_ids,
+            spec=spec,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
@@ -1692,6 +1736,151 @@ class TTModelRunner:
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
         )
+
+    # ------------------------------------------------------------------
+    # Speculative decoding with a model-owned drafter (spec_mtp.py)
+    # ------------------------------------------------------------------
+    def _build_spec_step_input(
+        self,
+        scheduler_output: SchedulerOutput,
+        row_req_ids: list[str | None],
+        pad_to: int,
+        perform_device_sampling: bool,
+        has_structured: bool,
+    ) -> TTSpecStepInput:
+        """The decode step's speculative payload: per padded row the request and
+        its scheduled draft tokens, whether every live request may take the
+        greedy verify path (device greedy sampling, no penalties / logprobs /
+        structured output: the verify's argmax IS the plain decode's token),
+        and the scheduler's flush request."""
+        batch = self.input_batch
+        eligible = bool(
+            perform_device_sampling
+            and batch.all_greedy
+            and batch.no_penalties
+            and not has_structured
+            and batch.max_num_logprobs is None
+        )
+        rows = list(row_req_ids) + [None] * max(0, pad_to - len(row_req_ids))
+        return TTSpecStepInput(
+            row_req_ids=rows,
+            drafts=drafts_for_rows(
+                scheduler_output.scheduled_spec_decode_tokens, row_req_ids, pad_to
+            ),
+            eligible=eligible,
+            flush=get_tt_spec_flush(scheduler_output),
+        )
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        """The drafts the last decode step proposed (one list per request it
+        emitted tokens for; ``[]`` = none), consumed once."""
+        drafts = self._pending_draft_token_ids
+        self._pending_draft_token_ids = None
+        return drafts
+
+    def _spec_hold_info(self) -> HoldInfo:
+        hold_fn = getattr(self.model, "spec_hold_info", None)
+        info = hold_fn() if callable(hold_fn) else None
+        return HoldInfo.from_any(info)
+
+    def _spec_attach_plain(
+        self, output: ModelRunnerOutput, fwd: _SyncForward
+    ) -> ModelRunnerOutput:
+        """A decode step that ran as plain decode while speculative decoding is
+        configured: publish the model's hold info and clear every request's
+        draft placeholders (no drafts for the next step)."""
+        if not self._spec_enabled or not fwd.is_decode:
+            return output
+        set_tt_spec_hold(output, self._spec_hold_info())
+        req_ids = list(output.req_ids)
+        self._pending_draft_token_ids = DraftTokenIds(
+            req_ids=req_ids, draft_token_ids=[[] for _ in req_ids]
+        )
+        return output
+
+    def _finish_spec_step(self, fwd: _SyncForward) -> ModelRunnerOutput:
+        """Build the output of a speculative decode step: ``1..1+K_s`` committed
+        tokens per live request (the row-0 token plus its accepted drafts and
+        the bonus token), applied to the host state, plus the drafts for the
+        next step and the scheduler's hold info."""
+        res = fwd.tt_out
+        row_req_ids = fwd.model_input.row_req_ids
+        if row_req_ids is None:
+            raise RuntimeError("a speculative decode step needs one request id per row")
+        req_ids: list[str] = []
+        tokens_per_req: list[list[int]] = []
+        drafts_per_req: list[list[int]] = []
+        for row, req_id in enumerate(row_req_ids):
+            if req_id is None:
+                continue
+            if row >= res.w:
+                raise RuntimeError(
+                    f"live decode row {row} ({req_id}) lies outside the verify grid "
+                    f"of width {res.w}"
+                )
+            toks = [int(t) for t in res.committed[row]]
+            if not toks:
+                raise RuntimeError(f"speculative step committed no token for {req_id}")
+            scheduled = (
+                fwd.model_input.spec.drafts[row] if fwd.model_input.spec else None
+            )
+            k_sched = len(scheduled) if scheduled else 0
+            if len(toks) > 1 + k_sched:
+                raise RuntimeError(
+                    f"speculative step committed {len(toks)} tokens for {req_id} "
+                    f"with {k_sched} scheduled drafts (placeholder accounting "
+                    f"allows 1..{1 + k_sched})"
+                )
+            req_ids.append(req_id)
+            tokens_per_req.append(toks)
+            drafts_per_req.append([int(t) for t in res.next_drafts[row]])
+        self._apply_spec_tokens_to_state(req_ids, tokens_per_req)
+        output = self._build_spec_runner_output(req_ids, tokens_per_req)
+        set_tt_spec_hold(output, res.hold)
+        self._pending_draft_token_ids = DraftTokenIds(
+            req_ids=list(req_ids), draft_token_ids=drafts_per_req
+        )
+        return output
+
+    def _build_spec_runner_output(
+        self, req_ids: list[str], tokens_per_req: list[list[int]]
+    ) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            req_ids=list(req_ids),
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=[list(t) for t in tokens_per_req],
+            logprobs=None,
+            prompt_logprobs_dict=dict.fromkeys(req_ids, None),
+            pooler_output=[],
+        )
+
+    def _apply_spec_tokens_to_state(
+        self, req_ids: list[str], tokens_per_req: list[list[int]]
+    ) -> None:
+        """Variable-length counterpart of ``_apply_sampled_tokens_to_state``: each
+        request's committed tokens extend its row (the next step's row-0 token is
+        the last one, at position ``num_tokens - 1``)."""
+        max_model_len = self.model_config.max_model_len
+        batch = self.input_batch
+        for req_id, toks in zip(req_ids, tokens_per_req, strict=True):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                raise RuntimeError(
+                    "request missing from runner state while applying speculative "
+                    f"tokens: {req_id!r}"
+                )
+            row = batch.req_id_to_index.get(req_id)
+            if row is not None:
+                start = int(batch.num_tokens[row])
+                end = start + len(toks)
+                if end > max_model_len:
+                    raise ValueError(
+                        f"speculative tokens exceed max_model_len for {req_id}: "
+                        f"{end} > {max_model_len}"
+                    )
+                batch.token_ids_cpu[row, start:end] = np.asarray(toks, dtype=np.int32)
+                batch.num_tokens[row] = end
+            req_state.output_token_ids.extend(toks)
 
     def build_model_input(
         self,
@@ -2058,6 +2247,9 @@ class TTModelRunner:
             return self.apply_and_build_runner_output(
                 torch.tensor([], dtype=torch.int32), None
             )
+        if fwd.is_decode and is_spec_step_result(fwd.tt_out):
+            # the model ran draft -> verify -> commit: variable tokens per request
+            return TTModelRunner._finish_spec_step(self, fwd)
         fwd = replace(
             fwd,
             model_input=self._apply_grammar_to_input(
@@ -2119,9 +2311,12 @@ class TTModelRunner:
                     else self.input_batch.live_req_ids()
                 ),
             )
-        return self.apply_and_build_runner_output(
+        output = self.apply_and_build_runner_output(
             sampled_token_ids, logprobs, req_ids=decode_req_ids
         )
+        if getattr(self, "_spec_enabled", False):
+            output = TTModelRunner._spec_attach_plain(self, output, fwd)
+        return output
 
     def _build_chunked_prefill_output(
         self,
