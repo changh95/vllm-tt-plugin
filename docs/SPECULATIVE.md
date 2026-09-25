@@ -138,8 +138,22 @@ traces are captured in the second, before the decode-bucket captures
   (flush), migrations, padding users, catch-up steps and plain decode above 16
   users -- every committed stream bitwise equal to the plain traced decode
   (`logs/spec_serving2.log`).
-- Served: see the table in the delivery report (`scripts/serve_pd.sh start`
-  with `QWEN36_SPEC_MTP=1`).
+- Served (2026-09-25, P/D 4+4 stack, `scripts/serve_pd.sh` defaults: decode
+  bucketing off, both runs at the same AICLK; `scripts/spec_served_suite.sh`):
+
+  | 128/128, concurrency | plain TPOT ms / tok/s | spec TPOT ms / tok/s | speed-up |
+  |---|---|---|---|
+  | 1 | 35.5 / 27.3 | 13.3 / 67.4 | 2.5x |
+  | 4 | 36.0 / 103 | 15.0 / 226 | 2.2x |
+  | 8 | 36.6 / 195 | 16.5 / 394 | 2.0x |
+  | 16 | 38.1 / 353 | 24.6 / 516 | 1.5x (k = 1 band) |
+  | 32 | 40.1 / 617 | 40.3 / 623 | plain above the ladder |
+
+  GSM8K real text: 13.2 / 15.5 / 23.9 ms TPOT at 1 / 8 / 16 vs 35.4 / 36.6 /
+  38.1 plain; vLLM acceptance length 3.5 (k = 3) on GSM8K, 2.9-3.1 on random
+  prompts; lm-eval GSM8K 0.82 both ways with all 200 generations identical
+  token for token; 5900 speculative steps, 14 held admissions (flushes), 26
+  migrations, no protocol error. TTFT unchanged (P side).
 
 ## Not done yet
 
