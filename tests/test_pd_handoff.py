@@ -830,3 +830,112 @@ def test_stage_ships_the_mtp_layer_and_hidden_row_when_the_model_has_a_head(
     st2 = w._staged["t2"]
     assert "mtp" not in st2.header and st2.header["version"] == 2
     w._release("t2")
+
+
+# ---- I: per-user staging (model hook stage_slot) -------------------------------------
+
+
+def _producer_with_step(p, slots, captures, meta, released=None):
+    """A producer inside a step: the runner's slot map, the model's parked snapshots and
+    the step's bound metadata (what ``_meta()`` returns during the forward)."""
+    released = [] if released is None else released
+    p.runner = SimpleNamespace(_req_state_slot=dict(slots))
+    p.model = SimpleNamespace(
+        pd_gdn_capture=dict(captures),
+        pd_gdn_snapshot_release=lambda r, c: released.append(1),
+    )
+    p.c._meta = lambda: meta
+    return p
+
+
+def test_stage_slot_releases_a_request_before_the_step_ends(producer, fake_pd_transfer):
+    """The model hook stages the request whose slot just got its snapshot; its GET is
+    answerable at once; the step-end pass skips it and stages only the rest."""
+    p = producer
+    kv, rec, taps = _payload()
+    released = []
+    meta = TTMooncakeConnectorMetadata(
+        stage=[StageReq("r1", [0, 1], 7, "tid-1"), StageReq("r2", [2, 3], 5, "tid-2")]
+    )
+    _producer_with_step(p, {"r1": 0, "r2": 1}, {0: (rec, taps)}, meta, released)
+    p.stage_slot(0)
+    assert "tid-1" in p._staged and "r1" in p._stage_done
+    assert p.model.pd_gdn_capture == {} and released == [1]
+    assert p._get_reply("tid-1", host_identity())["status"] == "ok"
+    p.stage_slot(1)  # r2 is not prefilled yet: nothing parked, nothing happens
+    assert "tid-2" not in p._staged and "r2" not in p._stage_done
+    p.model.pd_gdn_capture[1] = (rec, taps)  # r2's prefill finishes...
+    p.stage_after_step(meta)  # ...and the step-end pass stages it, r1 only once
+    assert set(p._staged) == {"tid-1", "tid-2"} and p.stats["staged"] == 2
+    assert released == [1, 1]
+    assert p.take_finished(set()) == ({"r1", "r2"}, None)
+
+
+def test_stage_slot_with_a_cancel_or_unknown_slot_is_harmless(
+    producer, fake_pd_transfer
+):
+    p = producer
+    kv, rec, taps = _payload()
+    released = []
+    meta = TTMooncakeConnectorMetadata(stage=[StageReq("r1", [0, 1], 7, "tid-1")])
+    _producer_with_step(p, {"r1": 3}, {3: (rec, taps)}, meta, released)
+    p.stage_slot(5)  # no request on slot 5 in this step
+    assert p._staged == {} and p.model.pd_gdn_capture == {3: (rec, taps)}
+    p._release("tid-1", remember_cancel=True)  # consumer gone before the stage
+    p.stage_slot(3)
+    assert p._staged == {} and released == [1] and "r1" in p._stage_done
+    assert p.take_finished(set()) == ({"r1"}, None)
+
+
+def test_stage_slot_failure_is_isolated_to_its_request(
+    producer, fake_pd_transfer, monkeypatch
+):
+    """An exception while exporting one user must not abort the N-user prefill: the
+    hook returns, the snapshot goes back to its pool, the request is reported finished
+    (P frees its blocks) and the others still stage."""
+    p = producer
+    kv, rec, taps = _payload()
+    released = []
+    mod = sys.modules["models.demos.blackhole.qwen36.tt.pd_transfer"]
+
+    def boom(model, block_ids):
+        if block_ids == [0, 1]:
+            raise RuntimeError("device read failed")
+        return kv
+
+    monkeypatch.setattr(mod, "export_kv_blocks", boom)
+    meta = TTMooncakeConnectorMetadata(
+        stage=[StageReq("r1", [0, 1], 7, "tid-1"), StageReq("r2", [2, 3], 5, "tid-2")]
+    )
+    _producer_with_step(
+        p, {"r1": 0, "r2": 1}, {0: (rec, taps), 1: (rec, taps)}, meta, released
+    )
+    p.stage_slot(0)  # raises inside _stage_one, swallowed by the hook
+    assert "tid-1" not in p._staged and "r1" in p._stage_done and released == [1]
+    assert p.pool.total == 0  # nothing acquired for the failed request
+    p.stage_slot(1)
+    assert "tid-2" in p._staged and released == [1, 1]
+    assert p.take_finished(set()) == ({"r1", "r2"}, None)
+
+
+def test_stage_slot_outside_a_connector_step_is_a_noop(producer, fake_pd_transfer):
+    p = producer
+    kv, rec, taps = _payload()
+
+    def unbound():
+        raise AssertionError("no metadata bound")
+
+    p.runner = SimpleNamespace(_req_state_slot={"r1": 0})
+    p.model = SimpleNamespace(pd_gdn_capture={0: (rec, taps)})
+    p.c._meta = unbound
+    p.stage_slot(0)
+    assert p._staged == {} and p.model.pd_gdn_capture == {0: (rec, taps)}
+
+
+@pytest.mark.parametrize("value,expected", [(None, True), ("1", True), ("0", False)])
+def test_stage_per_user_knob(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("QWEN36_PD_STAGE_PER_USER", raising=False)
+    else:
+        monkeypatch.setenv("QWEN36_PD_STAGE_PER_USER", value)
+    assert _WorkerSide(_connector_stub(True))._stage_per_user is expected

@@ -912,6 +912,10 @@ class _WorkerSide:
         # its GET was parked, or before it was scheduled): stage_after_step frees the
         # staging on arrival instead of holding it until the _GET_TIMEOUT_S GC
         self._cancelled: dict[str, float] = {}  # tid -> time.time() of the CANCEL
+        # QWEN36_PD_STAGE_PER_USER=1 (default): stage each request from the model's
+        # per-user hook (stage_slot) as soon as its prefill is done; 0 = only at step
+        # end (stage_after_step), the pre-2026-09-27 behaviour
+        self._stage_per_user = os.environ.get("QWEN36_PD_STAGE_PER_USER", "1") == "1"
         self._zmq_thread: threading.Thread | None = None
         self._stop = threading.Event()
         # consumer: pulls park on the producer for its whole queue time, so DONE/CANCEL
@@ -981,6 +985,11 @@ class _WorkerSide:
             # decode slots (P never decodes)
             self.model.pd_gdn_capture = {}
             self.model.pd_skip_gdn_slot_write = True
+            if self._stage_per_user:
+                # release each prefilled request to its consumer as soon as ITS
+                # prefill finishes (prefill_paged_slots calls the hook right after it
+                # parked the request's GDN snapshot), not at the end of the N-user step
+                self.model.pd_stage_hook = self.stage_slot
             self._zmq_thread = threading.Thread(
                 target=self._serve_side_channel, name="tt-pd-side-channel", daemon=True
             )
@@ -1020,6 +1029,7 @@ class _WorkerSide:
                 self.model,
                 max_bucket=int(os.environ.get("QWEN36_PD_EXPORT_WARMUP_MAX", "2048")),
             )
+            self._log_dram("after warm-up")
             return
         if not self.c._is_consumer:
             return
@@ -1049,6 +1059,29 @@ class _WorkerSide:
             n_slots,
             time.perf_counter() - t0,
         )
+        self._log_dram("after warm-up")
+
+    def _log_dram(self, when: str) -> None:
+        """Device DRAM allocated/free (per chip) at INFO: the number that sizes the
+        decode half's KV pool (QWEN36_PD_DECODE_MAX_TOKENS) and the prefill half's
+        export transient. Best effort: the memory view API differs between builds."""
+        try:
+            import ttnn
+
+            mv = ttnn.get_memory_view(self.model.mesh_device, ttnn.BufferType.DRAM)
+            banks = int(mv.num_banks)
+            alloc = int(mv.total_bytes_allocated_per_bank) * banks
+            free = int(mv.total_bytes_free_per_bank) * banks
+            logger.info(
+                "[pd] device DRAM %s: %.0f MiB allocated, %.0f MiB free (largest "
+                "contiguous %.0f MiB) per chip",
+                when,
+                alloc / 2**20,
+                free / 2**20,
+                int(mv.largest_contiguous_bytes_free_per_bank) * banks / 2**20,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[pd] device DRAM view unavailable (%s)", e)
 
     def shutdown(self):
         self._stop.set()
@@ -1160,15 +1193,52 @@ class _WorkerSide:
             self.pool.release(st.buf)
         return st is not None
 
+    def stage_slot(self, slot: int) -> None:
+        """Model hook (``model.pd_stage_hook``): ``prefill_paged_slots`` calls it right
+        after it parked decode slot ``slot``'s GDN snapshot, i.e. the moment THAT
+        request's prefill is done while the step's other requests are still to be
+        prefilled. The request is staged now, so its consumer's parked GET is answered
+        ~(N-1)/2 prefills earlier than at step end; ``stage_after_step`` then skips it
+        (``_stage_done``).
+        The step's metadata is bound (the runner binds it before the forward). A failure
+        is logged and isolated to this request (the request is reported finished so the
+        scheduler frees its blocks; the consumer's GET times out) and never propagates
+        into the N-user prefill."""
+        if not self.c._is_producer:
+            return
+        try:
+            meta = self.c._meta()
+        except (AssertionError, TypeError):
+            return  # no step metadata bound (a prefill outside a connector step)
+        slot_of = getattr(self.runner, "_req_state_slot", None) or {}
+        for sr in meta.stage:
+            if sr.req_id in self._stage_done or slot_of.get(sr.req_id) != slot:
+                continue
+            cap = self.model.pd_gdn_capture.pop(slot, None)
+            if cap is None:
+                return  # nothing parked under the slot: stage_after_step reports it
+            try:
+                self._stage_one(sr, slot, cap, where="per-user")
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[pd] per-user staging of %s (slot %d) failed; the request is "
+                    "not transferable",
+                    sr.req_id,
+                    slot,
+                )
+                with self._lock:
+                    self._finished_sending.add(sr.req_id)
+                    self._stage_done.add(sr.req_id)
+            return
+
     def stage_after_step(self, meta: TTMooncakeConnectorMetadata):
         if not self.c._is_producer or not meta.stage:
             return
-        from models.demos.blackhole.qwen36.tt import pd_transfer
-
         for sr in meta.stage:
             if sr.req_id in self._stage_done:
-                continue  # re-shipped until the scheduler sees finished_sending
-            t0 = time.perf_counter()
+                # staged per user (stage_slot), or re-shipped until the scheduler sees
+                # finished_sending
+                continue
             slot = self.runner._req_state_slot.get(sr.req_id)
             cap = (
                 self.model.pd_gdn_capture.pop(slot, None) if slot is not None else None
@@ -1181,11 +1251,52 @@ class _WorkerSide:
                     slot,
                 )
                 continue
-            rec_snap, conv_snap = cap
-            # the model reads snapshots into pooled host buffers; give them back once
-            # the bytes are in the staging buffer (or the request cannot be staged)
-            release_snapshot = getattr(self.model, "pd_gdn_snapshot_release", None)
-            tid = sr.transfer_id or sr.req_id
+            self._stage_one(sr, slot, cap, where="step end")
+        # garbage-collect stagings nobody pulled (decoder died / aborted upstream) and
+        # cancels whose staging never came (the request failed on this instance)
+        now = time.time()
+        with self._lock:
+            stale = [
+                tid
+                for tid, st in self._staged.items()
+                if now - st.t_staged > _GET_TIMEOUT_S
+            ]
+            for tid in [
+                t for t, at in self._cancelled.items() if now - at > _GET_TIMEOUT_S
+            ]:
+                del self._cancelled[tid]
+        for tid in stale:
+            logger.warning(
+                "[pd] dropping staged %s: never pulled within %.0f s",
+                tid,
+                _GET_TIMEOUT_S,
+            )
+            self._release(tid)
+
+    def _stage_one(self, sr: StageReq, slot, cap, where: str = "step end") -> None:
+        """Stage one prefilled request: export its KV blocks, pack them with the GDN
+        snapshot ``cap`` (popped from ``pd_gdn_capture`` by the caller) into a pooled
+        staging buffer and file it under its transfer id for the consumer's GET. The
+        snapshot's pooled host buffers are given back on every path (also when this
+        raises). Files ``_stage_done`` / ``_finished_sending`` for the scheduler."""
+        from models.demos.blackhole.qwen36.tt import pd_transfer
+
+        t0 = time.perf_counter()
+        rec_snap, conv_snap = cap
+        # the model reads snapshots into pooled host buffers; give them back once
+        # the bytes are in the staging buffer (or the request cannot be staged)
+        release_snapshot = getattr(self.model, "pd_gdn_snapshot_release", None)
+        released = False
+
+        def release():
+            nonlocal released
+            if not released:
+                released = True
+                if release_snapshot is not None:
+                    release_snapshot(rec_snap, conv_snap)
+
+        tid = sr.transfer_id or sr.req_id
+        try:
             with self._lock:
                 cancelled = self._cancelled.pop(tid, None) is not None
             if cancelled:
@@ -1197,12 +1308,11 @@ class _WorkerSide:
                     sr.req_id,
                     tid,
                 )
-                if release_snapshot is not None:
-                    release_snapshot(rec_snap, conv_snap)
+                release()
                 with self._lock:
                     self._finished_sending.add(sr.req_id)
                     self._stage_done.add(sr.req_id)
-                continue
+                return
             n_blocks = max(1, math.ceil(sr.num_tokens / self.c._block_size))
             block_ids = sr.block_ids[:n_blocks]
             if len(block_ids) < n_blocks:
@@ -1212,9 +1322,8 @@ class _WorkerSide:
                     len(sr.block_ids),
                     sr.num_tokens,
                 )
-                if release_snapshot is not None:
-                    release_snapshot(rec_snap, conv_snap)
-                continue
+                release()
+                return
             kv = pd_transfer.export_kv_blocks(self.model, block_ids)
             # speculative decoding (model.mtp_head): the drafter's KV layer is the last
             # export pair(s) and its hidden row travels with the snapshot
@@ -1236,8 +1345,7 @@ class _WorkerSide:
                 mtp_hidden=hidden,
                 n_mtp_layers=n_mtp,
             )
-            if release_snapshot is not None:
-                release_snapshot(rec_snap, conv_snap)
+            release()
             addr, nbytes = buf.data_ptr(), int(header["nbytes"])
             shm_name = self.pool.shm_name(buf)
             with self._lock:
@@ -1257,15 +1365,16 @@ class _WorkerSide:
                     sr.req_id,
                     tid,
                 )
-                continue
+                return
             t2 = time.perf_counter()
             self.stats["staged"] += 1
             self.stats["staged_bytes"] += header["nbytes"]
             self.stats["stage_ms"] += 1e3 * (t2 - t0)
             logger.info(
-                "[pd] staged %s: %d tokens, %d blocks, %.1f MiB (export %.1f ms, "
+                "[pd] staged %s (%s): %d tokens, %d blocks, %.1f MiB (export %.1f ms, "
                 "pack+register %.1f ms) digest %s transfer %s via %s%s",
                 sr.req_id,
+                where,
                 sr.num_tokens,
                 n_blocks,
                 header["nbytes"] / 2**20,
@@ -1281,26 +1390,8 @@ class _WorkerSide:
                     else ""
                 ),
             )
-        # garbage-collect stagings nobody pulled (decoder died / aborted upstream) and
-        # cancels whose staging never came (the request failed on this instance)
-        now = time.time()
-        with self._lock:
-            stale = [
-                tid
-                for tid, st in self._staged.items()
-                if now - st.t_staged > _GET_TIMEOUT_S
-            ]
-            for tid in [
-                t for t, at in self._cancelled.items() if now - at > _GET_TIMEOUT_S
-            ]:
-                del self._cancelled[tid]
-        for tid in stale:
-            logger.warning(
-                "[pd] dropping staged %s: never pulled within %.0f s",
-                tid,
-                _GET_TIMEOUT_S,
-            )
-            self._release(tid)
+        finally:
+            release()
 
     # ---- consumer ----
     def start_step(self, meta: TTMooncakeConnectorMetadata):
