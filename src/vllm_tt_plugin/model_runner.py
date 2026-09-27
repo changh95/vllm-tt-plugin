@@ -46,6 +46,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    get_tt_prefill_chunk_policy,
     is_tt_adaptive_block_output_model,
     is_tt_adaptive_block_ragged,
     is_tt_block_output_model,
@@ -215,6 +216,8 @@ class TTModelRunner:
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+        # TT chunk policy: prefill submissions carry resume/final row masks.
+        self._tt_prefill_chunk_policy = get_tt_prefill_chunk_policy(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
         self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
         # Ragged batched blocks: a decode block step's [num_reqs, W] rows carry
@@ -1474,6 +1477,7 @@ class TTModelRunner:
                 )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
+        prefill_resume_mask: list[bool] | None = None
         if is_prompt:
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
@@ -1500,6 +1504,17 @@ class TTModelRunner:
                 req_indices, :max_prefill_tokens
             ]
             decode_layout_changed = False
+            if getattr(self, "_tt_prefill_chunk_policy", None) is not None:
+                # A continuation is a cached request the scheduler neither
+                # admitted nor resumed this step that has computed tokens: the
+                # previous chunk of the same prompt. Prefix caching is off, so
+                # nothing else reaches the prefill path with computed tokens.
+                continuing = set(cached_reqs.req_ids) - set(cached_reqs.resumed_req_ids)
+                prefill_resume_mask = [
+                    bool(input_positions[k] > 0)
+                    and input_batch.req_ids[i] in continuing
+                    for k, i in enumerate(req_indices)
+                ]
         else:
             for req_id in remote_new:
                 # The existing decode math then yields position T-1 and token
@@ -1742,6 +1757,7 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prefill_resume_mask=prefill_resume_mask,
         )
 
     def build_model_input(
@@ -2393,6 +2409,15 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        # ``getattr``: host tests submit prebuilt namespace inputs.
+        resume_mask = getattr(model_input, "prefill_resume_mask", None)
+        if resume_mask is not None:
+            # TT chunk policy (the model declared tt_prefill_chunk_tokens): which
+            # rows resume their prompt at ``start_pos``, and which chunks end it.
+            kwargs["prefill_resume_mask"] = list(resume_mask)
+            kwargs["prefill_final_mask"] = [
+                not bool(m) for m in model_input.intermediate_prefill_mask.tolist()
+            ]
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)

@@ -14,12 +14,15 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
+    clear_tt_prefill_chunk_policy,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
+    get_tt_prefill_chunk_policy,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_prefill_chunk_policy,
     store_tt_adaptive_block_batched,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
@@ -150,6 +153,7 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     """Disable split prefills and restore a full-prompt scheduler budget."""
     scheduler_config = vllm_config.scheduler_config
     model_config = vllm_config.model_config
+    clear_tt_prefill_chunk_policy(vllm_config)
 
     if scheduler_config.enable_chunked_prefill:
         logger.info(
@@ -212,17 +216,51 @@ def _apply_chunked_prefill_policy(
     # stays off for every model that does not reach here.
     scheduler_config.disable_chunked_mm_input = True
 
+    # A model that declares its chunk unit gets the TT chunk policy (aligned
+    # chunks, one long prompt at a time, a decode cadence; see TTScheduler);
+    # one that does not keeps the plain base-scheduler chunking.
+    chunk_unit = model_capabilities.get("tt_prefill_chunk_tokens")
+    policy = (
+        resolve_tt_prefill_chunk_policy(vllm_config, chunk_unit)
+        if chunk_unit is not None
+        else None
+    )
+
     # The only signal from outside the process that chunked prefill is active and
     # at what budget: the scheduler config is absent from /metrics and an
     # intermediate chunk emits no token, so it raises no iteration stats either.
     # CI gates its device tests on this line, so it is logged unconditionally.
     logger.info(
         "Chunked prefill enabled for %s: max_num_batched_tokens=%d, "
-        "long_prefill_token_threshold=%d.",
+        "long_prefill_token_threshold=%d, tt chunk policy (chunk_tokens, "
+        "decode_steps_per_chunk)=%s.",
         model_desc,
         scheduler_config.max_num_batched_tokens,
         scheduler_config.long_prefill_token_threshold,
+        policy,
     )
+
+
+def _finalize_tt_prefill_chunk_policy(
+    vllm_config: "VllmConfig", *, is_lane_mode: bool
+) -> None:
+    """Turn the TT chunk policy off where phase 1 does not support it.
+
+    Runs after async scheduling and lane mode are resolved. The chunk cadence
+    counts synchronous steps, lane-DP schedules through the lane coordinator,
+    and a KV-transfer (PD) split has its own prefill path; each disables
+    chunked prefill rather than serving a combination nobody validated.
+    """
+    if get_tt_prefill_chunk_policy(vllm_config) is None:
+        return
+    if vllm_config.scheduler_config.async_scheduling:
+        _disable_chunked_prefill(
+            vllm_config, "the TT chunk policy with async scheduling"
+        )
+    elif is_lane_mode:
+        _disable_chunked_prefill(vllm_config, "the TT chunk policy with lane-DP")
+    elif getattr(vllm_config, "kv_transfer_config", None) is not None:
+        _disable_chunked_prefill(vllm_config, "the TT chunk policy with KV transfer")
 
 
 def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
@@ -864,6 +902,14 @@ def _install_block_output_input_processor_patch() -> None:
                 "TT block-output models do not support resumable "
                 "streaming-input requests"
             )
+        if kwargs.get("resumable", False) and get_tt_prefill_chunk_policy(
+            self.vllm_config
+        ):
+            # A resumed session re-enters with computed tokens at an arbitrary
+            # offset; the TT chunk policy resumes only its own aligned chunks.
+            raise ValueError(
+                "TT chunked prefill does not support resumable streaming-input requests"
+            )
 
         unresolved_max_tokens = (
             isinstance(params, SamplingParams) and params.max_tokens is None
@@ -918,6 +964,10 @@ def _install_block_output_streaming_input_patch() -> None:
             raise ValueError(
                 "TT block-output models do not support resumable "
                 "streaming-input requests"
+            )
+        if get_tt_prefill_chunk_policy(self.vllm_config):
+            raise ValueError(
+                "TT chunked prefill does not support resumable streaming-input requests"
             )
         return await original(self, *args, **kwargs)
 
@@ -2067,6 +2117,13 @@ class TTPlatform(Platform):
             )
         else:
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
+
+        _finalize_tt_prefill_chunk_policy(vllm_config, is_lane_mode=is_lane_mode)
+        if get_tt_prefill_chunk_policy(vllm_config) and not is_block_output_model:
+            # Refuse resumable streaming-input sessions at the frontend (the
+            # patches' block-output branches stay inert for this model).
+            _install_block_output_input_processor_patch()
+            _install_block_output_streaming_input_patch()
 
         # ``getattr``: host tests hand this hook a SimpleNamespace config.
         if getattr(vllm_config, "kv_transfer_config", None) is not None:

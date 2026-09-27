@@ -170,6 +170,13 @@ class TTModelInput:
     # ``None`` for decode.
     intermediate_prefill_mask: torch.Tensor | None = None
 
+    # Prefill only, TT chunk policy only: rows that continue a chunked prompt
+    # (a scheduled cached request that is neither new nor resumed and has
+    # computed tokens), in row order. The model resumes those rows at
+    # ``input_positions`` and re-prefills every other row from 0. ``None``
+    # when the policy is off (the model then never receives the mask).
+    prefill_resume_mask: list[bool] | None = None
+
     # Request id per forward row. A prefill build can drop rows, so forward row
     # order is not recoverable from the persistent batch; sample-time consumers
     # must resolve rows through this. ``None`` for lane builds, whose rows are

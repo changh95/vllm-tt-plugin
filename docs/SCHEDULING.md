@@ -190,6 +190,45 @@ Two things follow for the TT execution path:
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
 
+#### TT chunk policy (models that declare `tt_prefill_chunk_tokens`)
+
+A model can declare its resume unit as
+`model_capabilities['tt_prefill_chunk_tokens']` (next to
+`supports_chunked_prefill`). The platform then resolves a chunk policy
+`(chunk_tokens, decode_steps_per_chunk)` and `TTScheduler` uses chunking to
+interleave long prefills with decode instead of running them whole:
+
+- **Aligned chunks.** `long_prefill_token_threshold` is set to the chunk size,
+  and `max_num_batched_tokens` is raised to at least
+  `max_model_len + max_num_seqs * chunk_tokens`, so only the threshold ever
+  splits a prompt. Every chunk that leaves its prompt unfinished starts and ends
+  on a multiple of the chunk size (the scheduler refuses anything else loudly).
+- **One long prompt in flight.** A prompt with more than one chunk left to
+  compute is long. While one is partial, other long waiting requests are hidden
+  from the prefill pass; otherwise only the oldest one is visible.
+- **Dynamic cap.** With no request decoding, the threshold is 0 for that pass:
+  the whole remaining prompt runs in one step, so a lone request's TTFT does not
+  change.
+- **Cadence.** While a prompt is partial and requests decode, a prefill step
+  runs only after `decode_steps_per_chunk` decode steps since the previous
+  prefill step. Short prompts wait for that step too and share it with the
+  chunk, so the decoders stall once per cycle.
+- **KV pressure.** A partial whose next chunk does not fit the free KV blocks
+  is not scheduled (vLLM would preempt it and drop its computed chunks); the
+  step decodes and admits nothing until blocks free up.
+- **Runner.** Each prefill row that continues a chunked prompt (a cached
+  request, not resumed this step, with computed tokens) is flagged; the model
+  receives `prefill_resume_mask` and `prefill_final_mask` next to `start_pos`
+  and re-prefills every unflagged row from position 0.
+
+Knobs (`--additional-config '{"tt": {...}}'`): `prefill_chunk_tokens` (a
+multiple of the model's unit; default the unit) and
+`chunked_prefill_decode_steps` (default 4; 0 = no cadence). The policy is
+turned off (chunked prefill disabled) with async scheduling, lane-DP, or a
+`kv_transfer_config`, and resumable streaming-input requests are rejected while
+it is on. The startup log line `Chunked prefill enabled for ...` prints the
+resolved policy.
+
 ### Block-output reservation
 
 Output placeholders (see "Why TT uses an async-style scheduler even in

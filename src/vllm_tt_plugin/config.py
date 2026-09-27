@@ -326,3 +326,107 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
         vllm_config.parallel_config.data_parallel_size == 1
         and get_tt_data_parallel_size(vllm_config) > 1
     )
+
+
+# Resolved scheduler-driven chunked-prefill policy
+# (see ``resolve_tt_prefill_chunk_policy``):
+# ``[chunk_tokens, decode_steps_per_chunk]``, or absent when the policy is off.
+_PREFILL_CHUNK_POLICY_KEY = "_tt_prefill_chunk_policy"
+_DEFAULT_CHUNKED_PREFILL_DECODE_STEPS = 4
+
+
+def get_tt_prefill_chunk_policy(vllm_config: "VllmConfig") -> tuple[int, int] | None:
+    """Return ``(chunk_tokens, decode_steps_per_chunk)`` when the TT chunk policy is on.
+
+    The policy is on only for a model that declares ``tt_prefill_chunk_tokens``
+    (and ``supports_chunked_prefill``) while chunked prefill stays enabled; the
+    scheduler then splits at most one long prompt at a time into aligned chunks
+    and interleaves them with decode steps (``TTScheduler``), and the runner
+    tells the model which prefill rows resume a chunk.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    policy = additional.get(_PREFILL_CHUNK_POLICY_KEY)
+    if policy is None:
+        return None
+    return int(policy[0]), int(policy[1])
+
+
+def store_tt_prefill_chunk_policy(
+    vllm_config: "VllmConfig", chunk_tokens: int, decode_steps: int
+) -> None:
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_PREFILL_CHUNK_POLICY_KEY] = [int(chunk_tokens), int(decode_steps)]
+
+
+def clear_tt_prefill_chunk_policy(vllm_config: "VllmConfig") -> None:
+    additional = getattr(vllm_config, "additional_config", None)
+    if isinstance(additional, dict):
+        additional.pop(_PREFILL_CHUNK_POLICY_KEY, None)
+
+
+def resolve_tt_prefill_chunk_policy(
+    vllm_config: "VllmConfig", model_chunk_tokens: int
+) -> tuple[int, int]:
+    """Resolve and store the chunk policy of a model that declared its chunk unit.
+
+    Operator knobs (``additional_config.tt``):
+
+    - ``prefill_chunk_tokens``: the chunk size, a positive multiple of the
+      model's ``tt_prefill_chunk_tokens`` (default: that unit). Chunk starts
+      are multiples of it, which is what the model resumes from.
+    - ``chunked_prefill_decode_steps``: decode-only steps after each chunk step
+      while requests are decoding (default 4; 0 = no cadence).
+
+    Rewrites the scheduler config so the base scheduler's token budget never
+    splits a prompt (only ``long_prefill_token_threshold`` does, at the chunk
+    size): at most one long prompt plus ``max_num_seqs - 1`` prompts of at most
+    one chunk share a step, so the budget is raised to at least
+    ``max_model_len + max_num_seqs * chunk_tokens``.
+    """
+    unit = int(model_chunk_tokens)
+    if unit <= 0:
+        raise ValueError(f"tt_prefill_chunk_tokens must be positive, got {unit}")
+    tt_config = get_tt_config(vllm_config)
+    chunk = tt_config.get("prefill_chunk_tokens", unit)
+    if isinstance(chunk, bool) or not isinstance(chunk, int) or chunk <= 0:
+        raise ValueError(
+            "additional_config.tt.prefill_chunk_tokens must be a positive "
+            f"integer, got {chunk!r}"
+        )
+    if chunk % unit != 0:
+        raise ValueError(
+            f"additional_config.tt.prefill_chunk_tokens={chunk} must be a multiple "
+            f"of the model's tt_prefill_chunk_tokens={unit}"
+        )
+    steps = tt_config.get(
+        "chunked_prefill_decode_steps", _DEFAULT_CHUNKED_PREFILL_DECODE_STEPS
+    )
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+        raise ValueError(
+            "additional_config.tt.chunked_prefill_decode_steps must be an integer "
+            f">= 0, got {steps!r}"
+        )
+    block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
+    if block_size and chunk % int(block_size) != 0:
+        raise ValueError(
+            f"prefill chunk {chunk} must be a multiple of the KV block size "
+            f"{block_size}"
+        )
+    scheduler_config = vllm_config.scheduler_config
+    max_model_len = vllm_config.model_config.max_model_len
+    budget = max_model_len + int(scheduler_config.max_num_seqs) * chunk
+    if scheduler_config.max_num_batched_tokens < budget:
+        logger.warning(
+            "TT chunked prefill: raising max_num_batched_tokens %d -> %d "
+            "(max_model_len + max_num_seqs * chunk) so only the chunk threshold "
+            "splits a prompt.",
+            scheduler_config.max_num_batched_tokens,
+            budget,
+        )
+        scheduler_config.max_num_batched_tokens = budget
+    scheduler_config.long_prefill_token_threshold = chunk
+    store_tt_prefill_chunk_policy(vllm_config, chunk, steps)
+    return chunk, steps

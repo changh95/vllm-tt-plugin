@@ -321,3 +321,126 @@ def test_apply_sampled_token_updates_request_state():
 
 
 # endregion Output state
+
+
+# region TT chunk policy: resume/final row masks
+
+
+def _two_request_batch(computed_r: int, computed_s: int):
+    batch = InputBatch(
+        max_num_reqs=MAX_NUM_REQS,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[BLOCK_SIZE],
+        kernel_block_sizes=[BLOCK_SIZE],
+    )
+    requests = {}
+    for req_id, computed in (("r", computed_r), ("s", computed_s)):
+        request = CachedRequestState(
+            req_id=req_id,
+            prompt_token_ids=list(range(24)),
+            mm_features=None,
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            block_ids=([0],),
+            num_computed_tokens=computed,
+            output_token_ids=[],
+        )
+        batch.add_request(request)
+        requests[req_id] = request
+    return batch, requests
+
+
+def _chunk_step(runner, rows, resumed=()):
+    out = SchedulerOutput.make_empty()
+    out.num_scheduled_tokens = {r: s for r, s, _ in rows}
+    out.total_num_scheduled_tokens = sum(s for _, s, _ in rows)
+    out.scheduled_cached_reqs = CachedRequestData(
+        req_ids=[r for r, *_ in rows],
+        resumed_req_ids=set(resumed),
+        new_token_ids=[[] for _ in rows],
+        all_token_ids={},
+        new_block_ids=[None for _ in rows],
+        num_computed_tokens=[c for *_, c in rows],
+        num_output_tokens=[0 for _ in rows],
+    )
+    return TTModelRunner._prepare_model_inputs(runner, out, None)
+
+
+@pytest.mark.parametrize("policy", [None, (8, 4)])
+def test_prefill_resume_mask_marks_only_chunk_continuations(policy):
+    """A continuation (cached, not resumed, computed > 0) resumes; a row
+    prefilled from 0 does not; no mask at all without the policy."""
+    batch, requests = _two_request_batch(computed_r=8, computed_s=0)
+    runner = _fake_runner(batch, requests["r"])
+    runner.requests = requests
+    runner._tt_prefill_chunk_policy = policy
+
+    model_input = _chunk_step(runner, [("r", 8, 8), ("s", 8, 0)])
+
+    assert model_input.intermediate_prefill_mask.tolist() == [True, True]
+    if policy is None:
+        assert model_input.prefill_resume_mask is None
+    else:
+        assert model_input.prefill_resume_mask == [True, False]
+        assert model_input.input_positions.tolist() == [8, 0]
+
+
+def test_prefill_resume_mask_excludes_resumed_requests():
+    """A request resumed this step (e.g. a streaming session re-entering with
+    computed tokens) is not a chunk continuation: the model re-prefills it."""
+    batch, requests = _two_request_batch(computed_r=8, computed_s=8)
+    runner = _fake_runner(batch, requests["r"])
+    runner.requests = requests
+    runner._tt_prefill_chunk_policy = (8, 4)
+
+    model_input = _chunk_step(runner, [("r", 16, 8), ("s", 16, 8)], resumed={"s"})
+
+    assert model_input.prefill_resume_mask == [True, False]
+    assert model_input.intermediate_prefill_mask.tolist() == [False, False]
+
+
+def test_submit_prefill_forwards_chunk_masks_only_under_the_policy():
+    import torch
+
+    captured: dict = {}
+
+    class FakeModel:
+        def prefill_forward(self, **kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            return object()
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        model=FakeModel(),
+        async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
+    )
+
+    def model_input(resume_mask):
+        return SimpleNamespace(
+            input_tokens=torch.zeros((2, 4), dtype=torch.int32),
+            block_tables=torch.zeros((2, 1), dtype=torch.int32),
+            prompt_lens=[4, 4],
+            input_positions=torch.tensor([2, 0]),
+            block_tables_per_layer=None,
+            multi_modal_kwargs={},
+            perform_device_sampling=False,
+            prefill_empty_slots=[0, 1],
+            intermediate_prefill_mask=torch.tensor([False, True]),
+            prefill_resume_mask=resume_mask,
+        )
+
+    TTModelRunner.submit_prefill(runner, model_input([True, False]), [2])
+    assert captured["prefill_resume_mask"] == [True, False]
+    assert captured["prefill_final_mask"] == [True, False]
+
+    TTModelRunner.submit_prefill(runner, model_input(None), [2])
+    assert "prefill_resume_mask" not in captured
+    assert "prefill_final_mask" not in captured
+
+
+# endregion TT chunk policy

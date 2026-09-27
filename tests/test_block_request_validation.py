@@ -15,6 +15,7 @@ from vllm.sampling_params import (
 from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     store_tt_output_tokens_per_step,
+    store_tt_prefill_chunk_policy,
 )
 from vllm_tt_plugin.platform import (
     TTPlatform,
@@ -785,6 +786,31 @@ def test_input_processor_rejects_resumable_block_request_before_upstream(
     assert processor.process_inputs_calls == []
 
 
+def test_input_processor_rejects_resumable_request_under_chunk_policy(monkeypatch):
+    """A resumed streaming session re-enters with computed tokens at an arbitrary
+    offset, which the TT chunk policy cannot resume: refused before upstream."""
+    processor_cls, processor = _processor_harness(monkeypatch, output_size=1)
+    store_tt_prefill_chunk_policy(processor.vllm_config, 2048, 4)
+
+    with pytest.raises(ValueError, match="chunked prefill does not support resumable"):
+        processor_cls.process_inputs(
+            processor,
+            "streaming-input-chunked",
+            {"prompt_token_ids": [1] * 200},
+            SamplingParams(max_tokens=16),
+            resumable=True,
+        )
+    assert processor.process_inputs_calls == []
+
+    request = processor_cls.process_inputs(
+        processor,
+        "plain-chunked",
+        {"prompt_token_ids": [1] * 200},
+        SamplingParams(max_tokens=16),
+    )
+    assert request.resumable is False
+
+
 def test_input_processor_preserves_resumable_ar_request(monkeypatch):
     processor_cls, processor = _processor_harness(monkeypatch, output_size=1)
 
@@ -889,7 +915,12 @@ def test_input_processor_keeps_transport_controls_for_adaptive_block_model(
     from vllm_tt_plugin.platform import _neutralize_model_owned_sampling
 
     params = SamplingParams(
-        max_tokens=16, temperature=0.7, top_p=0.9, top_k=5, seed=7, min_p=0.1,
+        max_tokens=16,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=5,
+        seed=7,
+        min_p=0.1,
         repetition_penalty=1.2,
     )
     ignored = _neutralize_model_owned_sampling(params, keep_transport_controls=True)
@@ -915,8 +946,11 @@ def test_adaptive_block_model_rejects_multimodal_prompt(monkeypatch):
     assert config is not None
     store_tt_adaptive_block_output(config, True)
     try:
-        prompt = {"prompt_token_ids": [1] * 32, "mm_kwargs": [object()],
-                  "mm_placeholders": {"image": [object()]}}
+        prompt = {
+            "prompt_token_ids": [1] * 32,
+            "mm_kwargs": [object()],
+            "mm_placeholders": {"image": [object()]},
+        }
         with pytest.raises(ValueError, match="text prompts only"):
             TTPlatform.validate_request(prompt, SamplingParams(max_tokens=16))
         # text prompt still fine

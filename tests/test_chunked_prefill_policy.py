@@ -4,12 +4,18 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 # vLLM's own bootstrap resolves the platform plugin, which imports this module.
 # Letting the plugin module trigger that bootstrap deadlocks the cycle on a
 # half-built module, so let vLLM finish importing itself first.
 import vllm  # noqa: F401
 
-from vllm_tt_plugin.platform import _apply_chunked_prefill_policy
+from vllm_tt_plugin.config import get_tt_prefill_chunk_policy
+from vllm_tt_plugin.platform import (
+    _apply_chunked_prefill_policy,
+    _finalize_tt_prefill_chunk_policy,
+)
 
 
 class _FakeModel:
@@ -22,6 +28,8 @@ def _vllm_config(
     max_num_batched_tokens: int = 2048,
     max_model_len: int = 16384,
     long_prefill_token_threshold: int = 512,
+    max_num_seqs: int = 8,
+    tt: dict | None = None,
 ):
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(
@@ -29,8 +37,12 @@ def _vllm_config(
             max_num_batched_tokens=max_num_batched_tokens,
             long_prefill_token_threshold=long_prefill_token_threshold,
             disable_chunked_mm_input=False,
+            max_num_seqs=max_num_seqs,
+            async_scheduling=False,
         ),
         model_config=SimpleNamespace(max_model_len=max_model_len),
+        cache_config=SimpleNamespace(block_size=64),
+        additional_config={"tt": dict(tt or {})},
     )
 
 
@@ -151,3 +163,78 @@ def test_block_output_model_loses_chunked_prefill_even_when_declared():
     assert config.scheduler_config.max_num_batched_tokens == 16384
     assert config.scheduler_config.long_prefill_token_threshold == 0
     assert config.scheduler_config.disable_chunked_mm_input is False
+
+
+# ---- TT chunk policy: a model that declares its chunk unit ------------------
+
+_CHUNK_CAPS = {"supports_chunked_prefill": True, "tt_prefill_chunk_tokens": 2048}
+
+
+def test_declared_chunk_unit_resolves_the_tt_chunk_policy():
+    config = _vllm_config(max_num_batched_tokens=65536, max_model_len=65536)
+
+    _apply(config, _CHUNK_CAPS)
+
+    sched = config.scheduler_config
+    assert get_tt_prefill_chunk_policy(config) == (2048, 4)
+    assert sched.enable_chunked_prefill is True
+    assert sched.long_prefill_token_threshold == 2048
+    # one long prompt + max_num_seqs short ones never exceed the budget
+    assert sched.max_num_batched_tokens == 65536 + 8 * 2048
+
+
+def test_chunk_policy_knobs():
+    config = _vllm_config(
+        tt={"prefill_chunk_tokens": 4096, "chunked_prefill_decode_steps": 0}
+    )
+    _apply(config, _CHUNK_CAPS)
+    assert get_tt_prefill_chunk_policy(config) == (4096, 0)
+
+    for tt in (
+        {"prefill_chunk_tokens": 3072},
+        {"prefill_chunk_tokens": 0},
+        {"chunked_prefill_decode_steps": -1},
+    ):
+        with pytest.raises(ValueError):
+            _apply(_vllm_config(tt=tt), _CHUNK_CAPS)
+
+
+def test_chunk_unit_without_the_flag_or_on_block_output_resolves_no_policy():
+    config = _vllm_config(enable_chunked_prefill=False)
+    _apply(config, _CHUNK_CAPS)
+    assert get_tt_prefill_chunk_policy(config) is None
+
+    config = _vllm_config()
+    _apply(config, {**_CHUNK_CAPS, "output_tokens_per_step": 16})
+    assert get_tt_prefill_chunk_policy(config) is None
+    assert config.scheduler_config.long_prefill_token_threshold == 0
+
+
+def test_supports_chunked_prefill_without_a_unit_keeps_plain_chunking():
+    config = _vllm_config(max_num_batched_tokens=3000)
+    _apply(config, {"supports_chunked_prefill": True})
+    assert get_tt_prefill_chunk_policy(config) is None
+    assert config.scheduler_config.max_num_batched_tokens == 3000
+
+
+@pytest.mark.parametrize("case", ["async", "lanes", "kv_transfer"])
+def test_chunk_policy_is_refused_where_phase_1_does_not_support_it(case):
+    config = _vllm_config()
+    _apply(config, _CHUNK_CAPS)
+    if case == "async":
+        config.scheduler_config.async_scheduling = True
+    if case == "kv_transfer":
+        config.kv_transfer_config = object()
+
+    _finalize_tt_prefill_chunk_policy(config, is_lane_mode=case == "lanes")
+
+    assert get_tt_prefill_chunk_policy(config) is None
+    assert config.scheduler_config.enable_chunked_prefill is False
+    assert config.scheduler_config.long_prefill_token_threshold == 0
+
+
+def test_chunk_policy_survives_finalize_for_plain_sync_serving():
+    config = _vllm_config()
+    _apply(config, _CHUNK_CAPS)
+    _finalize_tt_prefill_chunk_policy(config, is_lane_mode=False)
+    assert get_tt_prefill_chunk_policy(config) == (2048, 4)
