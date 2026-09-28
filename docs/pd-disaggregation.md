@@ -79,6 +79,33 @@ A consumer without a drafter drops the extra layer; a drafter fed by a version-1
 and no hidden row and must not draft for that request. Round-trip evidence (bitwise KV / hidden row and identical
 committed streams): tt-metal `models/demos/blackhole/qwen36/tests/pd_mtp_transfer_repro.py`.
 
+## Speculative decoding (DFlash2 drafter) state -- payload version 3 KV groups
+
+With `QWEN36_SPEC_DRAFTER=dflash2` (tt-metal `tt/aux_hidden.py`; the master switch stays `QWEN36_SPEC_MTP=1`) the
+producer builds no MTP head. Its prefill instead captures the target's auxiliary hidden states (the residual after
+layers 5/19/33/47/61, the DFlash2 `target_layer_ids`) per masked bucket / 2048-token chunk, projects them into the
+drafter's CONTEXT K/V (5 layers x 8 kv heads x 128, `dflash2_head.DFlash2ContextProjector`) and stages them per
+decode slot; `_stage_one` takes them through `pd_transfer.export_kv_groups` and the payload (format version 3)
+carries them as the KV GROUP `dflash2`:
+
+- `dflash2.kv.<j>.k/.v`, j = 0..4, each `[n_shipped_blocks, 8, block_size, 128]` bf16 (dim 1 in global kv-head
+  order = device-major over the decoder's shards; 20 KB/token, +24 % of an 8k payload), after `gdn.taps` /
+  `mtp.hidden`;
+- `header["kv_groups"]["dflash2"] = {n_layers, kv_heads, head_dim, block_size, block_index, first_pos, n_tokens}`
+  where `block_index` lists the shipped blocks as indices into the request's block list (all of them by default;
+  `QWEN36_DFLASH2_CONTEXT_WINDOW=2048` ships the drafter's sliding-window tail only: 32 of 128 blocks at 8k).
+
+Version 3 adds tensors and header fields only: a version-2 consumer decodes a version-3 payload unchanged and a
+version-3 consumer decodes a version-2 one (no groups). The consumer registers its drafter's caches once at warm-up
+(`pd_transfer.register_kv_group(model, "dflash2", drafter.kv_layers, pad_block=...)`, or attaches the drafter as
+`model.dflash2_drafter`; then `pd_transfer.kv_group_import_warmup(model)` before any trace capture); the drain
+imports the group's blocks right after the main KV (`pd_transfer.import_kv_groups`, same block ids / page table)
+and parks the metadata as `entry[4]["kv_groups"]["dflash2"]` -- the runner then knows positions
+`[first_pos, first_pos + n_tokens)` of the request have context K/V in the drafter's cache. A consumer without the
+group logs once and skips it (plain decode for that request). Round-trip evidence (imported drafter K/V bitwise equal
+to the decoder's own projection of the same prompt for 8 x 128, 4196 and 8192 tokens): tt-metal
+`models/demos/blackhole/qwen36/tests/pd_dflash2_transfer_repro.py`, numbers in `tests/DFLASH2_TRANSPORT_RESULTS.md`.
+
 ## Configuration
 
 Producer (prefill instance):
