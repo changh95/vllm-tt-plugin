@@ -517,3 +517,83 @@ def test_build_spec_step_input_eligibility():
     assert not TTModelRunner._build_spec_step_input(
         runner, so, ["a", "b"], 4, True, False
     ).eligible
+
+
+def test_pd_admission_reports_the_kv_group_metadata_to_the_model(monkeypatch):
+    """The consumer runner's admission of an imported request hands the payload's
+    parked sidecar (``entry[4]``: mtp_hidden / kv_groups) to the model's
+    ``spec_note_admission`` -- the DFlash2 drafter learns whether the request's
+    context K/V (group "dflash2") arrived; a model without the hook (plain /
+    MTP-only builds) is left alone."""
+    import sys
+    import types
+
+    calls = []
+    mod = types.ModuleType("models.demos.blackhole.qwen36.tt.pd_transfer")
+    mod.import_gdn_slot = lambda model, slot, rec, conv: calls.append(("gdn", slot))
+    mod.import_mtp_hidden = lambda model, slot, row: calls.append(("mtp", slot))
+    parent = None
+    chain = ["models", "demos", "blackhole", "qwen36", "tt"]
+    for i, name in enumerate(chain):
+        full = ".".join(chain[: i + 1])
+        pkg = sys.modules.get(full) or types.ModuleType(full)
+        pkg.__path__ = []
+        monkeypatch.setitem(sys.modules, full, pkg)
+        if parent is not None:
+            monkeypatch.setattr(parent, name, pkg, raising=False)
+        parent = pkg
+    monkeypatch.setattr(parent, "pd_transfer", mod, raising=False)
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    noted = []
+    inner = SimpleNamespace(mtp_head=None)
+    model = SimpleNamespace(
+        model=[inner],
+        spec_note_admission=lambda slot, req_id, extra: noted.append(
+            (slot, req_id, extra)
+        ),
+    )
+    meta = {"n_layers": 5, "first_pos": 0, "n_tokens": 100, "block_index": [0, 1]}
+    runner = SimpleNamespace(
+        pd_pending_gdn={
+            "a": (
+                torch.zeros(1),
+                torch.zeros(1),
+                None,
+                None,
+                {"mtp_hidden": None, "kv_groups": {"dflash2": meta}},
+            ),
+            "b": (
+                torch.zeros(1),
+                torch.zeros(1),
+                None,
+                None,
+                {"mtp_hidden": None, "kv_groups": {}},
+            ),
+            "later": (torch.zeros(1), torch.zeros(1)),
+        },
+        input_batch=SimpleNamespace(req_id_to_index={"a": 3, "b": 5}),
+        _alloc_prefill_state_slots=lambda ids: [int(ids[0][-1] == "b") * 4 + 2],
+        model=model,
+        requests={},
+    )
+    TTModelRunner._pd_after_update_states(runner, None)
+    assert calls == [("gdn", 2), ("gdn", 6)]
+    assert noted == [
+        (2, "a", {"mtp_hidden": None, "kv_groups": {"dflash2": meta}}),
+        (6, "b", {"mtp_hidden": None, "kv_groups": {}}),
+    ]
+    assert set(runner.pd_pending_gdn) == {"later"}  # not in the batch yet: stays parked
+    assert runner._pd_imported_new == {"a", "b"}
+    assert runner.model._slots_prefilled_since_decode == {3, 5}
+    # a model without the hook: the same admission, nothing reported
+    runner.pd_pending_gdn["c"] = (
+        torch.zeros(1),
+        torch.zeros(1),
+        None,
+        None,
+        {"kv_groups": {}},
+    )
+    runner.input_batch.req_id_to_index["c"] = 7
+    del model.spec_note_admission
+    TTModelRunner._pd_after_update_states(runner, None)
+    assert len(noted) == 2 and calls[-1] == ("gdn", 2)

@@ -935,6 +935,15 @@ class TTModelRunner:
                     release()
             if mtp_hidden is not None and getattr(inner, "mtp_head", None) is not None:
                 pd_transfer.import_mtp_hidden(inner, slot, mtp_hidden)
+            # Speculative decoding with the DFlash2 drafter: the payload's KV group
+            # "dflash2" (the prompt's drafter context K/V) was imported into the
+            # drafter caches by the connector's drain; ``extra["kv_groups"]`` parks
+            # its metadata (or lacks the name). The model decides what to do with
+            # it (qwen36_vllm.spec_note_admission -> spec_decoder.note_context: a
+            # request without context decodes with no drafts).
+            note = getattr(self.model, "spec_note_admission", None)
+            if callable(note):
+                note(slot, req_id, extra)
             if os.environ.get("QWEN36_PD_VERIFY", "0") == "1":
                 pd_transfer.verify_gdn_slot(inner, slot, rec, conv, tag=req_id)
             imported.add(req_id)
