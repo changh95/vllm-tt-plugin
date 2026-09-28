@@ -362,13 +362,57 @@ def store_tt_prefill_chunk_policy(
 
 
 def clear_tt_prefill_chunk_policy(vllm_config: "VllmConfig") -> None:
+    """Turn the TT chunk policy off, together with its block-output contract
+    and extras (a flag that outlives the policy would relax the runner's
+    width checks and keep sticky slots with nothing chunking)."""
     additional = getattr(vllm_config, "additional_config", None)
     if isinstance(additional, dict):
         additional.pop(_PREFILL_CHUNK_POLICY_KEY, None)
+        additional.pop(_PREFILL_CHUNK_EXTRAS_KEY, None)
+
+
+# Extras of the resolved TT chunk policy (``resolve_tt_prefill_chunk_policy``),
+# absent when the policy is off; cleared with it. Keys:
+# - ``block_output``: the model declared ``tt_block_output_chunked_prefill``
+#   (a block-output model that resumes a split prompt; prefill anchors stay
+#   width 1, intermediate rows emit nothing, continuations keep their state
+#   slot).
+# - ``rider_tokens``: prompt-token budget of the short prompts that may share a
+#   chunk step while requests decode (None = no cap).
+# - ``cadence_after_final``: the decode cadence also separates a partial's
+#   final chunk from the next long prompt's first chunk.
+# - ``burst_longs``: with this many long prompts pending (0 = never), prefill
+#   first like the default policy (no split, no cadence).
+_PREFILL_CHUNK_EXTRAS_KEY = "_tt_prefill_chunk_extras"
+_DEFAULT_BLOCK_OUTPUT_RIDER_TOKENS = 512
+
+
+def get_tt_prefill_chunk_extras(vllm_config: "VllmConfig") -> dict[str, Any]:
+    """Return the chunk policy's extras (defaults when the policy is off or
+    was stored without them: no block-output contract, no rider cap, no
+    post-final cadence, no burst fallback)."""
+    extras = {
+        "block_output": False,
+        "rider_tokens": None,
+        "cadence_after_final": False,
+        "burst_longs": 0,
+    }
+    if get_tt_prefill_chunk_policy(vllm_config) is None:
+        return extras
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    extras.update(additional.get(_PREFILL_CHUNK_EXTRAS_KEY) or {})
+    return extras
+
+
+def is_tt_block_output_chunked_prefill(vllm_config: "VllmConfig") -> bool:
+    """Whether a block-output model resumes split prompts under the TT chunk
+    policy (``tt_block_output_chunked_prefill``; False whenever the policy is
+    off)."""
+    return bool(get_tt_prefill_chunk_extras(vllm_config)["block_output"])
 
 
 def resolve_tt_prefill_chunk_policy(
-    vllm_config: "VllmConfig", model_chunk_tokens: int
+    vllm_config: "VllmConfig", model_chunk_tokens: int, block_output: bool = False
 ) -> tuple[int, int]:
     """Resolve and store the chunk policy of a model that declared its chunk unit.
 
@@ -379,6 +423,18 @@ def resolve_tt_prefill_chunk_policy(
       are multiples of it, which is what the model resumes from.
     - ``chunked_prefill_decode_steps``: decode-only steps after each chunk step
       while requests are decoding (default 4; 0 = no cadence).
+    - ``chunked_prefill_rider_tokens``: prompt tokens of short prompts that may
+      share a chunk step while requests decode (the oldest waiting short prompt
+      always may); the rest wait for the next chunk step. Default: 512 for a
+      block-output model (``block_output``), no cap otherwise.
+    - ``chunked_prefill_cadence_after_final``: also hold the next long prompt's
+      first chunk for the cadence after a partial's final chunk, so decoders
+      never see two chunk steps back to back. Default: on for a block-output
+      model, off otherwise.
+    - ``chunked_prefill_burst_longs``: with at least this many long prompts
+      pending (the partial included), prefill first as without the policy (the
+      remainder in one step, no cadence): bursts keep today's throughput and
+      TTFT at the cost of the decode stall. Default 0 (never).
 
     Rewrites the scheduler config so the base scheduler's token budget never
     splits a prompt (only ``long_prefill_token_threshold`` does, at the chunk
@@ -427,6 +483,45 @@ def resolve_tt_prefill_chunk_policy(
             budget,
         )
         scheduler_config.max_num_batched_tokens = budget
+    rider_tokens = tt_config.get(
+        "chunked_prefill_rider_tokens",
+        _DEFAULT_BLOCK_OUTPUT_RIDER_TOKENS if block_output else None,
+    )
+    if rider_tokens is not None and (
+        isinstance(rider_tokens, bool)
+        or not isinstance(rider_tokens, int)
+        or rider_tokens < 0
+    ):
+        raise ValueError(
+            "additional_config.tt.chunked_prefill_rider_tokens must be an integer "
+            f">= 0 or null, got {rider_tokens!r}"
+        )
+    cadence_after_final = tt_config.get(
+        "chunked_prefill_cadence_after_final", bool(block_output)
+    )
+    if not isinstance(cadence_after_final, bool):
+        raise ValueError(
+            "additional_config.tt.chunked_prefill_cadence_after_final must be a "
+            f"boolean, got {cadence_after_final!r}"
+        )
+    burst_longs = tt_config.get("chunked_prefill_burst_longs", 0)
+    if (
+        isinstance(burst_longs, bool)
+        or not isinstance(burst_longs, int)
+        or burst_longs < 0
+        or burst_longs == 1
+    ):
+        raise ValueError(
+            "additional_config.tt.chunked_prefill_burst_longs must be 0 (off) or an "
+            f"integer >= 2, got {burst_longs!r}"
+        )
     scheduler_config.long_prefill_token_threshold = chunk
     store_tt_prefill_chunk_policy(vllm_config, chunk, steps)
+    additional = vllm_config.additional_config
+    additional[_PREFILL_CHUNK_EXTRAS_KEY] = {
+        "block_output": bool(block_output),
+        "rider_tokens": rider_tokens,
+        "cadence_after_final": cadence_after_final,
+        "burst_longs": burst_longs,
+    }
     return chunk, steps

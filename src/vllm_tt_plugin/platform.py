@@ -18,8 +18,10 @@ from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
+    get_tt_prefill_chunk_extras,
     get_tt_prefill_chunk_policy,
     is_tt_adaptive_block_output_model,
+    is_tt_block_output_chunked_prefill,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
     resolve_tt_prefill_chunk_policy,
@@ -199,10 +201,39 @@ def _apply_chunked_prefill_policy(
     output_tokens_per_step = (
         model_capabilities.get("output_tokens_per_step", 1) if model_capabilities else 1
     )
+    # A block-output model may declare that it resumes split prompts
+    # (tt_block_output_chunked_prefill). The contract only holds with the TT
+    # chunk policy (aligned chunks: its own unit) and the adaptive batched
+    # block contract (prefill anchors are width 1 and blocks come only from
+    # decode-only steps, so an intermediate chunk commits nothing and never
+    # meets block accounting). Anything else is a declaration error.
+    block_output_chunked = bool(
+        model_capabilities.get("tt_block_output_chunked_prefill", False)
+        if model_capabilities
+        else False
+    )
+    if block_output_chunked:
+        missing = [
+            key
+            for key in (
+                "supports_chunked_prefill",
+                "tt_prefill_chunk_tokens",
+                "tt_adaptive_block_output",
+                "tt_adaptive_block_batched",
+            )
+            if not model_capabilities.get(key)
+        ]
+        if missing or output_tokens_per_step <= 1:
+            raise ValueError(
+                f"{model_desc} declares tt_block_output_chunked_prefill without "
+                f"{', '.join(missing) or 'output_tokens_per_step > 1'}: the "
+                "block-output chunk contract needs chunked prefill with a chunk "
+                "unit on an adaptive batched block-output model"
+            )
     if (
         not supports_chunked_prefill
         or not scheduler_config.enable_chunked_prefill
-        or output_tokens_per_step > 1
+        or (output_tokens_per_step > 1 and not block_output_chunked)
     ):
         reason = model_desc
         if supports_chunked_prefill and output_tokens_per_step > 1:
@@ -221,7 +252,9 @@ def _apply_chunked_prefill_policy(
     # one that does not keeps the plain base-scheduler chunking.
     chunk_unit = model_capabilities.get("tt_prefill_chunk_tokens")
     policy = (
-        resolve_tt_prefill_chunk_policy(vllm_config, chunk_unit)
+        resolve_tt_prefill_chunk_policy(
+            vllm_config, chunk_unit, block_output=block_output_chunked
+        )
         if chunk_unit is not None
         else None
     )
@@ -239,6 +272,13 @@ def _apply_chunked_prefill_policy(
         scheduler_config.long_prefill_token_threshold,
         policy,
     )
+    if block_output_chunked:
+        logger.info(
+            "Block-output chunked prefill for %s: intermediate chunks emit no "
+            "token, continuations keep their state slot; policy extras %s.",
+            model_desc,
+            get_tt_prefill_chunk_extras(vllm_config),
+        )
 
 
 def _finalize_tt_prefill_chunk_policy(
@@ -1835,7 +1875,8 @@ class TTPlatform(Platform):
             )
         if block_kv_lookahead and output_tokens_per_step <= 1:
             raise ValueError(
-                "tt_block_output_kv_lookahead_tokens requires output_tokens_per_step > 1"
+                "tt_block_output_kv_lookahead_tokens requires "
+                "output_tokens_per_step > 1"
             )
         store_tt_block_output_kv_lookahead_tokens(vllm_config, block_kv_lookahead)
         is_block_output_model = is_tt_block_output_model(vllm_config)
@@ -1900,8 +1941,11 @@ class TTPlatform(Platform):
 
             # Block-output models cannot resume a split prompt. The policy
             # already disables this from output_tokens_per_step; keep the
-            # same guard after the width is stored on the config.
-            _disable_chunked_prefill(vllm_config, "block-output models")
+            # same guard after the width is stored on the config -- except for
+            # a model that declared tt_block_output_chunked_prefill and got the
+            # TT chunk policy (the policy step validated the declaration).
+            if not is_tt_block_output_chunked_prefill(vllm_config):
+                _disable_chunked_prefill(vllm_config, "block-output models")
 
             # Independently of the MODELS_CONFIG_MAP hook prevented during
             # pre-registration, upstream 0.25.1 detects diffusion directly from

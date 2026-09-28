@@ -161,7 +161,8 @@ step.
 At configuration time the platform turns requested chunked prefill off for
 every model that does not declare
 `model_capabilities['supports_chunked_prefill']`, and for every block-output
-model, which cannot resume a split prompt, and zeroes
+model that does not also declare `tt_block_output_chunked_prefill` (see
+"Block-output models" below), and zeroes
 `long_prefill_token_threshold` (the base scheduler applies that cap before it
 consults `enable_chunked_prefill`, so leaving it set would still split a
 prefill). When chunked prefill stays on, `max_num_batched_tokens` is left as
@@ -228,6 +229,41 @@ turned off (chunked prefill disabled) with async scheduling, lane-DP, or a
 `kv_transfer_config`, and resumable streaming-input requests are rejected while
 it is on. The startup log line `Chunked prefill enabled for ...` prints the
 resolved policy.
+
+Policy extras (same `tt` dict), resolved with the policy and cleared with it:
+
+- `chunked_prefill_rider_tokens`: while a pass carries a long prompt's chunk
+  and requests decode, the short waiting prompts that may share that step are
+  admitted oldest first while their prompt tokens fit this budget (the oldest
+  always may); the rest wait for the next chunk step. Default: 512 for a
+  block-output model, no cap otherwise. A pass of short prompts alone keeps the
+  normal admission.
+- `chunked_prefill_cadence_after_final`: the cadence also holds the next long
+  prompt's first chunk after a partial's final chunk, so decoders never see two
+  chunk steps back to back. Default: on for a block-output model, off otherwise.
+- `chunked_prefill_burst_longs`: with at least this many long prompts pending
+  (the partial included), the policy prefills first as without chunking (the
+  whole remainder in one step, no cadence) until fewer are pending: a burst
+  keeps its throughput and TTFT at the cost of the decode stall. Default 0
+  (never); otherwise at least 2.
+
+#### Block-output models (`tt_block_output_chunked_prefill`)
+
+An adaptive batched block-output model (`tt_adaptive_block_output` and
+`tt_adaptive_block_batched`) that can resume a split prompt declares
+`tt_block_output_chunked_prefill` together with `supports_chunked_prefill` and
+`tt_prefill_chunk_tokens`; the platform raises if any of them is missing, and
+keeps the TT chunk policy for it. Nothing in the block contract changes:
+
+- Blocks come only from decode-only steps. A partial is never in a decode step
+  (the decode pass hides it), so it reserves no block placeholders and never
+  meets the ragged `1..W` reconciliation.
+- An intermediate chunk row emits `[]` (vLLM skips an empty token list); the
+  final chunk is a plain width-1 prefill anchor.
+- A continuation keeps the device state slot it already owns, held against the
+  other rows of the step (the model keeps per-slot prompt context there); the
+  runner raises if a continuation has no slot or two rows claim one. Decode
+  steps still remap slots, and the continuation's slot follows the remap.
 
 ### Block-output reservation
 

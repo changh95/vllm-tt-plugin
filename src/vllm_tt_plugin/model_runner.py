@@ -49,6 +49,7 @@ from vllm_tt_plugin.config import (
     get_tt_prefill_chunk_policy,
     is_tt_adaptive_block_output_model,
     is_tt_adaptive_block_ragged,
+    is_tt_block_output_chunked_prefill,
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.host_sampler import make_host_sampler
@@ -218,6 +219,14 @@ class TTModelRunner:
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         # TT chunk policy: prefill submissions carry resume/final row masks.
         self._tt_prefill_chunk_policy = get_tt_prefill_chunk_policy(vllm_config)
+        # Block-output chunked prefill (tt_block_output_chunked_prefill): only
+        # ever True together with the policy (cleared with it). Intermediate
+        # prefill rows of a block-output model emit nothing and a continuation
+        # keeps its state slot (the model's per-slot context lives there).
+        self._tt_block_output_chunked = bool(
+            self._tt_prefill_chunk_policy is not None
+            and is_tt_block_output_chunked_prefill(vllm_config)
+        )
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
         self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
         # Ragged batched blocks: a decode block step's [num_reqs, W] rows carry
@@ -1154,10 +1163,19 @@ class TTModelRunner:
         connector.clear_connector_metadata()
         return out
 
-    def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
+    def _alloc_prefill_state_slots(
+        self, row_req_ids: list[str], continuing: set[str] | None = None
+    ) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
         off-batch requests own. Prefers its own row (where it decodes), so the
         steady state moves nothing.
+
+        ``continuing`` (block-output chunked prefill only): requests whose row
+        resumes their prompt this step. Each keeps the slot it already owns --
+        the model keeps per-slot prompt context there (DFlash2: the drafter
+        ring and its frontier) -- and that slot is held against every other row
+        before any is placed. A continuation without a slot, or a slot claimed
+        twice, raises.
 
         Exhaustion is unreachable: holders and prefills are disjoint and both count
         against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
@@ -1191,9 +1209,29 @@ class TTModelRunner:
                 if req_id not in prefilling
                 and (req_id in remote_loading or req_id in remote_ready)
             }
+        sticky: dict[str, int] = {}
+        for req_id in row_req_ids:
+            if not continuing or req_id not in continuing:
+                continue
+            slot = self._req_state_slot.get(req_id)
+            if slot is None:
+                raise RuntimeError(
+                    f"chunked-prefill continuation {req_id!r} has no device state "
+                    f"slot: map={self._req_state_slot}"
+                )
+            if slot in held or slot in sticky.values():
+                raise RuntimeError(
+                    f"chunked-prefill continuation {req_id!r} owns slot {slot}, which "
+                    f"another request also claims: held={sorted(held)}, "
+                    f"continuations={sticky}, map={self._req_state_slot}"
+                )
+            sticky[req_id] = slot
+        held |= set(sticky.values())
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
-            if row not in held:
+            if req_id in sticky:
+                slot = sticky[req_id]
+            elif row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]
@@ -1711,7 +1749,19 @@ class TTModelRunner:
         prefill_empty_slots = None
         slot_remap = None
         if is_prompt:
-            prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
+            continuing_rows = None
+            if getattr(self, "_tt_block_output_chunked", False) and prefill_resume_mask:
+                continuing_rows = {
+                    req_id
+                    for req_id, resume in zip(row_req_ids, prefill_resume_mask)
+                    if resume
+                }
+            if continuing_rows:
+                prefill_empty_slots = self._alloc_prefill_state_slots(
+                    row_req_ids, continuing=continuing_rows
+                )
+            else:
+                prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
         else:
             # Advances the ownership map to the post-gather layout, so the returned
             # remap has to reach the device: dropping it would leave the map claiming
@@ -2221,10 +2271,14 @@ class TTModelRunner:
         tokens without appending output. Only final rows emit a token and reach
         runner state.
         """
-        assert self._output_tokens_per_step == 1, (
-            "Chunked-prefill output suppression assumes one sampled token per "
-            "request; block-output models must disable chunked prefill"
-        )
+        if self._output_tokens_per_step != 1 and not getattr(
+            self, "_tt_block_output_chunked", False
+        ):
+            raise RuntimeError(
+                "Chunked-prefill output suppression assumes one sampled token per "
+                f"request (output_tokens_per_step={self._output_tokens_per_step}); "
+                "a block-output model needs tt_block_output_chunked_prefill"
+            )
         emit_mask = np.asarray(
             [not bool(intermediate_mask[i]) for i in range(len(req_ids))],
             dtype=bool,
@@ -2571,10 +2625,15 @@ class TTModelRunner:
             ):
                 # Every row is mid-prompt; there is nothing to sample and the
                 # placeholders are dropped when the output is built.
-                assert self._output_tokens_per_step == 1, (
-                    "Intermediate-prefill suppression assumes one sampled token "
-                    "per request"
-                )
+                if self._output_tokens_per_step != 1 and not getattr(
+                    self, "_tt_block_output_chunked", False
+                ):
+                    raise RuntimeError(
+                        "Intermediate-prefill suppression assumes one sampled token "
+                        f"per request (output_tokens_per_step="
+                        f"{self._output_tokens_per_step}); a block-output model "
+                        "needs tt_block_output_chunked_prefill"
+                    )
                 next_token_ids = torch.zeros(sz, dtype=torch.int32)
                 logprobs_per_dp.append(None)
             elif not perform_device_sampling:
