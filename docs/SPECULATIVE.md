@@ -235,38 +235,47 @@ temperature 0). Three configurations: `dflash2` with the default R <= 64 ladder,
 
 | 128/128 random, users | dflash2 R<=64 TPOT ms / tok/s | dflash2 bitwise TPOT / tok/s | mtp TPOT / tok/s |
 |---|---|---|---|
-| 1 | 11.7 / 75 | DFLASH2_BITWISE_R1 | 12.1 / 74 |
-| 4 | 14.8 / 231 | DFLASH2_BITWISE_R4 | 13.8 / 245 |
-| 8 | 21.1 / 313 | DFLASH2_BITWISE_R8 | 15.4 / 429 |
-| 16 | 32.4 / 430 | DFLASH2_BITWISE_R16 | 23.1 / 574 |
-| 32 (plain) | 39.7 / 701 | DFLASH2_BITWISE_R32 | 38.0 / 723 |
+| 1 | 11.7 / 75 | 11.7 / 75 | 12.1 / 74 |
+| 4 | 14.8 / 231 | 14.9 / 231 | 13.8 / 245 |
+| 8 | 21.1 / 313 | 17.9 / 370 | 15.4 / 429 |
+| 16 | 32.4 / 430 | 32.7 / 431 | 23.1 / 574 |
+| 32 (plain) | 39.7 / 701 | 39.5 / 699 | 38.0 / 723 |
 
 | GSM8K text (OSL 128), users | dflash2 R<=64 TPOT ms / tok/s | dflash2 bitwise TPOT / tok/s | mtp TPOT / tok/s |
 |---|---|---|---|
-| 1 | 9.4 / 91 | DFLASH2_BITWISE_G1 | 12.1 / 74 |
-| 4 | 10.4 / 313 | DFLASH2_BITWISE_G4 | 13.0 / 265 |
-| 8 | 14.1 / 472 | DFLASH2_BITWISE_G8 | 14.4 / 471 |
-| 16 | 31.7 / 446 | DFLASH2_BITWISE_G16 | 22.9 / 599 |
-| 32 (plain) | 39.0 / 672 | DFLASH2_BITWISE_G32 | 37.6 / 694 |
+| 1 | 9.4 / 91 | 9.4 / 93 | 12.1 / 74 |
+| 4 | 10.4 / 313 | 10.3 / 316 | 13.0 / 265 |
+| 8 | 14.1 / 472 | 15.3 / 445 | 14.4 / 471 |
+| 16 | 31.7 / 446 | 31.1 / 442 | 22.9 / 599 |
+| 32 (plain) | 39.0 / 672 | 39.3 / 694 | 37.6 / 694 |
 
 | | dflash2 R<=64 | dflash2 bitwise | mtp |
 |---|---|---|---|
-| TTFT 128 / 1k / 4k (latency_probe, ms) | 180 / 310 / 870-1080 | DFLASH2_BITWISE_TTFT | 160 / 268 / 690-940 |
-| vLLM acceptance length, GSM8K phase (8 users) | 5.9-6.3 (k = 7; per-position 0.93 .. 0.52) | DFLASH2_BITWISE_ACC | 3.4-3.6 (k = 3; 0.95 / 0.86 / 0.76) |
-| GSM8K lm-eval 200, flexible-extract | 0.835 +- 0.026 | DFLASH2_BITWISE_GSM | 0.82 +- 0.027 |
-| det_probe (3 x 3 prompts) | deterministic | DFLASH2_BITWISE_DET | deterministic |
-| self-consistency, conc 1..32 x 64 tokens | **10 / 63 streams differ** (conc 8: 1/8, 16: 5/16, 32: 4/32; near-tie flips of the (8,T=8) plan) | DFLASH2_BITWISE_SELF | ALL MATCH |
-| spec / plain steps, flushes, migrations, protocol errors | 4750 / 2427, 9, 41, 0 | DFLASH2_BITWISE_STEPS | 6600 / 2410, 17, 46, 0 |
+| TTFT 128 / 1k / 4k (latency_probe, ms) | 180 / 310 / 870-1080 | 168-188 / 310-368 / 870-1110 | 160 / 268 / 690-940 |
+| vLLM acceptance length (`SpecDecoding metrics`), lm-eval GSM8K phase (8 users) | 5.9-6.3 (k = 7 at 8 users; per-position 0.93, 0.87, 0.82, 0.76, 0.71, 0.65, 0.58) | 3.5-3.6 at 8 users (k = 3 band; 0.94 / 0.87 / 0.81); 3.3-4.2 at 1-4 users on the OSL-128 GSM8K bench prompts (k = 7; positions 0.83-0.93, 0.56-0.79, 0.36-0.60, 0.25-0.47, 0.14-0.27, 0.09-0.13, 0.04-0.06) | 3.4-3.6 (k = 3; 0.95 / 0.86 / 0.76) |
+| GSM8K lm-eval 200, flexible-extract | 0.835 +- 0.026 | 0.82 +- 0.027 | 0.82 +- 0.027 |
+| det_probe (3 x 3 prompts) | deterministic | deterministic | deterministic |
+| self-consistency, conc 1..32 x 64 tokens | **10 / 63 streams differ** (conc 8: 1/8, 16: 5/16, 32: 4/32; near-tie flips of the (8,T=8) plan) | **ALL MATCH** (63/63) | ALL MATCH |
+| spec / plain steps, flushes, migrations, protocol errors | 4750 / 2427, 9, 41, 0 | 5850 / 2430, 22, 37, 0 | 6600 / 2410, 17, 46, 0 |
 
 Reading: on real text the block drafter accepts ~6 of 7 drafts per step and wins
-at 1-8 users (TPOT 9.4 vs 12.1 ms at one user, 10.4 vs 13.0 at four); its
-(8,T=8) plan costs 52 + 1.2 + 12.4 ms per step (verify + commit + draft) against
-the MTP (8,T=4) plan's 37 + 0.4 + 8.3, so at 8 users the two tie on GSM8K text
-and MTP wins on random prompts (low acceptance). The T=2 band (9..16 users)
-pays the block step (16 ms) for one draft and is slower than MTP's k=1 band.
-The R = 64 plan is not self-consistent under a changing batch (the fractured
-path's near-tie flips reach ~1 stream in 6 within 64 tokens), which is why the
-bundle ships the bitwise ladder.
+at 1-4 users (GSM8K TPOT 9.4 vs 12.1 ms at one user, 10.3 vs 13.0 at four:
+1.3x fewer ms per token, 1.2-1.25x the tokens/s). At 5-8 users the bitwise
+ladder's (8,T=4) plan (37 + 1 + 12 ms verify + commit + draft, 3 drafts of the
+7) is a wash against MTP's (8,T=4) (37 + 0.4 + 8.3): 15.3 vs 14.4 ms on GSM8K,
+17.9 vs 15.4 on random prompts (low acceptance either way); the R = 64
+(8,T=8) plan (52 + 1.2 + 12.4 ms) ties MTP on GSM8K text and loses on random
+prompts. The T=2 band (9..16 users) pays the whole block step (16 ms) for one
+draft and is slower than MTP's k=1 band (31-33 vs 23 ms TPOT); above 16 both
+decode plainly (~39 ms). TTFT is P-side and unchanged within noise (the DFlash2
+payload carries 20 KB/token more). The R = 64 plan is not self-consistent under
+a changing batch (the fractured path's near-tie flips reach ~1 stream in 6
+within 64 tokens; `tests/DFLASH2_RESULTS.md` measured them at gap <= 0.25), so
+the bundle ships `QWEN36_SPEC_ALLOW_FRACTURED=0`: bitwise everywhere, ALL MATCH.
+Where DFlash2 should go next: a per-user block step (the 8 x w rows are
+computed for every user; a 16-row path would halve the 16-26 ms at w >= 16),
+and the 5-8 user band could return to (8,T=8) once the fractured verify path is
+made bitwise (a fused all-reduce for R = 64).
 
 ## Not done yet
 
