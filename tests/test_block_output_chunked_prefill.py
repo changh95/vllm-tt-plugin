@@ -130,6 +130,8 @@ def test_the_key_with_its_prerequisites_resolves_the_policy():
     assert extras["max_riders"] == 1
     assert extras["cadence_after_final"] is True
     assert extras["burst_longs"] == 0
+    assert extras["chunk_without_decoders"] is True
+    assert extras["oversized_rider_step"] is True
 
 
 @pytest.mark.parametrize(
@@ -161,6 +163,8 @@ def test_the_key_on_a_width_one_model_raises():
         ({"chunked_prefill_cadence_after_final": 1}, "cadence_after_final"),
         ({"chunked_prefill_burst_longs": 1}, "burst_longs"),
         ({"chunked_prefill_max_riders": 0}, "max_riders"),
+        ({"chunked_prefill_chunk_without_decoders": 1}, "chunk_without_decoders"),
+        ({"chunked_prefill_oversized_rider_step": "yes"}, "oversized_rider_step"),
     ],
 )
 def test_policy_extra_knobs_are_validated(tt, match):
@@ -181,6 +185,8 @@ def test_plain_models_keep_the_plain_policy_extras():
         "max_riders": None,
         "cadence_after_final": False,
         "burst_longs": 0,
+        "chunk_without_decoders": False,
+        "oversized_rider_step": False,
     }
 
 
@@ -485,8 +491,13 @@ def test_no_count_cap_lets_small_riders_share_one_chunk_step():
     assert set(trace.steps[-1][1]) == {"L", "s0", "s1", "s2"}
 
 
-def test_the_oldest_rider_is_admitted_even_above_the_budget():
-    s = _scheduler(max_num_seqs=8, decode_steps=1, chunked_prefill_rider_tokens=0)
+def test_without_the_hard_budget_the_oldest_rider_rides_above_it():
+    s = _scheduler(
+        max_num_seqs=8,
+        decode_steps=1,
+        chunked_prefill_rider_tokens=0,
+        chunked_prefill_oversized_rider_step=False,
+    )
     _start_decoders(s, 1)
     s.add_request(_request("L", 4 * CHUNK))
     _step(s)
@@ -494,6 +505,54 @@ def test_the_oldest_rider_is_admitted_even_above_the_budget():
     trace = _Trace()
     _run_until(s, lambda: s.requests["s0"].num_computed_tokens > 0, trace)
     assert set(trace.steps[-1][1]) == {"L", "s0"}
+
+
+def test_an_oversized_rider_gets_its_own_step_counted_by_the_cadence():
+    """Review F5: the rider budget is hard. A short above it never shares a
+    chunk step (chunk + rider would exceed one chunk's stall); it takes a
+    prefill step alone, the partial held, and the cadence then separates it
+    from the next chunk step."""
+    s = _scheduler(max_num_seqs=8, decode_steps=2, chunked_prefill_rider_tokens=40)
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 4 * CHUNK))
+    trace = _Trace()
+    _step(s, trace)  # chunk 0
+    s.add_request(_request("big", 60))  # above the budget, still short (<= CHUNK)
+    s.add_request(_request("small", 20))
+    _run_until(s, lambda: not s.requests["L"].is_prefill_chunk, trace)
+    prefills = [(i, sp) for i, (k, sp, _) in enumerate(trace.steps) if k == "prefill"]
+    assert any(set(sp) == {"big"} for _, sp in prefills), prefills
+    assert not any("big" in sp and "L" in sp for _, sp in prefills), prefills
+    small = [sp for _, sp in prefills if "small" in sp]
+    assert small and "L" in small[0], prefills  # a small rider still rides
+    idx = [i for i, _ in prefills]
+    assert all(b - a >= 3 for a, b in zip(idx, idx[1:])), trace.kinds()
+
+
+def test_oversized_riders_alternate_with_chunks_and_never_starve_the_partial():
+    s = _scheduler(max_num_seqs=8, decode_steps=1, chunked_prefill_rider_tokens=10)
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 4 * CHUNK))
+    trace = _Trace()
+    _step(s, trace)  # chunk 0
+    for i in range(4):
+        s.add_request(_request(f"b{i}", 50))
+    _run_until(s, lambda: not s.requests["L"].is_prefill_chunk, trace)
+    seq = ["L" if "L" in sp else "b" for k, sp, _ in trace.steps if k == "prefill"]
+    assert "bb" not in "".join(seq), seq
+    assert seq.count("L") == 4, seq
+
+
+def test_an_oversized_rider_goes_before_a_new_long_prompts_first_chunk():
+    s = _scheduler(max_num_seqs=8, decode_steps=2, chunked_prefill_rider_tokens=10)
+    _start_decoders(s, 1)
+    s.add_request(_request("big", 50))
+    s.add_request(_request("L", 3 * CHUNK))
+    trace = _Trace()
+    _run_until(s, lambda: s.requests["L"].num_computed_tokens > 0, trace)
+    prefills = [(i, sp) for i, (k, sp, _) in enumerate(trace.steps) if k == "prefill"]
+    assert [set(sp) for _, sp in prefills] == [{"big"}, {"L"}], prefills
+    assert prefills[1][0] - prefills[0][0] >= 3, trace.kinds()
 
 
 def test_short_prompts_alone_keep_todays_admission():
@@ -531,6 +590,56 @@ def test_without_the_extra_a_new_long_prompt_may_follow_a_final_chunk():
     kinds = trace.kinds()
     prefill_idx = [i for i, k in enumerate(kinds) if k == "prefill"]
     assert any(b - a == 1 for a, b in zip(prefill_idx, prefill_idx[1:])), kinds
+
+
+def test_a_partial_keeps_one_chunk_per_step_when_the_last_decoder_leaves():
+    """Review F1: when the decoder count reaches 0 mid-partial, the remainder
+    must not run as one call (a request arriving right after would wait for
+    all of it): the partial advances one chunk per step, back to back, and a
+    newcomer rides the next chunk step."""
+    s = _scheduler(max_num_seqs=8, decode_steps=2)
+    _start_decoders(s, 1, max_tokens=12)
+    s.add_request(_request("L", 8 * CHUNK + 5))
+    trace = _Trace()
+    _run_until(s, lambda: "d0" not in s.requests, trace)
+    assert s.requests["L"].is_prefill_chunk
+    s.add_request(_request("late", 20))
+    _run_until(s, lambda: s.requests["L"].num_computed_tokens >= 8 * CHUNK + 5, trace)
+    spans = [sp["L"] for k, sp, _ in trace.steps if k == "prefill" and "L" in sp]
+    assert all(b - a <= CHUNK for a, b in spans), spans
+    late = next(sp for k, sp, _ in trace.steps if "late" in sp)
+    assert "L" in late and late["L"][1] < 8 * CHUNK + 5, late
+
+
+def test_without_the_extra_the_remainder_runs_whole_when_nobody_decodes():
+    """Negative control for the test above: lane C's plain behaviour."""
+    s = _scheduler(
+        max_num_seqs=8, decode_steps=2, chunked_prefill_chunk_without_decoders=False
+    )
+    _start_decoders(s, 1, max_tokens=12)
+    s.add_request(_request("L", 8 * CHUNK + 5))
+    trace = _Trace()
+    _run_until(s, lambda: s.requests["L"].num_computed_tokens >= 8 * CHUNK + 5, trace)
+    spans = [sp["L"] for k, sp, _ in trace.steps if k == "prefill" and "L" in sp]
+    assert len(spans) >= 2 and spans[-1][1] - spans[-1][0] > CHUNK, spans
+
+
+def test_a_lone_long_prompt_with_nobody_decoding_is_still_one_call():
+    s = _scheduler(max_num_seqs=8, decode_steps=2)
+    s.add_request(_request("L", 8 * CHUNK + 5))
+    kind, spans = _step(s)
+    assert kind == "prefill" and spans == {"L": (0, 8 * CHUNK + 5)}
+
+
+def test_a_small_kv_pool_warns_at_boot():
+    import vllm_tt_plugin.scheduler as sched_mod
+
+    with patch.object(sched_mod.logger, "warning") as warn:
+        _scheduler(max_num_seqs=4, num_blocks=4 * MAX_MODEL_LEN // BLOCK - 1)
+    assert warn.call_count == 1 and "preempt" in warn.call_args[0][0]
+    with patch.object(sched_mod.logger, "warning") as warn:
+        _scheduler(max_num_seqs=4)
+    assert warn.call_count == 0
 
 
 def test_a_burst_of_long_prompts_falls_back_to_prefill_first():

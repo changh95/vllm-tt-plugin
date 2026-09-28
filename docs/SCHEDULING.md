@@ -235,9 +235,9 @@ Policy extras (same `tt` dict), resolved with the policy and cleared with it:
 - `chunked_prefill_rider_tokens`: while a pass carries a long prompt's chunk
   and requests decode, the short waiting prompts that may share that step are
   admitted oldest first while their prompt tokens fit this budget (the oldest
-  always may); the rest wait for the next chunk step. Default: 512 for a
-  block-output model, no cap otherwise. A pass of short prompts alone keeps the
-  normal admission.
+  always may, unless `chunked_prefill_oversized_rider_step` is on); the rest
+  wait for the next chunk step. Default: 512 for a block-output model, no cap
+  otherwise. A pass of short prompts alone keeps the normal admission.
 - `chunked_prefill_max_riders`: how many short prompts may share such a chunk
   step (the oldest always may). A short rider's prefill cost is nearly fixed (the
   smallest masked bucket), so the count bounds the step where the token budget
@@ -251,6 +251,21 @@ Policy extras (same `tt` dict), resolved with the policy and cleared with it:
   whole remainder in one step, no cadence) until fewer are pending: a burst
   keeps its throughput and TTFT at the cost of the decode stall. Default 0
   (never); otherwise at least 2.
+- `chunked_prefill_chunk_without_decoders`: while a partial is in flight and
+  the last decoding request leaves, keep advancing it one chunk per step (no
+  cadence: nothing decodes) instead of running its whole remainder in one step.
+  A request that arrives meanwhile then waits for one chunk and rides the next
+  chunk step, instead of waiting for the remainder. A long prompt that starts
+  with nothing decoding still runs whole. Default: on for a block-output model,
+  off otherwise.
+- `chunked_prefill_oversized_rider_step`: `chunked_prefill_rider_tokens` binds
+  the oldest short prompt too. When the oldest waiting short prompt exceeds it
+  while a long prompt is in play, that prompt takes a prefill step alone (the
+  partial and every other waiting prompt held); the step counts toward the
+  cadence like a chunk step, and the next gate-open step advances the long
+  prompt (a stream of oversized shorts cannot starve it). Decoders then see a
+  stall of at most one chunk or one short prompt, never both. Default: on for a
+  block-output model, off otherwise.
 
 #### Block-output models (`tt_block_output_chunked_prefill`)
 
@@ -273,6 +288,10 @@ keeps the TT chunk policy for it. Nothing in the block contract changes:
   other rows of the step (the model keeps per-slot prompt context there); the
   runner raises if a continuation has no slot or two rows claim one. Decode
   steps still remap slots, and the continuation's slot follows the remap.
+- A partial holds its KV blocks for its whole (interleaved, longer) prefill,
+  so a KV pool smaller than `max_num_seqs * max_model_len` makes vLLM preempt
+  decoders more often than without the policy; a preempted request replays
+  through prefill. The scheduler warns at boot when the pool is that small.
 
 ### Block-output reservation
 

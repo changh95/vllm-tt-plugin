@@ -386,6 +386,13 @@ def clear_tt_prefill_chunk_policy(vllm_config: "VllmConfig") -> None:
 #   final chunk from the next long prompt's first chunk.
 # - ``burst_longs``: with this many long prompts pending (0 = never), prefill
 #   first like the default policy (no split, no cadence).
+# - ``chunk_without_decoders``: a partial keeps advancing one chunk per step
+#   when nothing decodes (instead of its whole remainder in one step), so a
+#   request arriving meanwhile waits at most one chunk.
+# - ``oversized_rider_step``: ``rider_tokens`` is a hard per-step budget; the
+#   oldest short prompt above it gets a prefill step of its own (the partial
+#   and every other prompt held), which counts toward the cadence like a chunk
+#   step.
 _PREFILL_CHUNK_EXTRAS_KEY = "_tt_prefill_chunk_extras"
 _DEFAULT_BLOCK_OUTPUT_RIDER_TOKENS = 512
 _DEFAULT_BLOCK_OUTPUT_MAX_RIDERS = 1
@@ -401,6 +408,8 @@ def get_tt_prefill_chunk_extras(vllm_config: "VllmConfig") -> dict[str, Any]:
         "max_riders": None,
         "cadence_after_final": False,
         "burst_longs": 0,
+        "chunk_without_decoders": False,
+        "oversized_rider_step": False,
     }
     if get_tt_prefill_chunk_policy(vllm_config) is None:
         return extras
@@ -430,8 +439,9 @@ def resolve_tt_prefill_chunk_policy(
       while requests are decoding (default 4; 0 = no cadence).
     - ``chunked_prefill_rider_tokens``: prompt tokens of short prompts that may
       share a chunk step while requests decode (the oldest waiting short prompt
-      always may); the rest wait for the next chunk step. Default: 512 for a
-      block-output model (``block_output``), no cap otherwise.
+      always may, unless ``chunked_prefill_oversized_rider_step``); the rest
+      wait for the next chunk step. Default: 512 for a block-output model
+      (``block_output``), no cap otherwise.
     - ``chunked_prefill_max_riders``: how many short prompts may share such a
       chunk step (the oldest always may). Default: 1 for a block-output model,
       no cap otherwise.
@@ -443,6 +453,17 @@ def resolve_tt_prefill_chunk_policy(
       pending (the partial included), prefill first as without the policy (the
       remainder in one step, no cadence): bursts keep today's throughput and
       TTFT at the cost of the decode stall. Default 0 (never).
+    - ``chunked_prefill_chunk_without_decoders``: while a partial is in flight
+      and nothing decodes, keep advancing it one chunk per step (no cadence)
+      instead of running its whole remainder in one step, so a request that
+      arrives meanwhile waits for one chunk, not the remainder. Default: on for
+      a block-output model, off otherwise.
+    - ``chunked_prefill_oversized_rider_step``: make ``rider_tokens`` a hard
+      budget: the oldest waiting short prompt above it does not ride a chunk
+      step but gets a prefill step of its own (the partial and every other
+      prompt held), counted toward the cadence like a chunk step; the next
+      gate-open step advances the long prompt. Default: on for a block-output
+      model, off otherwise.
 
     Rewrites the scheduler config so the base scheduler's token budget never
     splits a prompt (only ``long_prefill_token_threshold`` does, at the chunk
@@ -536,6 +557,15 @@ def resolve_tt_prefill_chunk_policy(
             "additional_config.tt.chunked_prefill_burst_longs must be 0 (off) or an "
             f"integer >= 2, got {burst_longs!r}"
         )
+    flags = {}
+    for key in ("chunk_without_decoders", "oversized_rider_step"):
+        value = tt_config.get(f"chunked_prefill_{key}", bool(block_output))
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"additional_config.tt.chunked_prefill_{key} must be a boolean, "
+                f"got {value!r}"
+            )
+        flags[key] = value
     scheduler_config.long_prefill_token_threshold = chunk
     store_tt_prefill_chunk_policy(vllm_config, chunk, steps)
     additional = vllm_config.additional_config
@@ -545,5 +575,6 @@ def resolve_tt_prefill_chunk_policy(
         "max_riders": max_riders,
         "cadence_after_final": cadence_after_final,
         "burst_longs": burst_longs,
+        **flags,
     }
     return chunk, steps
