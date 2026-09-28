@@ -787,7 +787,10 @@ def test_drain_parks_the_mtp_hidden_row_as_entry_four(consumer, fake_pd_transfer
     w._inflight[rr1.req_id] = rr1
     w._fetched.put(mc._Fetched(rr1, buf1, header1, lambda: None, "pull", 0.0, 0.0))
     w._drain_fetched()
-    assert w.runner.pd_pending_gdn[rr1.req_id][4] == {"mtp_hidden": None}
+    assert w.runner.pd_pending_gdn[rr1.req_id][4] == {
+        "mtp_hidden": None,
+        "kv_groups": {},
+    }
 
 
 def test_stage_ships_the_mtp_layer_and_hidden_row_when_the_model_has_a_head(
@@ -828,8 +831,120 @@ def test_stage_ships_the_mtp_layer_and_hidden_row_when_the_model_has_a_head(
         TTMooncakeConnectorMetadata(stage=[StageReq("r2", [3, 4], 7, "t2")])
     )
     st2 = w._staged["t2"]
-    assert "mtp" not in st2.header and st2.header["version"] == 2
+    assert "mtp" not in st2.header and st2.header["version"] == 3
     w._release("t2")
+
+
+# ---- version 3: KV groups (the DFlash2 drafter's context K/V) ride the payload -------
+
+
+def _group_payload(n_blocks=2, seed=9):
+    g = torch.Generator().manual_seed(seed)
+    gkv = [
+        (
+            torch.randn(n_blocks, 8, 4, 16, generator=g).to(torch.bfloat16),
+            torch.randn(n_blocks, 8, 4, 16, generator=g).to(torch.bfloat16),
+        )
+        for _ in range(5)
+    ]
+    meta = {
+        "n_layers": 5,
+        "kv_heads": 8,
+        "head_dim": 16,
+        "block_size": 4,
+        "block_index": list(range(n_blocks)),
+        "first_pos": 0,
+        "n_tokens": 7,
+    }
+    return gkv, meta
+
+
+def test_stage_ships_the_kv_groups_the_model_staged(producer, fake_pd_transfer):
+    """The producer asks pd_transfer.export_kv_groups for the slot's staged groups (the
+    DFlash2 prefill hook's context K/V) and packs them as ``dflash2.kv.<j>`` with the
+    group's metadata in the header; without the helper (older model side) the payload
+    has     no ``kv_groups``."""
+    import sys
+
+    w = producer
+    mod = sys.modules["models.demos.blackhole.qwen36.tt.pd_transfer"]
+    kv, rec, taps = _payload()
+    gkv, meta = _group_payload()
+    asked = []
+    mod.export_kv_blocks = lambda model, block_ids: kv
+
+    def export_kv_groups(model, slot, block_ids, num_tokens):
+        asked.append((slot, list(block_ids), num_tokens))
+        return {"dflash2": (gkv, meta)}
+
+    mod.export_kv_groups = export_kv_groups
+    w.model = SimpleNamespace(pd_gdn_capture={4: (rec, taps)})
+    w.runner = SimpleNamespace(_req_state_slot={"r1": 4})
+    w.stage_after_step(
+        TTMooncakeConnectorMetadata(stage=[StageReq("r1", [3, 4], 7, "t1")])
+    )
+    st = w._staged["t1"]
+    assert asked == [(4, [3, 4], 7)]
+    assert st.header["version"] == 3 and "mtp" not in st.header
+    assert st.header["kv_groups"] == {"dflash2": meta}
+    groups = mc.unpack_kv_groups(st.buf[: st.nbytes], st.header)
+    assert list(groups) == ["dflash2"] and len(groups["dflash2"][0]) == 5
+    assert torch.equal(groups["dflash2"][0][2][0], gkv[2][0])
+    kv2, rec2, _ = unpack_payload(st.buf[: st.nbytes], st.header)
+    assert len(kv2) == 2 and torch.equal(rec2, rec)
+    w._release("t1")
+
+    del mod.export_kv_groups
+    w.model = SimpleNamespace(pd_gdn_capture={5: (rec, taps)})
+    w.runner = SimpleNamespace(_req_state_slot={"r2": 5})
+    w.stage_after_step(
+        TTMooncakeConnectorMetadata(stage=[StageReq("r2", [3, 4], 7, "t2")])
+    )
+    assert "kv_groups" not in w._staged["t2"].header
+    w._release("t2")
+
+
+def test_drain_imports_the_kv_groups_and_parks_their_metadata(
+    consumer, fake_pd_transfer
+):
+    """A version-3 payload's groups go through ``pd_transfer.import_kv_groups(model,
+    block_ids, groups)`` right after the main import, and the imported groups' metadata
+    is parked as ``entry[4]["kv_groups"]`` (a payload without groups parks {})."""
+    import sys
+
+    w = consumer
+    mod = sys.modules["models.demos.blackhole.qwen36.tt.pd_transfer"]
+    imported = []
+
+    def import_kv_groups(model, block_ids, groups):
+        imported.append(
+            (list(block_ids), {n: (len(kv), m) for n, (kv, m) in groups.items()})
+        )
+        return list(groups)
+
+    mod.import_kv_groups = import_kv_groups
+    kv, rec, taps = _payload()
+    gkv, meta = _group_payload()
+    buf, header = pack_payload(kv, rec, taps, 7, 2, kv_groups={"dflash2": (gkv, meta)})
+    rr = _rr(num_tokens=7)
+    w._inflight[rr.req_id] = rr
+    w._fetched.put(mc._Fetched(rr, buf, header, lambda: None, "pull", 0.0, 0.0))
+    w._drain_fetched()
+    assert len(fake_pd_transfer) == 1 and fake_pd_transfer[0][0] == [3, 4]
+    assert imported == [([3, 4], {"dflash2": (5, meta)})]
+    entry = w.runner.pd_pending_gdn[rr.req_id]
+    assert entry[4] == {"mtp_hidden": None, "kv_groups": {"dflash2": meta}}
+
+    buf1, header1 = pack_payload(kv, rec, taps, 7, 2)
+    rr1 = RecvReq("r2", [5, 6], "127.0.0.1", 1, "t2", 7)
+    w._inflight[rr1.req_id] = rr1
+    w._fetched.put(mc._Fetched(rr1, buf1, header1, lambda: None, "pull", 0.0, 0.0))
+    w._drain_fetched()
+    assert len(imported) == 1  # no groups: import_kv_groups not called
+    assert w.runner.pd_pending_gdn[rr1.req_id][4] == {
+        "mtp_hidden": None,
+        "kv_groups": {},
+    }
 
 
 # ---- I: per-user staging (model hook stage_slot) -------------------------------------

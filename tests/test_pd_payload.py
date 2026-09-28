@@ -178,7 +178,9 @@ def test_v2_mtp_layer_and_hidden_row_round_trip():
         kv17, rec, taps, 7, N_BLOCKS, mtp_hidden=hidden, n_mtp_layers=1
     )
 
-    assert header["version"] == 2
+    assert (
+        header["version"] == 3
+    )  # version 3 adds KV groups (none here); the v2 fields are unchanged
     assert (
         header["n_attn_layers"] == N_ATTN
     )  # main layers only: a v1 consumer still decodes
@@ -250,3 +252,176 @@ def test_v2_rejects_bad_mtp_arguments():
         pack_payload(kv, rec, taps, 7, N_BLOCKS, n_mtp_layers=N_ATTN + 1)
     with pytest.raises(ValueError, match=r"\[dim\] row"):
         pack_payload(kv, rec, taps, 7, N_BLOCKS, mtp_hidden=torch.zeros(2, 3))
+
+
+# ---- version 3: named KV groups (the DFlash2 drafter's context K/V) ------------------
+
+G_LAYERS, G_HEADS, G_HD, G_BLOCKS = 5, 8, 16, 2
+
+
+def _group(seed=5, n_blocks=G_BLOCKS):
+    g = torch.Generator().manual_seed(seed)
+    kv = [
+        (
+            torch.randn(n_blocks, G_HEADS, BLOCK, G_HD, generator=g).to(torch.bfloat16),
+            torch.randn(n_blocks, G_HEADS, BLOCK, G_HD, generator=g).to(torch.bfloat16),
+        )
+        for _ in range(G_LAYERS)
+    ]
+    meta = {
+        "n_layers": G_LAYERS,
+        "kv_heads": G_HEADS,
+        "head_dim": G_HD,
+        "block_size": BLOCK,
+        "block_index": [
+            1,
+            2,
+        ],  # the sliding-window tail: blocks 1..2 of a 3-block request
+        "first_pos": BLOCK,
+        "n_tokens": 2 * BLOCK - 1,
+    }
+    return kv, meta
+
+
+def test_v3_kv_group_round_trip_and_header():
+    """A KV group travels as ``<name>.kv.<j>.k/.v`` after the GDN pair (and after
+    ``mtp.hidden``) with its own geometry; ``header["kv_groups"][name]`` is its metadata
+    and
+    ``unpack_kv_groups`` hands back views."""
+    from vllm_tt_plugin.kv_connector.tt_mooncake_connector import (
+        payload_kv_groups,
+        unpack_kv_groups,
+        unpack_mtp_hidden,
+    )
+
+    kv, (rec, taps) = _kv(), _snapshot()
+    gkv, meta = _group()
+    buf, header = pack_payload(
+        kv, rec, taps, 3 * BLOCK - 1, 3, kv_groups={"dflash2": (gkv, meta)}
+    )
+
+    assert header["version"] == 3 and "mtp" not in header
+    assert header["nbytes"] == payload_nbytes(
+        kv, rec, taps, None, {"dflash2": (gkv, meta)}
+    )
+    assert payload_kv_groups(header) == {"dflash2": meta}
+    names = [e["name"] for e in header["tensors"]]
+    assert names == [f"kv.{li}.{x}" for li in range(N_ATTN) for x in "kv"] + [
+        "gdn.rec",
+        "gdn.taps",
+    ] + [f"dflash2.kv.{j}.{x}" for j in range(G_LAYERS) for x in "kv"]
+    # the v2 view is untouched: main pairs + GDN, no MTP
+    kv2, rec2, taps2 = unpack_payload(buf, header)
+    assert len(kv2) == N_ATTN and torch.equal(rec, rec2) and torch.equal(taps, taps2)
+    assert unpack_mtp_hidden(buf, header) is None
+    groups = unpack_kv_groups(buf, header)
+    assert list(groups) == ["dflash2"]
+    gkv2, meta2 = groups["dflash2"]
+    assert meta2 == meta and len(gkv2) == G_LAYERS
+    for (k, v), (k2, v2) in zip(gkv, gkv2):
+        assert torch.equal(k, k2) and torch.equal(v, v2)
+        assert (
+            k2.shape == (G_BLOCKS, G_HEADS, BLOCK, G_HD)
+            and _inside(k2, buf)
+            and _inside(v2, buf)
+        )
+
+
+def test_v3_group_with_mtp_orders_mtp_hidden_before_the_group_tensors():
+    from vllm_tt_plugin.kv_connector.tt_mooncake_connector import (
+        unpack_kv_groups,
+        unpack_mtp_hidden,
+    )
+
+    kv, (rec, taps) = _kv(), _snapshot()
+    gkv, meta = _group()
+    hidden = torch.ones(8, dtype=torch.bfloat16)
+    buf, header = pack_payload(
+        kv + [kv[0]],
+        rec,
+        taps,
+        7,
+        3,
+        mtp_hidden=hidden,
+        n_mtp_layers=1,
+        kv_groups={"dflash2": (gkv, meta)},
+    )
+    names = [e["name"] for e in header["tensors"]]
+    assert names.index("mtp.hidden") < names.index("dflash2.kv.0.k")
+    assert header["mtp"] == {"n_layers": 1, "hidden": True}
+    assert torch.equal(unpack_mtp_hidden(buf, header), hidden)
+    assert torch.equal(unpack_kv_groups(buf, header)["dflash2"][0][4][1], gkv[4][1])
+
+
+def test_v2_consumer_view_of_a_v3_payload_ignores_the_group_tensors():
+    """A version-2 consumer reads ``kv.<li>``, ``mtp.*`` and the GDN pair by name and
+    skips
+    unknown names: reconstruct that view from a v3 header."""
+    kv, (rec, taps) = _kv(), _snapshot()
+    gkv, meta = _group()
+    buf, header = pack_payload(kv, rec, taps, 7, 3, kv_groups={"dflash2": (gkv, meta)})
+    by_name = {
+        e["name"]: buf[e["offset"] : e["offset"] + e["nbytes"]]
+        .view(getattr(torch, e["dtype"]))
+        .view(*e["shape"])
+        for e in header["tensors"]
+    }
+    old_kv = [
+        (by_name[f"kv.{li}.k"], by_name[f"kv.{li}.v"])
+        for li in range(header["n_attn_layers"])
+    ]
+    assert len(old_kv) == N_ATTN
+    for (k, v), (k2, v2) in zip(kv, old_kv):
+        assert torch.equal(k, k2) and torch.equal(v, v2)
+    assert torch.equal(by_name["gdn.rec"], rec) and torch.equal(
+        by_name["gdn.taps"], taps
+    )
+    assert "mtp" not in header and all(
+        n.startswith(("kv.", "gdn.", "dflash2.")) for n in by_name
+    )
+
+
+def test_v3_consumer_reads_a_v2_payload_without_groups():
+    from vllm_tt_plugin.kv_connector.tt_mooncake_connector import (
+        payload_kv_groups,
+        unpack_kv_groups,
+    )
+
+    kv, (rec, taps) = _kv(), _snapshot()
+    buf, header = pack_payload(kv, rec, taps, 7, N_BLOCKS)
+    header = dict(header, version=2)  # what an older producer stamps
+    assert "kv_groups" not in header
+    assert payload_kv_groups(header) == {} and unpack_kv_groups(buf, header) == {}
+    kv2, _, _ = unpack_payload(buf, header)
+    assert len(kv2) == N_ATTN
+
+
+def test_v3_rejects_bad_kv_groups():
+    kv, (rec, taps) = _kv(), _snapshot()
+    gkv, meta = _group()
+    with pytest.raises(ValueError, match="reserved or malformed"):
+        pack_payload(kv, rec, taps, 7, 3, kv_groups={"mtp": (gkv, meta)})
+    with pytest.raises(ValueError, match="reserved or malformed"):
+        pack_payload(kv, rec, taps, 7, 3, kv_groups={"a.b": (gkv, meta)})
+    with pytest.raises(ValueError, match="one shape"):
+        pack_payload(
+            kv,
+            rec,
+            taps,
+            7,
+            3,
+            kv_groups={"dflash2": (gkv[:-1] + [(gkv[0][0], gkv[0][1][:1])], meta)},
+        )
+    with pytest.raises(ValueError, match="block_index"):
+        pack_payload(
+            kv,
+            rec,
+            taps,
+            7,
+            3,
+            kv_groups={"dflash2": (gkv, dict(meta, block_index=[0]))},
+        )
+    with pytest.raises(ValueError, match="n_layers"):
+        pack_payload(
+            kv, rec, taps, 7, 3, kv_groups={"dflash2": (gkv, dict(meta, n_layers=4))}
+        )

@@ -30,7 +30,7 @@ producer request; the producer echoes it) and post to the consumer before the
 producer has answered: the consumer derives ``num_tokens`` from its own tokenization
 and its GET blocks on the side channel until the producer has staged.
 
-Payload format (``pack_payload`` / ``unpack_payload``; ``header["version"]`` = 2). One
+Payload format (``pack_payload`` / ``unpack_payload``; ``header["version"]`` = 3). One
 uint8 buffer, tensors back to back in this order, each described by a header entry
 ``{name, dtype, shape, offset, nbytes}``::
 
@@ -50,16 +50,34 @@ uint8 buffer, tensors back to back in this order, each described by a header ent
                         model's post-final-norm hidden row at the last prefilled
                         position, the drafter's first-step input
                         (MTPHead.set_hidden_in on the decoder)
+  <group>.kv.<j>.k/.v   (version 3, only when the producer staged a KV GROUP for the
+                        request; QWEN36_SPEC_DRAFTER=dflash2 stages group "dflash2" =
+                        the DFlash2 drafter's context K/V of the prompt) j =
+                        0..kv_groups[<group>].n_layers-1, each [n_shipped_blocks,
+                        kv_heads, block_size, head_dim] bf16 with the group's OWN head
+                        count / head dim (dflash2: 8 x 128; the main layers are 4 x
+                        256), dim 1 in global kv-head order (device-major on the
+                        decoder's shards), dim 0 = the shipped blocks in
+                        ``block_index`` order (pd_transfer.export_kv_groups)
 
 Header fields: ``num_tokens`` (the producer's prefilled length), ``n_blocks``,
 ``n_attn_layers`` (main layers only, so a version-1 consumer, which reads ``kv.<li>``
 for li < n_attn_layers and ignores unknown names, still decodes a version-2 payload),
 ``n_gdn_layers``, ``n_conv``, ``nbytes``, ``tensors`` and, when present, ``mtp`` =
-``{"n_layers": <int>, "hidden": <bool>}``. A version-2 consumer without an MTP head
-imports the main layers only; one with a head fed by a version-1 payload leaves the
-head's blocks zero and gets no hidden row (``unpack_mtp_hidden`` -> None), so it must
-not draft for that request.  The bytes are staged once per request and pulled or
-mapped as-is."""
+``{"n_layers": <int>, "hidden": <bool>}`` and (version 3) ``kv_groups`` =
+``{<group>: {n_layers, kv_heads, head_dim, block_size, block_index, first_pos,
+n_tokens}}`` where ``block_index`` lists the shipped blocks as indices into the
+request's block list (all of them by default; with QWEN36_DFLASH2_CONTEXT_WINDOW the
+producer ships only the drafter's sliding-window tail) and ``first_pos`` / ``n_tokens``
+the positions they hold. A version-2 consumer without an
+MTP head imports the main layers only; one with a head fed by a version-1 payload
+leaves the head's blocks zero and gets no hidden row (``unpack_mtp_hidden`` -> None),
+so it must not draft for that request. Version 3 adds tensors and header fields only:
+a version-2 consumer reads a version-3 payload exactly as before (unknown names
+ignored), and a version-3 consumer reads a version-2 one (no groups). The consumer
+imports the groups it has caches for (``pd_transfer.import_kv_groups``) and parks the
+group metadata as ``entry[4]["kv_groups"]``.  The bytes are staged once per request
+and pulled or mapped as-is."""
 
 from __future__ import annotations
 
@@ -234,7 +252,49 @@ def _check_gdn_snapshot(rec_snap, conv_snap) -> None:
         )
 
 
-PAYLOAD_VERSION = 2
+PAYLOAD_VERSION = 3
+
+
+def _check_kv_groups(kv_groups) -> dict:
+    """``kv_groups`` = {name: (kv, meta)}: ``kv`` a list of (k, v) host tensor pairs of
+    one     shape, ``meta`` the group's header entry (pd_transfer.export_kv_groups)."""
+    if not kv_groups:
+        return {}
+    out = {}
+    for name, (kv, meta) in kv_groups.items():
+        name = str(name)
+        if not name or "." in name or name in ("kv", "mtp", "gdn"):
+            raise ValueError(f"KV group name {name!r} is reserved or malformed")
+        if not kv:
+            raise ValueError(f"KV group {name!r} has no layers")
+        shape = tuple(kv[0][0].shape)
+        for k, v in kv:
+            if tuple(k.shape) != shape or tuple(v.shape) != shape or k.dim() != 4:
+                raise ValueError(
+                    f"KV group {name!r}: every pair must be [n_blocks, kv_heads, "
+                    f"block_size, head_dim] of one shape, got {tuple(k.shape)} / "
+                    f"{tuple(v.shape)} vs {shape}"
+                )
+        meta = dict(meta or {})
+        if int(meta.get("n_layers", len(kv))) != len(kv):
+            raise ValueError(
+                f"KV group {name!r}: meta n_layers {meta.get('n_layers')} != {len(kv)}"
+            )
+        idx = list(meta.get("block_index", range(shape[0])))
+        if len(idx) != shape[0]:
+            raise ValueError(
+                f"KV group {name!r}: block_index has {len(idx)} entries for "
+                f"{shape[0]} blocks"
+            )
+        meta.update(
+            n_layers=len(kv),
+            kv_heads=int(meta.get("kv_heads", shape[1])),
+            block_size=int(meta.get("block_size", shape[2])),
+            head_dim=int(meta.get("head_dim", shape[3])),
+            block_index=[int(i) for i in idx],
+        )
+        out[name] = (kv, meta)
+    return out
 
 
 def pack_payload(
@@ -246,6 +306,7 @@ def pack_payload(
     out: torch.Tensor | None = None,
     mtp_hidden: torch.Tensor | None = None,
     n_mtp_layers: int = 0,
+    kv_groups=None,
 ):
     """Pack one request's KV pairs (per attention layer) and GDN snapshot into one uint8
     buffer (the module docstring has the layout).  Returns ``(buffer, header)``;
@@ -256,8 +317,11 @@ def pack_payload(
     ``[n_dev, L, K, C]`` (device-major: one memcpy each here, one borrowed upload each
     on the decoder). Speculative decoding: the LAST ``n_mtp_layers`` pairs of ``kv``
     are the MTP drafter's layers (``mtp.kv.<j>``, kept out of ``n_attn_layers``) and
-    ``mtp_hidden`` ([dim] bf16) is the drafter's hidden row (``mtp.hidden``)."""
+    ``mtp_hidden`` ([dim] bf16) is the drafter's hidden row (``mtp.hidden``). Version 3:
+    ``kv_groups`` = {name: (kv, meta)} adds named KV groups with their own geometry
+    (``<name>.kv.<j>.k/.v`` after the GDN pair; the DFlash2 drafter's context K/V)."""
     _check_gdn_snapshot(rec_snap, conv_snap)
+    kv_groups = _check_kv_groups(kv_groups)
     n_mtp_layers = int(n_mtp_layers)
     if not 0 <= n_mtp_layers <= len(kv):
         raise ValueError(
@@ -300,6 +364,10 @@ def pack_payload(
     add("gdn.taps", conv_snap)
     if mtp_hidden is not None:
         add("mtp.hidden", mtp_hidden)
+    for name, (gkv, _) in kv_groups.items():
+        for j, (k, v) in enumerate(gkv):
+            add(f"{name}.kv.{j}.k", k)
+            add(f"{name}.kv.{j}.v", v)
     if out is not None:
         if out.numel() < off:
             raise ValueError(f"pooled buffer {out.numel()} B < payload {off} B")
@@ -320,11 +388,13 @@ def pack_payload(
     }
     if n_mtp_layers or mtp_hidden is not None:
         header["mtp"] = {"n_layers": n_mtp_layers, "hidden": mtp_hidden is not None}
+    if kv_groups:
+        header["kv_groups"] = {name: meta for name, (_, meta) in kv_groups.items()}
     return buf, header
 
 
 def payload_nbytes(
-    kv, rec_snap, conv_snap, mtp_hidden: torch.Tensor | None = None
+    kv, rec_snap, conv_snap, mtp_hidden: torch.Tensor | None = None, kv_groups=None
 ) -> int:
     _check_gdn_snapshot(rec_snap, conv_snap)
     n = sum(k.numel() * k.element_size() + v.numel() * v.element_size() for k, v in kv)
@@ -332,6 +402,10 @@ def payload_nbytes(
     n += conv_snap.numel() * conv_snap.element_size()
     if mtp_hidden is not None:
         n += mtp_hidden.numel() * mtp_hidden.element_size()
+    for gkv, _ in (kv_groups or {}).values():
+        n += sum(
+            k.numel() * k.element_size() + v.numel() * v.element_size() for k, v in gkv
+        )
     return n
 
 
@@ -451,6 +525,44 @@ def unpack_mtp_hidden(buf: torch.Tensor, header: dict[str, Any]) -> torch.Tensor
     if not (header.get("mtp") or {}).get("hidden"):
         return None
     return _payload_views(buf, header).get("mtp.hidden")
+
+
+def payload_kv_groups(header: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The version-3 KV group metadata ({name: meta}); {} for older payloads."""
+    return dict(header.get("kv_groups") or {})
+
+
+def _kv_groups_note(header: dict[str, Any]) -> str:
+    """Log suffix describing the payload's KV groups ("" when none)."""
+    groups = payload_kv_groups(header)
+    if not groups:
+        return ""
+    return " " + ", ".join(
+        f"{name} {int(m['n_layers'])} layer(s) x "
+        f"{len(m.get('block_index', []))} block(s) "
+        f"({int(m.get('n_tokens', 0))} positions from {int(m.get('first_pos', 0))})"
+        for name, m in groups.items()
+    )
+
+
+def unpack_kv_groups(buf: torch.Tensor, header: dict[str, Any]):
+    """The payload's KV groups as {name: (kv, meta)} with ``kv`` = per layer (k, v)
+    views into ``buf`` -- the argument of ``pd_transfer.import_kv_groups``. {} when
+    none."""
+    groups = payload_kv_groups(header)
+    if not groups:
+        return {}
+    by_name = _payload_views(buf, header)
+    out = {}
+    for name, meta in groups.items():
+        out[name] = (
+            [
+                (by_name[f"{name}.kv.{j}.k"], by_name[f"{name}.kv.{j}.v"])
+                for j in range(int(meta["n_layers"]))
+            ],
+            dict(meta),
+        )
+    return out
 
 
 def unpack_payload(buf: torch.Tensor, header: dict[str, Any]):
@@ -1333,8 +1445,18 @@ class _WorkerSide:
             hidden = (
                 export_hidden(self.model, slot) if export_hidden is not None else None
             )
+            # version 3: named KV groups a prefill hook staged for this slot (the
+            # DFlash2 drafter's context K/V, QWEN36_SPEC_DRAFTER=dflash2)
+            export_groups = getattr(pd_transfer, "export_kv_groups", None)
+            groups = (
+                export_groups(self.model, slot, block_ids, sr.num_tokens)
+                if export_groups is not None
+                else {}
+            )
             t1 = time.perf_counter()
-            pooled = self.pool.acquire(payload_nbytes(kv, rec_snap, conv_snap, hidden))
+            pooled = self.pool.acquire(
+                payload_nbytes(kv, rec_snap, conv_snap, hidden, groups)
+            )
             buf, header = pack_payload(
                 kv,
                 rec_snap,
@@ -1344,6 +1466,7 @@ class _WorkerSide:
                 out=pooled,
                 mtp_hidden=hidden,
                 n_mtp_layers=n_mtp,
+                kv_groups=groups,
             )
             release()
             addr, nbytes = buf.data_ptr(), int(header["nbytes"])
@@ -1372,7 +1495,7 @@ class _WorkerSide:
             self.stats["stage_ms"] += 1e3 * (t2 - t0)
             logger.info(
                 "[pd] staged %s (%s): %d tokens, %d blocks, %.1f MiB (export %.1f ms, "
-                "pack+register %.1f ms) digest %s transfer %s via %s%s",
+                "pack+register %.1f ms) digest %s transfer %s via %s%s%s",
                 sr.req_id,
                 where,
                 sr.num_tokens,
@@ -1389,6 +1512,7 @@ class _WorkerSide:
                     if n_mtp or hidden is not None
                     else ""
                 ),
+                _kv_groups_note(header),
             )
         finally:
             release()
@@ -1624,6 +1748,16 @@ class _WorkerSide:
                 else:
                     kv, rec, gdn = f.kv, f.rec, f.gdn
                 pd_transfer.import_kv_blocks(self.model, rr.block_ids[:n_blocks], kv)
+                # version 3 KV groups (the DFlash2 drafter's context K/V): into the
+                # caches this instance registered (pd_transfer.register_kv_group);
+                # groups it lacks are skipped there (logged once)
+                groups = unpack_kv_groups(buf, header)
+                import_groups = getattr(pd_transfer, "import_kv_groups", None)
+                imported_groups = (
+                    import_groups(self.model, rr.block_ids[:n_blocks], groups)
+                    if groups and import_groups is not None
+                    else []
+                )
                 # keep the snapshot alive (views into buf: the pooled receive buffer
                 # or the producer's mapped segment) until the runner writes the decode
                 # slot; the runner calls the release when done (for a mapped segment
@@ -1633,12 +1767,20 @@ class _WorkerSide:
                 # None} -- the runner hands it to the drafter with
                 # pd_transfer.import_mtp_hidden(model, slot, row) when the request
                 # gets its slot (None: the producer ran no MTP prefill; do not draft).
+                # ``kv_groups``: {name: meta} of the version-3 groups whose blocks were
+                # imported above (e.g. "dflash2": the request has drafter context K/V
+                # for positions [first_pos, first_pos + n_tokens)); {} otherwise.
                 self.runner.pd_pending_gdn[rr.req_id] = (
                     rec,
                     gdn,
                     buf,
                     f.release,
-                    {"mtp_hidden": unpack_mtp_hidden(buf, header)},
+                    {
+                        "mtp_hidden": unpack_mtp_hidden(buf, header),
+                        "kv_groups": {
+                            name: groups[name][1] for name in imported_groups
+                        },
+                    },
                 )
             t1 = time.perf_counter()
             self._finish_recv(rr.req_id)
@@ -1651,7 +1793,7 @@ class _WorkerSide:
                 f"{' + hidden row' if (header.get('mtp') or {}).get('hidden') else ''}"
                 if header.get("mtp")
                 else ""
-            )
+            ) + _kv_groups_note(header)
             if f.via == "shm":
                 logger.info(
                     "[pd] pulled %s: %d tokens, %.1f MiB via shm (wait %.1f ms, map "
