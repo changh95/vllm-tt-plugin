@@ -395,6 +395,49 @@ generations token-identical to both single-drafter runs) across 19 served
 drafter switches. TTFT is ~10-20 % higher than mtp's on 1k-4k prompts because P
 runs both hooks (the DFlash2 projection dominates; the MTP prefill adds ~5 ms).
 
+## Long-context TPOT: the DFlash2 context window (2026-09-28)
+
+The first hybrid sweep (`logs/points_pd_v11_merged` in the experiments tree) had
+long-prompt TPOT about 2x the MTP sweep's at every listed concurrency (16k/128:
+14-15 -> 27-35 ms; 32k: 15 -> 34-40; 64k: 13 -> 55-59; 128k: 18 -> 70) with
+128/128 unchanged, and D's acceptance length at 1.04-1.25 late in the sweep. An
+A/B of four stacks on the same tree (tt-metal `tests/DFLASH2_RESULTS.md`
+section 8: hybrid; mtp; hybrid resident but never drafting; no speculation)
+separated the two candidate causes:
+
+- The resident drafters cost the decode nothing: plain steps with both drafters
+  built, P shipping both states and D importing them run at 24.2 / 24.8 / 25.2 ms
+  TPOT for one user at 128 / 16k / 32k context, the no-speculation floor's
+  24.2 / 24.7 / 25.3 (decode bucketing on). `keep_current` / the DFlash2 commit
+  run on speculative steps only.
+- The mtp drafter on the same tree is at the previous level (13.6 / 15.0 ms at
+  16k / 32k, acceptance 3.05-3.37 tok/step on real text at every context length).
+- The regression is the DFlash2 band: the device drafter attended the WHOLE
+  context while the checkpoint is trained with a 2048-token sliding window
+  (config.json `sliding_window: 2048`, `layer_types: sliding_attention`), so its
+  drafts degraded with the prompt length (real text: 4.7 tok/step at 1k-2k, 4.3
+  at 4k, 2.4 at 8k, 2.0 at 16k, 1.75 at 32k; random prompts 1.0-1.2 at 64k-128k)
+  while its block SDPA grew (8 -> 15 ms at 128k). The "32-user" long-prompt
+  points of the sweep never had more than 1-2 live users on D (P prefills a 16k
+  prompt every 1.5-3 s, a 128-token decode lasts 2-5 s), so they ran in the
+  DFlash2 band, not the plain one; the sweep's true 32-live-user long-context
+  points (8192/1024, 10000/1024) never regressed.
+
+Fix (tt-metal `tt/dflash2_head.py`): the block step's paged SDPA decode gets
+`sliding_window_size=2048` (the kernel attends keys `[cur_pos + 1 - 2048,
+cur_pos]` per block row; the 8 rows share `cur_pos = P + 7`, so a row sees at
+most 7 fewer of the oldest keys than the reference's per-row window and nothing
+the reference does not). `QWEN36_DFLASH2_DEVICE_WINDOW` (default = the
+checkpoint's 2048; `0` = the whole context, for A/B only) is read on D. Device
+evidence: the drafter's SDPA configuration matches a windowed torch reference
+(PCC 0.9997) and differs from the whole-context result past 2048 tokens
+(`tests/test_dflash2_window_op.py`); the device draft logits on a 3000-token
+GSM8K prompt match the fp32 host reference, which applies the window (PCC mean
+0.9991, argmax agreement 0.92, selected-path agreement 0.84;
+`tests/test_dflash2_spec_scratch.py DF_PCC_LEN=3000 DF_BPU=64`). Served
+re-measure: section 8.3 of the tt-metal note (the table there is the one to
+quote).
+
 ## Not done yet
 
 - Only greedy requests speculate; sampled requests force the whole step to plain
@@ -404,10 +447,11 @@ runs both hooks (the DFlash2 projection dominates; the MTP prefill adds ~5 ms).
   `QWEN36_SPEC_ALLOW_FRACTURED=1`).
 - Logprobs on the speculative path (the verify reads back only the per-row
   argmax and max).
-- The DFlash2 device drafter attends the whole context (no 2048-token sliding
-  window): identical to the reference below 2048 context tokens, a documented
-  deviation above; `QWEN36_DFLASH2_CONTEXT_WINDOW` stays 0 until the window is
-  applied on device.
+- The prefill engine ships the DFlash2 context K/V of EVERY prompt position by
+  default (`QWEN36_DFLASH2_CONTEXT_WINDOW=0`) although the device drafter reads
+  only the last 2048 (since 2026-09-28, see "Long-context TPOT" below); `2048`
+  on both engines ships the window's tail only (an opt-in until it has its own
+  served gate).
 - The prefill engine builds the whole `DFlash2Drafter` (its context caches are
   unused there: ~1.4 GB/chip at the 525k-token prefill pool); a projector-only
   construction would save them.
