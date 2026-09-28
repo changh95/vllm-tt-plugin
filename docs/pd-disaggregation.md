@@ -92,8 +92,9 @@ carries them as the KV GROUP `dflash2`:
   order = device-major over the decoder's shards; 20 KB/token, +24 % of an 8k payload), after `gdn.taps` /
   `mtp.hidden`;
 - `header["kv_groups"]["dflash2"] = {n_layers, kv_heads, head_dim, block_size, block_index, first_pos, n_tokens}`
-  where `block_index` lists the shipped blocks as indices into the request's block list (all of them by default;
-  `QWEN36_DFLASH2_CONTEXT_WINDOW=2048` ships the drafter's sliding-window tail only: 32 of 128 blocks at 8k).
+  where `block_index` lists the shipped blocks as indices into the request's block list -- by default the blocks
+  covering the drafter's 2048-position sliding-window tail (`QWEN36_DFLASH2_CONTEXT_WINDOW` follows the device
+  window `QWEN36_DFLASH2_DEVICE_WINDOW`; 32 of 128 blocks at 8k, 40 MiB instead of 160 MiB; `0` ships every block).
 
 Version 3 adds tensors and header fields only: a version-2 consumer decodes a version-3 payload unchanged and a
 version-3 consumer decodes a version-2 one (no groups). The consumer registers its drafter's caches once at warm-up

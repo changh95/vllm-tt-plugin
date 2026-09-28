@@ -64,20 +64,20 @@ Header fields: ``num_tokens`` (the producer's prefilled length), ``n_blocks``,
 ``n_attn_layers`` (main layers only, so a version-1 consumer, which reads ``kv.<li>``
 for li < n_attn_layers and ignores unknown names, still decodes a version-2 payload),
 ``n_gdn_layers``, ``n_conv``, ``nbytes``, ``tensors`` and, when present, ``mtp`` =
-``{"n_layers": <int>, "hidden": <bool>}`` and (version 3) ``kv_groups`` =
-``{<group>: {n_layers, kv_heads, head_dim, block_size, block_index, first_pos,
-n_tokens}}`` where ``block_index`` lists the shipped blocks as indices into the
-request's block list (all of them by default; with QWEN36_DFLASH2_CONTEXT_WINDOW the
-producer ships only the drafter's sliding-window tail) and ``first_pos`` / ``n_tokens``
-the positions they hold. A version-2 consumer without an
-MTP head imports the main layers only; one with a head fed by a version-1 payload
-leaves the head's blocks zero and gets no hidden row (``unpack_mtp_hidden`` -> None),
-so it must not draft for that request. Version 3 adds tensors and header fields only:
-a version-2 consumer reads a version-3 payload exactly as before (unknown names
-ignored), and a version-3 consumer reads a version-2 one (no groups). The consumer
-imports the groups it has caches for (``pd_transfer.import_kv_groups``) and parks the
-group metadata as ``entry[4]["kv_groups"]``.  The bytes are staged once per request
-and pulled or mapped as-is."""
+``{"n_layers": <int>, "hidden": <bool>}`` and (version 3) ``kv_groups`` = ``{<group>:
+{n_layers, kv_heads, head_dim, block_size, block_index, first_pos, n_tokens}}`` where
+``block_index`` lists the shipped blocks as indices into the request's block list (by
+default the blocks covering the drafter's 2048-position sliding-window tail --
+QWEN36_DFLASH2_CONTEXT_WINDOW follows the device window; 0 ships every block) and
+``first_pos`` / ``n_tokens`` the positions they hold. A version-2 consumer without an
+MTP head imports the main layers only; one with a head fed by a version-1 payload leaves
+the head's blocks zero and gets no hidden row (``unpack_mtp_hidden`` -> None), so it
+must not draft for that request. Version 3 adds tensors and header fields only: a
+version-2 consumer reads a version-3 payload exactly as before (unknown names ignored),
+and a version-3 consumer reads a version-2 one (no groups). The consumer imports the
+groups it has caches for (``pd_transfer.import_kv_groups``) and parks the group metadata
+as ``entry[4]["kv_groups"]``.  The bytes are staged once per request and pulled or
+mapped as-is."""
 
 from __future__ import annotations
 
