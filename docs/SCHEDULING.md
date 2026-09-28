@@ -238,6 +238,11 @@ Policy extras (same `tt` dict), resolved with the policy and cleared with it:
   always may); the rest wait for the next chunk step. Default: 512 for a
   block-output model, no cap otherwise. A pass of short prompts alone keeps the
   normal admission.
+- `chunked_prefill_max_riders`: how many short prompts may share such a chunk
+  step (the oldest always may). A short rider's prefill cost is nearly fixed (the
+  smallest masked bucket), so the count bounds the step where the token budget
+  would let many tiny riders through. Default: 1 for a block-output model, no
+  cap otherwise.
 - `chunked_prefill_cadence_after_final`: the cadence also holds the next long
   prompt's first chunk after a partial's final chunk, so decoders never see two
   chunk steps back to back. Default: on for a block-output model, off otherwise.

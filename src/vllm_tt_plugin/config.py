@@ -379,12 +379,16 @@ def clear_tt_prefill_chunk_policy(vllm_config: "VllmConfig") -> None:
 #   slot).
 # - ``rider_tokens``: prompt-token budget of the short prompts that may share a
 #   chunk step while requests decode (None = no cap).
+# - ``max_riders``: how many short prompts may share such a step (None = no
+#   count cap). A rider's prefill cost is mostly fixed (the smallest masked
+#   bucket), so the count bounds the step better than tokens for short riders.
 # - ``cadence_after_final``: the decode cadence also separates a partial's
 #   final chunk from the next long prompt's first chunk.
 # - ``burst_longs``: with this many long prompts pending (0 = never), prefill
 #   first like the default policy (no split, no cadence).
 _PREFILL_CHUNK_EXTRAS_KEY = "_tt_prefill_chunk_extras"
 _DEFAULT_BLOCK_OUTPUT_RIDER_TOKENS = 512
+_DEFAULT_BLOCK_OUTPUT_MAX_RIDERS = 1
 
 
 def get_tt_prefill_chunk_extras(vllm_config: "VllmConfig") -> dict[str, Any]:
@@ -394,6 +398,7 @@ def get_tt_prefill_chunk_extras(vllm_config: "VllmConfig") -> dict[str, Any]:
     extras = {
         "block_output": False,
         "rider_tokens": None,
+        "max_riders": None,
         "cadence_after_final": False,
         "burst_longs": 0,
     }
@@ -427,6 +432,9 @@ def resolve_tt_prefill_chunk_policy(
       share a chunk step while requests decode (the oldest waiting short prompt
       always may); the rest wait for the next chunk step. Default: 512 for a
       block-output model (``block_output``), no cap otherwise.
+    - ``chunked_prefill_max_riders``: how many short prompts may share such a
+      chunk step (the oldest always may). Default: 1 for a block-output model,
+      no cap otherwise.
     - ``chunked_prefill_cadence_after_final``: also hold the next long prompt's
       first chunk for the cadence after a partial's final chunk, so decoders
       never see two chunk steps back to back. Default: on for a block-output
@@ -496,6 +504,19 @@ def resolve_tt_prefill_chunk_policy(
             "additional_config.tt.chunked_prefill_rider_tokens must be an integer "
             f">= 0 or null, got {rider_tokens!r}"
         )
+    max_riders = tt_config.get(
+        "chunked_prefill_max_riders",
+        _DEFAULT_BLOCK_OUTPUT_MAX_RIDERS if block_output else None,
+    )
+    if max_riders is not None and (
+        isinstance(max_riders, bool)
+        or not isinstance(max_riders, int)
+        or max_riders < 1
+    ):
+        raise ValueError(
+            "additional_config.tt.chunked_prefill_max_riders must be an integer "
+            f">= 1 or null, got {max_riders!r}"
+        )
     cadence_after_final = tt_config.get(
         "chunked_prefill_cadence_after_final", bool(block_output)
     )
@@ -521,6 +542,7 @@ def resolve_tt_prefill_chunk_policy(
     additional[_PREFILL_CHUNK_EXTRAS_KEY] = {
         "block_output": bool(block_output),
         "rider_tokens": rider_tokens,
+        "max_riders": max_riders,
         "cadence_after_final": cadence_after_final,
         "burst_longs": burst_longs,
     }

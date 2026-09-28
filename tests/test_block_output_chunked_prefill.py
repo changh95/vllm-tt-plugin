@@ -127,6 +127,7 @@ def test_the_key_with_its_prerequisites_resolves_the_policy():
     assert is_tt_block_output_chunked_prefill(config) is True
     extras = get_tt_prefill_chunk_extras(config)
     assert extras["rider_tokens"] == 512
+    assert extras["max_riders"] == 1
     assert extras["cadence_after_final"] is True
     assert extras["burst_longs"] == 0
 
@@ -159,6 +160,7 @@ def test_the_key_on_a_width_one_model_raises():
         ({"chunked_prefill_rider_tokens": True}, "rider_tokens"),
         ({"chunked_prefill_cadence_after_final": 1}, "cadence_after_final"),
         ({"chunked_prefill_burst_longs": 1}, "burst_longs"),
+        ({"chunked_prefill_max_riders": 0}, "max_riders"),
     ],
 )
 def test_policy_extra_knobs_are_validated(tt, match):
@@ -176,6 +178,7 @@ def test_plain_models_keep_the_plain_policy_extras():
     assert get_tt_prefill_chunk_extras(config) == {
         "block_output": False,
         "rider_tokens": None,
+        "max_riders": None,
         "cadence_after_final": False,
         "burst_longs": 0,
     }
@@ -442,6 +445,44 @@ def test_riders_beyond_the_budget_wait_for_the_next_chunk_step():
     riders = [[r for r in sp if r.startswith("s")] for sp in chunk_steps]
     assert all(len(x) <= 1 for x in riders), riders  # 30 + 30 > 40
     assert sum(riders, []) == ["s0", "s1", "s2"]
+
+
+def test_riders_beyond_the_count_cap_wait_for_the_next_chunk_step():
+    """Short riders cost a nearly fixed masked-bucket prefill each: the count cap
+    (block-output default 1) bounds the chunk step where the token budget
+    would let many tiny riders through."""
+    s = _scheduler(max_num_seqs=8, decode_steps=1, chunked_prefill_rider_tokens=512)
+    assert s._cp_extras["max_riders"] == 1
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 4 * CHUNK))
+    trace = _Trace()
+    _step(s, trace)  # chunk 0
+    for i in range(3):
+        s.add_request(_request(f"s{i}", 10))
+    _run_until(
+        s, lambda: all(s.requests[f"s{i}"].num_computed_tokens for i in range(3)), trace
+    )
+    chunk_steps = [sp for k, sp, _ in trace.steps if k == "prefill" and "L" in sp]
+    riders = [[r for r in sp if r.startswith("s")] for sp in chunk_steps]
+    assert all(len(x) <= 1 for x in riders), riders
+    assert sum(riders, []) == ["s0", "s1", "s2"]
+
+
+def test_no_count_cap_lets_small_riders_share_one_chunk_step():
+    s = _scheduler(
+        max_num_seqs=8,
+        decode_steps=1,
+        chunked_prefill_rider_tokens=512,
+        chunked_prefill_max_riders=None,
+    )
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 4 * CHUNK))
+    _step(s)
+    for i in range(3):
+        s.add_request(_request(f"s{i}", 10))
+    trace = _Trace()
+    _run_until(s, lambda: s.requests["s0"].num_computed_tokens > 0, trace)
+    assert set(trace.steps[-1][1]) == {"L", "s0", "s1", "s2"}
 
 
 def test_the_oldest_rider_is_admitted_even_above_the_budget():

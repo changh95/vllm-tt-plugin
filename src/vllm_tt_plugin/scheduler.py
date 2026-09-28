@@ -763,6 +763,7 @@ class TTScheduler(AsyncScheduler):
             prefill_result = self._schedule_prefill_only(
                 chunked_threshold=threshold,
                 rider_tokens=extras.get("rider_tokens") if threshold else None,
+                max_riders=extras.get("max_riders") if threshold else None,
             )
             if prefill_result.total_num_scheduled_tokens > 0:
                 self._cp_check_alignment(prefill_result, chunk)
@@ -802,10 +803,17 @@ class TTScheduler(AsyncScheduler):
                 return True
         return False
 
-    def _cp_hide_excess_riders(self, chunk: int, rider_tokens: int, long_in_pass: bool):
+    def _cp_hide_excess_riders(
+        self,
+        chunk: int,
+        rider_tokens: int | None,
+        long_in_pass: bool,
+        max_riders: int | None = None,
+    ):
         """Take the short waiting requests beyond the rider budget of a chunk
-        step (extra ``rider_tokens``): riders are admitted oldest first while
-        their prompt tokens fit the budget; the oldest always may. Only when the
+        step (extras ``rider_tokens`` / ``max_riders``): riders are admitted
+        oldest first while their prompt tokens fit the token budget and their
+        count the count cap; the oldest always may. Only when the
         pass carries a long prompt's chunk; a pass of short prompts alone keeps
         today's admission. Returns [(queue, taken)] like _cp_hide_long_waiting."""
         if not long_in_pass:
@@ -822,12 +830,15 @@ class TTScheduler(AsyncScheduler):
             ((q, r) for q in queues for r in q if is_short(r)),
             key=lambda qr: qr[1].arrival_time,
         )
-        used = 0
+        used = admitted = 0
         hide = []
-        for k, (q, r) in enumerate(shorts):
+        for q, r in shorts:
             n = r.num_tokens - r.num_computed_tokens
-            if k == 0 or used + n <= rider_tokens:
+            fits_tokens = rider_tokens is None or used + n <= rider_tokens
+            fits_count = max_riders is None or admitted < max_riders
+            if admitted == 0 or (fits_tokens and fits_count):
                 used += n
+                admitted += 1
             else:
                 hide.append((q, r))
         taken = []
@@ -969,7 +980,10 @@ class TTScheduler(AsyncScheduler):
                 )
 
     def _schedule_prefill_only(
-        self, chunked_threshold: int | None = None, rider_tokens: int | None = None
+        self,
+        chunked_threshold: int | None = None,
+        rider_tokens: int | None = None,
+        max_riders: int | None = None,
     ) -> SchedulerOutput:
         """Schedule prefill work: waiting requests and partial continuations.
 
@@ -1020,14 +1034,17 @@ class TTScheduler(AsyncScheduler):
             taken_long = self._cp_hide_long_waiting(
                 chunk, partial_in_flight=bool(partial_prefills)
             )
-            if rider_tokens is not None:
+            if rider_tokens is not None or max_riders is not None:
                 long_visible = any(
                     r.num_tokens - r.num_computed_tokens > chunk
                     for q in (self.waiting, skipped_waiting or ())
                     for r in q
                 )
                 taken_long += self._cp_hide_excess_riders(
-                    chunk, rider_tokens, bool(partial_prefills) or long_visible
+                    chunk,
+                    rider_tokens,
+                    bool(partial_prefills) or long_visible,
+                    max_riders,
                 )
             self.scheduler_config.long_prefill_token_threshold = chunked_threshold
 
