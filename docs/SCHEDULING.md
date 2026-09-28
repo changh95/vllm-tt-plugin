@@ -265,6 +265,10 @@ keeps the TT chunk policy for it. Nothing in the block contract changes:
   meets the ragged `1..W` reconciliation.
 - An intermediate chunk row emits `[]` (vLLM skips an empty token list); the
   final chunk is a plain width-1 prefill anchor.
+- A preempted request's replay (prompt + outputs) is admitted whole, never split:
+  its later chunks would start past the prompt, where the block accounting and
+  the runner read a decode row. It is one whole-prompt stall, as without the
+  policy.
 - A continuation keeps the device state slot it already owns, held against the
   other rows of the step (the model keeps per-slot prompt context there); the
   runner raises if a continuation has no slot or two rows claim one. Decode

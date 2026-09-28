@@ -760,6 +760,17 @@ class TTScheduler(AsyncScheduler):
         )
         if has_pending_prefill and gate_open and not starved:
             threshold = chunk if has_running_decode and not burst else 0
+            if (
+                threshold
+                and partial is None
+                and extras.get("block_output")
+                and self._cp_next_long_is_replay(chunk)
+            ):
+                # A preempted request replays prompt + outputs. Split, its later
+                # chunks start past the prompt, where the block accounting's
+                # decode test (and the runner's) reads a decode row. Admit the
+                # replay whole instead (one stall, as without the policy).
+                threshold = 0
             prefill_result = self._schedule_prefill_only(
                 chunked_threshold=threshold,
                 rider_tokens=extras.get("rider_tokens") if threshold else None,
@@ -784,6 +795,20 @@ class TTScheduler(AsyncScheduler):
             result = super().schedule()
         self._cp_note_decode_step(result)
         return self._finalize_scheduler_output(result)
+
+    def _cp_next_long_is_replay(self, chunk: int) -> bool:
+        """Whether the long waiting request the next prefill pass admits (the
+        oldest, see _cp_hide_long_waiting) is a preempted request's replay."""
+        queues = [self.waiting]
+        skipped_waiting = getattr(self, "skipped_waiting", None)
+        if skipped_waiting is not None:
+            queues.append(skipped_waiting)
+        longs = [
+            r for q in queues for r in q if r.num_tokens - r.num_computed_tokens > chunk
+        ]
+        if not longs:
+            return False
+        return min(longs, key=lambda r: r.arrival_time).num_output_tokens > 0
 
     def _cp_count_long_waiting(self, chunk: int) -> int:
         queues = [self.waiting]

@@ -554,6 +554,33 @@ def test_one_long_prompt_with_decoders_is_still_chunked_under_the_burst_extra():
     assert spans == {"L1": (0, CHUNK)}
 
 
+def test_a_preempted_decoders_replay_is_never_split():
+    """KV pressure (found on device): a preempted decoder comes back with prompt +
+    outputs to replay. Split at the chunk size, its continuation chunk starts past
+    the prompt, so the block accounting's decode test counts it as a decode row (a
+    step with a rider trips the mixed-step refusal; a solo tail underflows the block
+    reservation). The policy admits a long replay whole instead of chunking it."""
+    s = _scheduler(max_num_seqs=8, decode_steps=1)
+    _start_decoders(s, 2, max_tokens=600)
+    for _ in range(40):  # d1 accumulates > CHUNK outputs (3 per ragged block step)
+        _step(s)
+    victim = s.requests["d1"]
+    assert victim.num_output_tokens > CHUNK
+    s.running.remove(victim)
+    s._preempt_request(victim, 0.0)
+    replay = victim.num_tokens
+    assert replay > CHUNK and victim.num_computed_tokens == 0
+    s.add_request(_request("s0", 20))  # a rider waiting next to the replay
+    trace = _Trace()
+    _run_until(s, lambda: victim.num_computed_tokens >= replay, trace)
+    spans = [sp["d1"] for k, sp, _ in trace.steps if "d1" in sp and k == "prefill"]
+    assert spans == [(0, replay)], spans
+    for _ in range(
+        10
+    ):  # and it decodes as a block row afterwards (_step raises on a mixed step)
+        _step(s)
+
+
 # ------------------------------------------------------------- runner: sticky slots
 
 
