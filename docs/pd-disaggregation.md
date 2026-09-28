@@ -106,6 +106,11 @@ group logs once and skips it (plain decode for that request). Round-trip evidenc
 to the decoder's own projection of the same prompt for 8 x 128, 4196 and 8192 tokens): tt-metal
 `models/demos/blackhole/qwen36/tests/pd_dflash2_transfer_repro.py`, numbers in `tests/DFLASH2_TRANSPORT_RESULTS.md`.
 
+With `QWEN36_SPEC_DRAFTER=hybrid` the producer runs BOTH prefill hooks and the payload carries both the MTP
+fields (`mtp.kv.0`, `mtp.hidden`) and the `dflash2` KV group; the consumer (which built both drafters) imports both,
+so its decode engine can switch drafters with the batch width without a re-prefill (docs/SPECULATIVE.md, "The hybrid
+policy"). No format change: version 3 already allows the MTP fields and the groups side by side.
+
 ## Configuration
 
 Producer (prefill instance):

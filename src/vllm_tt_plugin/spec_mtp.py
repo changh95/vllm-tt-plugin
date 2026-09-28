@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""Speculative decoding with a model-owned drafter (Qwen3.6 MTP head, or the
-DFlash2 block drafter behind the same loop -- ``QWEN36_SPEC_DRAFTER`` on the
-model side, see docs/SPECULATIVE.md): policy and plumbing on the plugin side.
+"""Speculative decoding with a model-owned drafter (Qwen3.6 MTP head, the
+DFlash2 block drafter behind the same loop, or the hybrid that keeps both and
+picks one by batch width -- ``QWEN36_SPEC_DRAFTER`` on the model side, see
+docs/SPECULATIVE.md): policy and plumbing on the plugin side.
 
 The TT model runs the whole draft -> verify -> commit loop itself (tt-metal
 ``qwen36/tt/spec_decoder.py``); vLLM only does the bookkeeping: the scheduler
