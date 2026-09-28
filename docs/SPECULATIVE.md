@@ -96,7 +96,52 @@ plan change and goes through the protocol below unchanged: the 4 -> 5 crossing
 5 -> 4 migrates the pending MTP-band rows (<= 3 <= 7) into the (4,8) plan, 16 ->
 17 flushes into plain decode as before. Nothing is re-prefilled at a switch
 because both drafters' per-request state is kept current on EVERY spec step
-(tt-metal `tt/spec_decoder.py` `_HybridDrafter`):
+(tt-metal `tt/spec_decoder.py` `_HybridDrafter`).
+
+**The context rule** (`QWEN36_SPEC_DFLASH2_MAX_CTX`, default 12288 tokens;
+`0` = off; 2026-09-28). The block drafter's acceptance falls with the context
+length even with its 2048-token sliding window applied (real text 4.7 tok/step
+at 1-2k, ~3.4 at 8k, 2.0-2.8 at 16k+; the MTP head's is context-independent at
+3.05-3.4), so past the crossover the DFlash2 band loses (see "Long-context
+TPOT"). The state machine therefore also looks at the LONGEST live context on
+the grid -- the rows' decode positions (prompt + generated), which the decoder
+has every step -- and drafts with DFlash2 only while it is `<=` the limit. Above
+it the grid runs the LONG ladder (`QWEN36_SPEC_LADDER_LONG`, default the mtp
+ladder `1:4,2:4,4:4,8:4,10:3,16:2`): the MTP head at every width. Concretely:
+
+| longest live context | `w_grid` 1 / 2 / 3-4 | 5-8 / 9-10 / 11-16 | 17-32 |
+|---|---|---|---|
+| `<= QWEN36_SPEC_DFLASH2_MAX_CTX` | (1,8) / (2,8) / (4,8) DFlash2 | (8,4) / (10,3) / (16,2) MTP | plain |
+| above (long mode) | (1,4) / (2,4) / (4,4) MTP | (8,4) / (10,3) / (16,2) MTP | plain |
+
+- The mode cannot flap: for a fixed set of requests the positions only grow, so
+  it flips at most once per set (short -> long when a user grows past the limit
+  or a long-prompt user is admitted) and flips back only when the long users
+  have left AND the longest remaining context is below the limit minus the
+  hysteresis (`QWEN36_SPEC_DFLASH2_CTX_HYST`, default 1024). Every change
+  coincides with a growth crossing or an admission / departure.
+- A mode change is a drafter change and a plan change (e.g. (4,8) -> (4,4))
+  taken through the protocol below. Pending DFlash2 rows of up to 7 do not fit
+  the MTP plan's T-1 = 3, and no scheduler hold can help (no admission is
+  involved, or it lands inside the current band), so the model runs ONE flush
+  step of its own at the current mode's plan for the grid width (a same-band
+  plan: the rows always fit) and switches on the next step; when the rows fit
+  (<= 3 accepted) it migrates directly. Back to DFlash2 (larger T) is always a
+  migration. Nothing changes for the scheduler: `HoldInfo` is computed against
+  the band structure of the mode in force, width crossings are held as before.
+- Cost: three more verify plans on D ((1,4) / (2,4) / (4,4): 9 plans, their
+  migrations compiled at warm-up), no new state (both drafters are current every
+  step already). `QWEN36_SPEC_K=3` clamps both ladders onto the same (w,4)
+  plans; the mode alone then picks the drafter, without a plan change.
+- Evidence: tt-metal `tests/DFLASH2_RESULTS.md` section 9 -- CPU state-machine
+  tests (a user growing past the limit: exactly one own flush then MTP for good;
+  a long-prompt admission into the DFlash2 band; hysteresis; a churn scenario
+  with no double flips; 52 pass), the device scenario with a limit inside the
+  scenario's context range (3 mode changes, 3 drafter switches, the long
+  ladder's plans in use, every stream bitwise the plain decode), the crossover
+  measurement behind the default and the served gate table below.
+
+Both drafters' state is kept current every step:
 
 - P computes and ships BOTH states: the MTP prefill hook (head KV `mtp.kv.0`
   over `0..N-2` + `mtp.hidden`) and the DFlash2 aux hook (KV group `dflash2`)
@@ -438,6 +483,130 @@ GSM8K prompt match the fp32 host reference, which applies the window (PCC mean
 re-measure: section 8.3 of the tt-metal note (the table there is the one to
 quote).
 
+With the window the DFlash2 band still trailed the MTP head at long context
+(TPOT 16k 17.4 vs 13.6 ms, 32k 17.9 vs 15.0, 64k 32 vs 15 on random prompts;
+real text 3.4 tok/step at 8k vs 3.05 at a ~10 ms cheaper step), which is what the
+context rule above answers; the crossover it is set from:
+
+Two probe-only stacks (hybrid + transport window with the context rule OFF, i.e. DFlash2 at every context length for one user; the MTP drafter K=3), AICLK under firmware control, `scripts/longctx_accept_probe.py` with GSM8K text and a long technical document (tt-metal tech reports), 128 greedy tokens, 2 repeats (means):
+
+| text | context | DFlash2 tok/step | DFlash2 ms/step | DFlash2 ms/token | MTP tok/step | MTP ms/step | MTP ms/token | winner | TTFT hybrid / mtp ms |
+|---|---|---|---|---|---|---|---|---|---|
+| gsm8k | 2,048 | 4.74 | 46.4 | **9.5** | 3.20 | 38.1 | **11.7** | DFlash2 | 476 / 374 |
+| gsm8k | 4,096 | 4.57 | 47.1 | **10.0** | 3.12 | 38.6 | **12.1** | DFlash2 | 831 / 642 |
+| gsm8k | 6,144 | 5.57 | 48.0 | **8.3** | 3.51 | 39.0 | **10.9** | DFlash2 | 1150 / 962 |
+| gsm8k | 8,192 | 3.71 | 47.5 | **12.6** | 3.01 | 38.7 | **12.7** | tie | 1352 / 1172 |
+| gsm8k | 12,288 | 4.13 | 48.3 | **11.4** | 2.96 | 39.5 | **13.1** | DFlash2 | 1957 / 1766 |
+| gsm8k | 16,384 | 3.88 | 49.0 | **12.4** | 3.09 | 40.2 | **12.8** | DFlash2 | 2571 / 2444 |
+| doc | 2,048 | 3.37 | 45.6 | **13.4** | 2.58 | 37.8 | **14.4** | DFlash2 | 476 / 380 |
+| doc | 4,096 | 4.27 | 46.8 | **10.7** | 2.98 | 38.5 | **12.8** | DFlash2 | 804 / 640 |
+| doc | 6,144 | 6.74 | 48.4 | **6.9** | 3.76 | 38.8 | **10.1** | DFlash2 | 1176 / 922 |
+| doc | 8,192 | 3.88 | 47.2 | **11.9** | 2.88 | 38.7 | **13.2** | DFlash2 | 1343 / 1248 |
+| doc | 12,288 | 4.41 | 48.3 | **10.6** | 3.08 | 39.8 | **12.6** | DFlash2 | 1904 / 1747 |
+| doc | 16,384 | 2.98 | 48.0 | **15.9** | 3.13 | 40.0 | **12.7** | MTP | 2559 / 2458 |
+
+(the reading and the default: tt-metal note section 9.2)
+
+**Transport window on by default.** `QWEN36_DFLASH2_CONTEXT_WINDOW` now follows
+the device window (unset -> 2048; `QWEN36_DFLASH2_DEVICE_WINDOW=0` -> ship
+everything; an explicit value wins): P skips the projection of every prompt
+segment that ends before the last 2048 positions (block aligned) and ships only
+the blocks covering `[first_pos, total_len)`; D imports them at the request's
+blocks and its `note_context` checks the tail covers the device window (no
+warning in the gate's D log); the drafter's SDPA never reads a block below
+`first_pos`. The payload's DFlash2 group is 40 MiB instead of 20 KB x prompt
+length (16k: 320 MiB), the hook's 73 ms per 2048-token chunk goes away for the
+skipped chunks:
+
+Payload per request (P log `[pd] staged`, the whole payload incl. 16 main layers + GDN + MTP state) and single-user
+TTFT (`scripts/latency_probe.py`, osl 32, x2, and the real-text probe's first chunk), the A/B stacks of today
+(`logs/ab_hybrid_base` = hybrid without any window, `logs/ab_xover_df2` = hybrid + device + transport window,
+`logs/ab_xover_mtp` = mtp; the v12 gate's rows are in 9.5):
+
+| prompt | hybrid, no window: payload / export | hybrid + transport window: payload / export | mtp: payload / export | TTFT hybrid no window | TTFT hybrid + window | TTFT mtp | hybrid+window vs mtp |
+|---|---|---|---|---|---|---|---|
+| 8,191 | 851.8 MiB / 206 ms (128 blocks of context K/V) | **733.0 MiB** / 62-76 ms (33 blocks: 2111 positions from 6080) | 691.8 MiB / 169 ms | -- | 1418-1618 (probe 1352) | 1165-1424 (probe 1172) | +9-14% |
+| 16,383 | 1555.8 MiB / 336 ms (256 blocks) | **1277.0 MiB** / 126-306 ms (33 blocks from 14272) | 1235.8 MiB / 143-222 ms | 3651-3927 | 2529-3020 (probe 2565) | 2349-2849 (probe 2451) | **+5-7%** (was +28-37%) |
+| 32,767 | 2963.8 MiB / 576 ms (512 blocks) | 2364 MiB (33 blocks) | 2323.8 MiB / 305-377 ms | 7544-7759 | 5243-5806 | 5116-5516 | +2.5-5% (was +22-26%) |
+
+The DFlash2 group shrinks from 20 KB x prompt (160 / 320 / 640 MiB) to 41 MiB; the remaining +41 MiB over mtp is that
+tail plus the MTP hidden row. The remaining TTFT gap over mtp (~150-200 ms at 8k-16k) is P's work for the two
+drafters: the MTP prefill hook (the head's layer over every position) and the DFlash2 hook's all-gather + projection
+of the tail's chunks (67 ms per 2048-row chunk; the chunk straddling the window start was projected whole in these
+runs and is sliced to the window since -- the gate's TTFT rows below carry that).
+
+**The long-context bitwise question** (tt-metal note section 9.4). The standalone
+probes' committed streams at 3000 / 8192 real-text tokens differed from the
+one-row decode at one token each. The near-tie probe classifies both as greedy
+(near-)ties of the plain decode's bf16 logits -- 3000: gap 0.5 (4 bf16 ulps at
+|logit| 17.6, the committed token ranked second); 8192: gap 0.000, an exact bf16
+tie the two argmaxes break differently -- and both are identical across three
+draft policies (DFlash2 / random / oracle drafts: same index, same token pair,
+same gap), so they are the R = 8 verify's numerics at that position, not the
+drafts'. The bitwise statement above holds where it was established (prompts up
+to a few hundred tokens, 128/128, the served self-consistency at 1..32 users);
+at >= 3k context the R <= 32 verify is near-tie-bounded like the fractured path
+(observed gap <= 0.5, n = 2 prompts). Not a bug -- both tokens are equally
+likely at bf16 resolution.
+
+## Served gate v12 (2026-09-28, hybrid + context rule + transport window, AICLK under firmware control)
+
+Config: `QWEN36_SPEC_DRAFTER=hybrid`, K=7, the device window (2048), the transport window (default = 2048), the
+context rule (default 12288 / hysteresis 1024), decode bucketing on, D pool 1,052,672, `scripts/force_aiclk.py 0`
+before the start (firmware control: 1350 MHz under load). D after warm-up: 9 verify plans, 5643 MiB DRAM free per
+chip (5698 with 6 plans). Stack up in 195 s.
+
+* det_probe: deterministic (3 x 3 prompts identical). Self-consistency `pd_concurrency_check --conc 1 2 4 8 16 32
+  --max-tokens 64`: **ALL MATCH** (63/63 streams). GSM8K lm-eval 200 at 8 users: **0.82 +- 0.027** flexible-extract,
+  **0 degenerate** generations. D log: 0 tracebacks / protocol errors, 0 transport-window warnings.
+* D stats over the gate: 5650 spec steps (1104 DFlash2-drafted, 4546 MTP-drafted), 1285 plain, 17 flushes, 61 plan
+  changes, 22 migrations, **21 drafter switches, 9 context-rule mode changes** (max live context 32784 at the end),
+  0 own flushes (every crossing had <= 3 rows pending or coincided with an admission). Per step at 1 user: (1,8)
+  DFlash2 verify 35.6-36.3 + post 1.6 + draft 7.8 ms; (1,4) MTP in long mode verify 31.5-32.7 + post 1.1-1.3 +
+  draft 6.8-7.0 (the MTP keep-current does not run inside the MTP band: 0 keep steps).
+* `vllm bench serve` (random prompts; v10 = `logs/points_pd_v10_merged`, mtp (tree) = `logs/ab_mtp_tree` +
+  `logs/served_spec_mtp`; v11 hybrid for reference: 128/128 11.9 / 15.2 / 16.2 / 24.6 / 39.6 ms, 16k 27-35, 32k 34-40,
+  64k 55-59):
+
+| point | v12 TPOT ms | v10 TPOT | mtp (tree) TPOT | v12 t/s | v10 t/s | mtp t/s | v12 TTFT ms | v10 TTFT | mtp TTFT | TPOT vs v10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 128/128 x1 | 11.8 | 12.3 | 12.1 | 75 | 73 | 74 | 213 | 194 | 190 | -4% |
+| 128/128 x4 | 15.0 | 13.8 | 13.8 | 229 | 247 | 245 | 266 | 238 | 244 | +9% |
+| 128/128 x8 | 15.9 | 15.3 | 15.3 | 412 | 435 | 429 | 333 | 287 | 303 | +4% |
+| 128/128 x16 | 24.3 | 23.0 | 23.1 | 559 | 569 | 574 | 431 | 521 | 501 | +5% |
+| 128/128 x32 | 39.5 | 38.1 | 38.0 | 694 | 709 | 723 | 674 | 723 | 607 | +4% |
+| 16,384/128 x1 | 14.0 | 13.5 | 13.6 | 27 | 28 | 28 | 2,933 | 2,843 | 2,859 | +3% |
+| 16,384/128 x4 | 15.4 | 15.2 | — | 42 | 45 | — | 6,423 | 7,444 | — | +1% |
+| 32,768/128 x1 | 15.5 | 15.0 | 15.0 | 16 | 16 | 16 | 6,276 | 5,887 | 6,177 | +3% |
+| 32,768/128 x4 | 14.2 | 13.9 | — | 22 | 22 | — | 13,208 | 13,429 | — | +2% |
+| 65,536/128 x1 | 13.5 | 13.3 | — | 9 | 9 | — | 13,036 | 13,083 | — | +2% |
+| 65,536/128 x4 | 14.2 | 14.1 | — | 10 | 8 | — | 30,347 | 33,318 | — | +1% |
+
+  Long-context TPOT is within **+1-3 %** of v10 at 16k / 32k / 64k x 1 and 4 users (the DFlash2 band is off above
+  12288: these points run the MTP plans; v11 was +100 %). 128/128: 1 user -4 % (DFlash2), 8-32 users +4-5 % (the same
+  as the v11 hybrid gate: 16.2 / 24.6 / 39.6 -- the MTP bands and the plain band are the v10 loop op for op, so this
+  is run-to-run + the hybrid's keep-current / commit on the MTP steps, ~1 ms), 4 users +9 % (15.0 vs 13.8: the (4,8)
+  DFlash2 band on RANDOM 128-token prompts accepts less than the MTP head's 3 drafts; on GSM8K text the same band is
+  10.5 vs 13.0 ms, section 7). Aggregate t/s: 75 vs 73 at 1 user, -7 / -5 / -2 / -2 % at 4 / 8 / 16 / 32.
+  TTFT at 16k x 1: 2933 vs v10 2843 (**+3 %**; mtp on this tree 2859), 32k 6276 vs 5887 (+7 %; mtp 6177: +1.6 %),
+  64k 13036 vs 13083; x4 points 6423 / 13208 / 30347 vs 7444 / 13429 / 33318 (n = 4, arrival-order dependent).
+* TTFT probe (osl 32, x2): 8k 1460-1520 (mtp stack 1165-1424), 16k 2795-2889 (mtp 2349-2849; v10 bench 2843),
+  32k 5933-5940 (mtp 5116-5516; v10 5887). The hybrid+window stack is within ~5 % of v10 / the mtp bench points and
+  ~+5-10 % of the mtp stack's best probe runs (the two drafters' prefill hooks on P).
+* Real-text acceptance probe (1 user, 128 tokens; the rule switches drafters at 12288):
+
+| text | ctx | ms/step | tok/step | ms/token | drafter |
+|---|---|---|---|---|---|
+| gsm8k | 1,024 / 2,048 / 4,096 / 8,192 | 46.0 / 46.3 / 47.0 / 47.2 | 4.74 / 4.74 / 4.57 / 3.71 | 9.4 / 9.5 / 10.0 / 12.4 | DFlash2 (1,8) |
+| gsm8k | 12,288 / 16,384 / 32,768 | 39.8 / 40.3 / 41.8 | 2.84 / 2.98 / 3.46 | 13.8 / 13.3 / 11.9 | MTP (1,4), long mode |
+| doc | 1,024 / 2,048 / 4,096 / 8,192 | 46.0 / 45.6 / 46.8 / 47.2 | 4.57 / 3.37 / 4.27 / 3.88 | 9.8 / 13.3 / 10.7 / 11.9 | DFlash2 (1,8) |
+| doc | 12,288 / 16,384 / 32,768 | 40.0 / 40.2 / 41.8 | 3.05 / 3.20 / 3.88 | 12.9 / 12.4 / 10.5 | MTP (1,4), long mode |
+
+  vs the mtp stack (9.2): the DFlash2 band wins 1k-8k by 1-2.5 ms/token, the MTP plans above 12k are the mtp stack's
+  numbers (12.4-13.4 at 16k; 11.9 / 10.5 at 32k vs mtp's 11.9); the 12288 point is the first one past the limit
+  (prompt 12288 + generated > 12288 -> long after the first step), 13.8 vs DFlash2's 11.4 in 9.2 -- the limit could
+  sit one step higher (12,288 + 128) for 128-token outputs; kept at the measured crossover.
+
 ## Not done yet
 
 - Only greedy requests speculate; sampled requests force the whole step to plain
@@ -447,11 +616,9 @@ quote).
   `QWEN36_SPEC_ALLOW_FRACTURED=1`).
 - Logprobs on the speculative path (the verify reads back only the per-row
   argmax and max).
-- The prefill engine ships the DFlash2 context K/V of EVERY prompt position by
-  default (`QWEN36_DFLASH2_CONTEXT_WINDOW=0`) although the device drafter reads
-  only the last 2048 (since 2026-09-28, see "Long-context TPOT" below); `2048`
-  on both engines ships the window's tail only (an opt-in until it has its own
-  served gate).
+- The exact-tie case of the long-context verify (an 8192-token prompt: the
+  8-row verify and the one-row decode break a bf16 tie differently, "Long-context
+  TPOT" below) could be closed by a lowest-index tie-break in the verify's argmax.
 - The prefill engine builds the whole `DFlash2Drafter` (its context caches are
   unused there: ~1.4 GB/chip at the 525k-token prefill pool); a projector-only
   construction would save them.
