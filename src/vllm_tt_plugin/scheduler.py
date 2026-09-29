@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 import os
+import time
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
@@ -153,6 +154,11 @@ class TTScheduler(AsyncScheduler):
         # prompt, so a stream of oversized shorts cannot starve it.
         self._cp_last_prefill_long = False
         self._cp_last_rider_step = False
+        # Extra protect_prior_decoders: when each running request was first
+        # seen decoding (time.time() at the schedule() after its prefill), to
+        # tell a decoder that predates a long prompt's arrival from one that
+        # arrived with it (a burst whose first member was already prefilled).
+        self._cp_decoding_since: dict[str, float] = {}
         if self._cp_extras.get("block_output"):
             self._cp_warn_small_kv_pool()
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
@@ -741,6 +747,8 @@ class TTScheduler(AsyncScheduler):
         """
         chunk, decode_steps = self._chunk_policy
         extras = getattr(self, "_cp_extras", None) or {}
+        if extras.get("protect_prior_decoders"):
+            self._cp_stamp_decoders()
         partials = [r for r in self.running if r.is_prefill_chunk]
         if len(partials) > 1:
             raise RuntimeError(
@@ -803,6 +811,14 @@ class TTScheduler(AsyncScheduler):
                 threshold, visible = 0, "all" if e2 else "one"
             elif self._cp_medium_first(chunk, long_tokens):
                 threshold, visible = 0, "mediums"
+            elif extras.get(
+                "protect_prior_decoders"
+            ) and not self._cp_long_has_prior_decoder(long_tokens):
+                # Every running decoder started decoding after the oldest long
+                # prompt arrived (it came with them, e.g. the rest of a burst
+                # whose first member is already decoding): nothing predates it
+                # to protect, prefill as without the policy.
+                threshold, visible = 0, "all"
             else:
                 threshold = chunk
             if (
@@ -894,6 +910,36 @@ class TTScheduler(AsyncScheduler):
             result = super().schedule()
         self._cp_note_decode_step(result)
         return self._finalize_scheduler_output(result)
+
+    def _cp_stamp_decoders(self) -> None:
+        """Record when each running request is first seen decoding; forget
+        the requests that no longer run."""
+        since = getattr(self, "_cp_decoding_since", None)
+        if since is None:
+            since = self._cp_decoding_since = {}
+        now = time.time()
+        live = set()
+        for r in self.running:
+            if r.is_prefill_chunk or r.num_output_tokens == 0:
+                continue
+            live.add(r.request_id)
+            since.setdefault(r.request_id, now)
+        for rid in [k for k in since if k not in live]:
+            del since[rid]
+
+    def _cp_long_has_prior_decoder(self, long_tokens: int) -> bool:
+        """Whether a running request was already decoding when the oldest
+        waiting long prompt arrived (True when no long prompt waits)."""
+        longs = [
+            r
+            for r in self._cp_waiting()
+            if r.num_tokens - r.num_computed_tokens > long_tokens
+        ]
+        if not longs:
+            return True
+        arrival = min(r.arrival_time for r in longs)
+        since = getattr(self, "_cp_decoding_since", {})
+        return any(t < arrival for t in since.values())
 
     def _cp_waiting(self) -> list[Request]:
         """The waiting requests a prefill pass could admit now (a request

@@ -397,6 +397,9 @@ def clear_tt_prefill_chunk_policy(vllm_config: "VllmConfig") -> None:
 #   oldest short prompt above it gets a prefill step of its own (the partial
 #   and every other prompt held), which counts toward the cadence like a chunk
 #   step.
+# - ``protect_prior_decoders``: a long prompt is chunked only when a running
+#   request was already decoding when it arrived; otherwise (it came with the
+#   decoders, e.g. a burst whose first member is prefilled) it runs whole.
 _PREFILL_CHUNK_EXTRAS_KEY = "_tt_prefill_chunk_extras"
 _DEFAULT_BLOCK_OUTPUT_RIDER_TOKENS = 512
 _DEFAULT_BLOCK_OUTPUT_MAX_RIDERS = 1
@@ -417,6 +420,7 @@ def get_tt_prefill_chunk_extras(vllm_config: "VllmConfig") -> dict[str, Any]:
         "min_tokens": 0,
         "chunk_without_decoders": False,
         "oversized_rider_step": False,
+        "protect_prior_decoders": False,
     }
     if get_tt_prefill_chunk_policy(vllm_config) is None:
         return extras
@@ -472,6 +476,12 @@ def resolve_tt_prefill_chunk_policy(
       instead of running its whole remainder in one step, so a request that
       arrives meanwhile waits for one chunk, not the remainder. Default: on for
       a block-output model, off otherwise.
+    - ``chunked_prefill_protect_prior_decoders``: chunk a long prompt only
+      when a running request was already decoding when it arrived; a long
+      prompt that arrived with every current decoder (the rest of a burst
+      whose first member is already decoding) is prefilled whole with every
+      waiting prompt that fits, as without the policy. Default: on for a
+      block-output model, off otherwise.
     - ``chunked_prefill_oversized_rider_step``: make ``rider_tokens`` a hard
       budget: the oldest waiting short prompt above it does not ride a chunk
       step but gets a prefill step of its own (the partial and every other
@@ -588,7 +598,11 @@ def resolve_tt_prefill_chunk_policy(
             f">= 0, got {min_tokens!r}"
         )
     flags = {}
-    for key in ("chunk_without_decoders", "oversized_rider_step"):
+    for key in (
+        "chunk_without_decoders",
+        "oversized_rider_step",
+        "protect_prior_decoders",
+    ):
         value = tt_config.get(f"chunked_prefill_{key}", bool(block_output))
         if not isinstance(value, bool):
             raise ValueError(

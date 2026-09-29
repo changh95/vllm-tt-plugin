@@ -131,6 +131,7 @@ def test_the_key_with_its_prerequisites_resolves_the_policy():
     assert extras["cadence_after_final"] is True
     assert extras["burst_longs"] == 2
     assert extras["min_tokens"] == 8192
+    assert extras["protect_prior_decoders"] is True
     assert extras["chunk_without_decoders"] is True
     assert extras["oversized_rider_step"] is True
 
@@ -167,6 +168,7 @@ def test_the_key_on_a_width_one_model_raises():
         ({"chunked_prefill_chunk_without_decoders": 1}, "chunk_without_decoders"),
         ({"chunked_prefill_oversized_rider_step": "yes"}, "oversized_rider_step"),
         ({"chunked_prefill_min_tokens": -1}, "min_tokens"),
+        ({"chunked_prefill_protect_prior_decoders": 1}, "protect_prior_decoders"),
         ({"chunked_prefill_min_tokens": 8192.0}, "min_tokens"),
     ],
 )
@@ -191,6 +193,7 @@ def test_plain_models_keep_the_plain_policy_extras():
         "min_tokens": 0,
         "chunk_without_decoders": False,
         "oversized_rider_step": False,
+        "protect_prior_decoders": False,
     }
 
 
@@ -273,6 +276,7 @@ def _scheduler(*, max_num_seqs=4, decode_steps=2, num_blocks=None, **tt_extra):
         # of the extras set them explicitly.
         "chunked_prefill_min_tokens": 0,
         "chunked_prefill_burst_longs": 0,
+        "chunked_prefill_protect_prior_decoders": False,
         **tt_extra,
     }
     with _model_resolution(_BlockChunkModel):
@@ -699,6 +703,7 @@ def _e2_scheduler(**kw):
     chunks, burst fallback at 2 long prompts."""
     kw.setdefault("max_num_seqs", 8)
     kw.setdefault("decode_steps", 2)
+    kw.setdefault("chunked_prefill_protect_prior_decoders", True)
     return _scheduler(
         chunked_prefill_min_tokens=MIN, chunked_prefill_burst_longs=2, **kw
     )
@@ -921,6 +926,33 @@ def test_a_burst_arriving_on_a_partial_finishes_it_whole_then_admits_the_rest():
         {"L0": (CHUNK, 8 * CHUNK)},
         {"L1": (0, 6 * CHUNK), "L2": (0, 6 * CHUNK)},
     ], prefills
+
+
+@pytest.mark.parametrize("protect", [True, False])
+def test_a_long_prompt_that_arrived_with_the_decoders_runs_whole(protect):
+    """protect_prior_decoders: two long prompts arrive together; the first is
+    prefilled alone (nothing decoding) and decodes; the second arrived before
+    that decoder started decoding, so there is nobody to protect and it runs
+    whole, as without the policy. Negative control: without the extra it is
+    chunked next to the first."""
+    s = _e2_scheduler(chunked_prefill_protect_prior_decoders=protect)
+    a = _request("A", 6 * CHUNK)
+    b = _request("B", 6 * CHUNK)
+    s.add_request(a)
+    assert _step(s) == ("prefill", {"A": (0, 6 * CHUNK)})
+    s.add_request(b)  # B.arrival_time predates A's first decode step
+    kind, spans = _step(s)
+    assert kind == "prefill"
+    assert spans == ({"B": (0, 6 * CHUNK)} if protect else {"B": (0, CHUNK)})
+
+
+def test_a_long_prompt_arriving_after_decoding_started_is_chunked():
+    s = _e2_scheduler()
+    _start_decoders(s, 1)
+    _step(s)  # the decoder is seen decoding before L arrives
+    s.add_request(_request("L", 6 * CHUNK))
+    kind, spans = _step(s)
+    assert spans == {"L": (0, CHUNK)}
 
 
 def test_a_preempted_decoders_replay_is_never_split():

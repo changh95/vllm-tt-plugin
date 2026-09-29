@@ -274,6 +274,13 @@ Policy extras (same `tt` dict), resolved with the policy and cleared with it:
   chunk step, instead of waiting for the remainder. A long prompt that starts
   with nothing decoding still runs whole. Default: on for a block-output model,
   off otherwise.
+- `chunked_prefill_protect_prior_decoders`: a long prompt is chunked only
+  when a running request was already decoding when it arrived (the scheduler
+  stamps each request when it is first seen decoding and compares with the
+  prompt's `arrival_time`). A long prompt that arrived together with every
+  current decoder, such as the rest of a burst whose first member was prefilled
+  alone, runs whole with every waiting prompt that fits, as without the policy.
+  Default: on for a block-output model, off otherwise.
 - `chunked_prefill_oversized_rider_step`: `chunked_prefill_rider_tokens` binds
   the oldest short prompt too. When the oldest waiting short prompt exceeds it
   while a long prompt is in play, that prompt takes a prefill step alone (the
