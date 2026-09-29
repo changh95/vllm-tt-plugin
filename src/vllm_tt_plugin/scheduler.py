@@ -723,7 +723,8 @@ class TTScheduler(AsyncScheduler):
           ``min_tokens`` tokens left) is never split. With no partial and
           requests decoding it runs whole in a threshold-0 step that hides the
           long prompts (counted toward the cadence like an oversized rider's
-          step); with a partial in flight it takes a prefill step of its own.
+          step when a long prompt waits); with a partial in flight it takes a
+          prefill step of its own.
         - Cadence: while a partial exists and requests decode, a prefill step
           runs only after N decode steps since the previous prefill step. The
           gate holds short prompts too, so they share the chunk's step (one
@@ -845,14 +846,17 @@ class TTScheduler(AsyncScheduler):
                 self._cp_last_prefill_long = self._cp_carries_long_chunk(
                     prefill_result, chunk
                 )
-                # A medium prompt's whole prefill next to decoders is a stall
-                # like an oversized rider's step: the cadence separates it from
-                # the next chunk step.
+                # A medium prompt's whole prefill next to decoders, with a long
+                # prompt waiting, is a stall like an oversized rider's step: the
+                # cadence separates it from that prompt's first chunk. With no
+                # long prompt waiting nothing is held (the unchunked server's
+                # admission).
                 self._cp_last_rider_step = rider is not None or (
                     visible == "mediums"
                     and any(
                         n > chunk for n in prefill_result.num_scheduled_tokens.values()
                     )
+                    and self._cp_count_long_waiting(long_tokens) > 0
                 )
                 return self._finalize_scheduler_output(prefill_result)
             if has_running_decode:

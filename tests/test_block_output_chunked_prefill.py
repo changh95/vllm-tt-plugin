@@ -750,19 +750,32 @@ def test_a_prompt_above_min_tokens_is_chunked_while_others_decode():
 
 def test_a_medium_prompt_runs_whole_and_the_cadence_follows_it():
     """min_tokens: a prompt of more than one chunk but at most min_tokens runs
-    whole next to decoders (the old policy split it), and the next chunk step
-    waits the cadence after it, like after an oversized rider's step."""
+    whole next to decoders (the old policy split it), and the waiting long
+    prompt's first chunk waits the cadence after it, like after an oversized
+    rider's step."""
     s = _e2_scheduler(decode_steps=2)
     _start_decoders(s, 1)
     s.add_request(_request("M", MIN))
+    s.add_request(_request("L", MIN + 2 * CHUNK))
     trace = _Trace()
     _step(s, trace)
     assert trace.steps[-1][:2] == ("prefill", {"M": (0, MIN)})
-    s.add_request(_request("L", MIN + 2 * CHUNK))
     _run_until(s, lambda: s.requests["L"].num_computed_tokens > 0, trace)
     kinds = trace.kinds()
     idx = [i for i, k in enumerate(kinds) if k == "prefill"]
     assert idx[1] - idx[0] >= 3, kinds  # two decode steps between
+
+
+def test_a_medium_prompt_with_no_long_prompt_waiting_holds_nothing():
+    """With only medium and short prompts the policy admits like the unchunked
+    server: a prompt arriving right after a medium one's step is prefilled at
+    once, not held for the cadence."""
+    s = _e2_scheduler(decode_steps=4)
+    _start_decoders(s, 1)
+    s.add_request(_request("M", MIN))
+    assert _step(s) == ("prefill", {"M": (0, MIN)})
+    s.add_request(_request("M2", 2 * CHUNK + 1))
+    assert _step(s) == ("prefill", {"M2": (0, 2 * CHUNK + 1)})
 
 
 def test_without_min_tokens_the_same_prompt_is_chunked():
