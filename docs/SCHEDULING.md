@@ -249,7 +249,8 @@ Policy extras (same `tt` dict), resolved with the policy and cleared with it:
 - `chunked_prefill_burst_longs`: with at least this many long prompts pending
   (the partial included), the policy prefills first as without chunking (no
   cadence; a partial's whole remainder in one step, then, with no partial in
-  flight, every waiting prompt that fits the token budget whole in one step)
+  flight, every waiting prompt in queue order up to the first that does not fit
+  `max_model_len` tokens, whole, in one step)
   until fewer are pending: a burst keeps the unchunked throughput, TTFT and
   TPOT at the cost of the decode stall. The same whole-step admission applies
   whenever nothing decodes and no partial is in flight. Default: 2 for a
@@ -258,10 +259,13 @@ Policy extras (same `tt` dict), resolved with the policy and cleared with it:
 - `chunked_prefill_min_tokens`: a prompt counts as long (chunked, one in
   flight, counted by `chunked_prefill_burst_longs`) only with more than
   max(chunk, this) tokens left. A "medium" prompt (more than one chunk, at
-  most this) is never split: with requests decoding and no partial it runs
-  whole in a step that hides the long prompts and counts toward the cadence;
-  with a partial in flight it takes a prefill step of its own (it can never
-  ride a chunk step, whose threshold would split it). Default: 8192 for a
+  most this) is never split: with requests decoding, no partial, and no older
+  long prompt waiting, it runs whole in a step that hides the long prompts
+  (with a long prompt still waiting, the cadence then holds that prompt's
+  first chunk); with a partial in flight or behind an older long prompt it
+  takes a prefill step of its own when a seat is free (it can never ride a
+  chunk step, whose threshold would split it). Prompts that never exceed this
+  schedule exactly as with chunked prefill off. Default: 8192 for a
   block-output model, 0 (the chunk size) otherwise.
 - `chunked_prefill_chunk_without_decoders`: while a partial is in flight and
   the last decoding request leaves, keep advancing it one chunk per step (no

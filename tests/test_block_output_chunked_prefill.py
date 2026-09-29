@@ -670,9 +670,8 @@ def test_a_burst_of_long_prompts_falls_back_to_prefill_first():
 
 def test_a_burst_admits_only_what_fits_the_token_budget_and_never_splits():
     s = _scheduler(max_num_seqs=8, decode_steps=2, chunked_prefill_burst_longs=2)
-    budget = s.scheduler_config.max_num_batched_tokens
-    n = budget // 3 + 1  # two fit, the third does not
-    assert n <= MAX_MODEL_LEN
+    # the unchunked server's budget (max_model_len): two fit, the third does not
+    n = MAX_MODEL_LEN // 3 + 1
     _start_decoders(s, 1)
     for i in range(3):
         s.add_request(_request(f"L{i}", n))
@@ -724,20 +723,85 @@ def test_with_nobody_decoding_every_waiting_prompt_runs_whole_in_one_step():
 
 
 def test_with_nobody_decoding_and_no_burst_extra_one_long_prompt_per_step():
-    """Negative control of the test above: burst_longs 0 keeps lane C's rule."""
-    s = _scheduler(max_num_seqs=8, decode_steps=2, chunked_prefill_min_tokens=MIN)
+    """Negative control of the test above: burst_longs 0 and min_tokens 0 keep
+    lane C's rule."""
+    s = _scheduler(max_num_seqs=8, decode_steps=2)
     for i in range(2):
         s.add_request(_request(f"L{i}", 6 * CHUNK))
     kind, spans = _step(s)
     assert kind == "prefill" and spans == {"L0": (0, 6 * CHUNK)}
 
 
-def test_a_lone_medium_prompt_with_nobody_decoding_runs_without_the_burst_extra():
+def test_with_nobody_decoding_min_tokens_alone_also_admits_everything():
     s = _scheduler(max_num_seqs=8, decode_steps=2, chunked_prefill_min_tokens=MIN)
     s.add_request(_request("M1", 3 * CHUNK))
     s.add_request(_request("M2", 3 * CHUNK))
     kind, spans = _step(s)
-    assert kind == "prefill" and spans == {"M1": (0, 3 * CHUNK)}
+    assert kind == "prefill"
+    assert spans == {"M1": (0, 3 * CHUNK), "M2": (0, 3 * CHUNK)}
+
+
+def test_an_older_long_prompt_is_not_starved_by_a_stream_of_medium_prompts():
+    """Review E2-1: a medium pass hides the long prompts, so it may run only
+    when the medium is older than every waiting long prompt; otherwise the
+    long prompt's chunk step comes first (the medium gets its own step)."""
+    s = _e2_scheduler(max_num_seqs=4, decode_steps=1)
+    _start_decoders(s, 3, max_tokens=30)
+    s.add_request(_request("L", 8 * CHUNK))
+    trace = _Trace()
+    for i in range(60):
+        if i % 3 == 0:
+            s.add_request(_request(f"M{i}", 3 * CHUNK, max_tokens=30))
+        _step(s, trace)
+    assert any("L" in sp for k, sp, _ in trace.steps if k == "prefill"), trace.kinds()
+
+
+def test_a_medium_rider_that_does_not_fit_does_not_stall_the_partial():
+    """Review E2-2: a medium's own step that schedules nothing (its KV blocks do
+    not fit, or no seat) must not take the step from the partial's chunk."""
+    s = _e2_scheduler(max_num_seqs=3, decode_steps=1)
+    _start_decoders(s, 2, max_tokens=500)
+    s.add_request(_request("L", 8 * CHUNK))
+    _step(s)
+    assert s.requests["L"].is_prefill_chunk
+    s.add_request(_request("M", 3 * CHUNK))  # no seat: 2 decoders + the partial
+    trace = _Trace()
+    for _ in range(20):
+        _step(s, trace)
+    l_chunks = [sp["L"] for k, sp, _ in trace.steps if k == "prefill" and "L" in sp]
+    assert len(l_chunks) >= 4, trace.kinds()
+
+
+def _admission_trace(s, arrivals, steps):
+    out = []
+    for t in range(steps):
+        for rid, n, mt in arrivals.get(t, ()):
+            s.add_request(_request(rid, n, mt))
+        kind, spans = _step(s)
+        out.append((kind, spans))
+    return out
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_prompts_up_to_min_tokens_schedule_exactly_like_the_unchunked_policy(seed):
+    """Differential: an arrival trace whose prompts never exceed min_tokens,
+    with and without decoders, gives the same steps under the E2 policy as
+    under the unchunked TT default policy (``_chunk_policy`` None)."""
+    rng = np.random.default_rng(seed)
+    arrivals = {}
+    for i in range(24):
+        t = int(rng.integers(0, 120))
+        n = int(rng.choice([10, CHUNK, CHUNK + 1, 3 * CHUNK, MIN]))
+        arrivals.setdefault(t, []).append((f"r{i}", n, int(rng.integers(4, 60))))
+    e2 = _e2_scheduler(max_num_seqs=4, decode_steps=3)
+    # the unchunked server: no chunk policy, no chunked prefill, budget
+    # max_model_len
+    plain = _e2_scheduler(max_num_seqs=4, decode_steps=3)
+    plain._chunk_policy = None
+    plain.scheduler_config.long_prefill_token_threshold = 0
+    plain.scheduler_config.enable_chunked_prefill = False
+    plain.max_num_scheduled_tokens = MAX_MODEL_LEN
+    assert _admission_trace(e2, arrivals, 200) == _admission_trace(plain, arrivals, 200)
 
 
 def test_a_prompt_above_min_tokens_is_chunked_while_others_decode():
@@ -787,19 +851,30 @@ def test_without_min_tokens_the_same_prompt_is_chunked():
     assert spans == {"M": (0, CHUNK)}
 
 
-def test_a_medium_prompt_goes_before_a_long_one_and_hides_it():
+def test_older_medium_prompts_run_whole_and_hide_a_newer_long_one():
     s = _e2_scheduler(decode_steps=1)
     _start_decoders(s, 1)
-    s.add_request(_request("L", 8 * CHUNK))
     s.add_request(_request("M1", 3 * CHUNK))
     s.add_request(_request("M2", 2 * CHUNK + 1))
     s.add_request(_request("s", 10))
+    s.add_request(_request("L", 8 * CHUNK))
     kind, spans = _step(s)  # one long waiting: no burst; the mediums whole, L hidden
     assert kind == "prefill"
     assert spans == {"M1": (0, 3 * CHUNK), "M2": (0, 2 * CHUNK + 1), "s": (0, 10)}
     trace = _Trace()
     _run_until(s, lambda: s.requests["L"].num_computed_tokens > 0, trace)
     assert trace.steps[-1][1] == {"L": (0, CHUNK)}
+
+
+def test_a_newer_medium_prompt_takes_its_own_step_next_to_an_older_long_one():
+    s = _e2_scheduler(decode_steps=1)
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 8 * CHUNK))
+    s.add_request(_request("M", 3 * CHUNK))
+    trace = _Trace()
+    _run_until(s, lambda: s.requests["L"].num_computed_tokens > 0, trace)
+    prefills = [sp for k, sp, _ in trace.steps if k == "prefill"]
+    assert prefills == [{"M": (0, 3 * CHUNK)}, {"L": (0, CHUNK)}], prefills
 
 
 def test_two_long_prompts_waiting_next_to_decoders_are_a_burst():
