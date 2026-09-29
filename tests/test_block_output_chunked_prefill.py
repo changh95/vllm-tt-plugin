@@ -129,7 +129,8 @@ def test_the_key_with_its_prerequisites_resolves_the_policy():
     assert extras["rider_tokens"] == 512
     assert extras["max_riders"] == 1
     assert extras["cadence_after_final"] is True
-    assert extras["burst_longs"] == 0
+    assert extras["burst_longs"] == 2
+    assert extras["min_tokens"] == 8192
     assert extras["chunk_without_decoders"] is True
     assert extras["oversized_rider_step"] is True
 
@@ -165,6 +166,8 @@ def test_the_key_on_a_width_one_model_raises():
         ({"chunked_prefill_max_riders": 0}, "max_riders"),
         ({"chunked_prefill_chunk_without_decoders": 1}, "chunk_without_decoders"),
         ({"chunked_prefill_oversized_rider_step": "yes"}, "oversized_rider_step"),
+        ({"chunked_prefill_min_tokens": -1}, "min_tokens"),
+        ({"chunked_prefill_min_tokens": 8192.0}, "min_tokens"),
     ],
 )
 def test_policy_extra_knobs_are_validated(tt, match):
@@ -185,6 +188,7 @@ def test_plain_models_keep_the_plain_policy_extras():
         "max_riders": None,
         "cadence_after_final": False,
         "burst_longs": 0,
+        "min_tokens": 0,
         "chunk_without_decoders": False,
         "oversized_rider_step": False,
     }
@@ -264,6 +268,11 @@ def _scheduler(*, max_num_seqs=4, decode_steps=2, num_blocks=None, **tt_extra):
     tt = {
         "chunked_prefill_decode_steps": decode_steps,
         "sample_on_device_mode": "decode_only",
+        # The tests below that predate these two extras run with them off
+        # (every prompt above the chunk is long, no burst fallback); the tests
+        # of the extras set them explicitly.
+        "chunked_prefill_min_tokens": 0,
+        "chunked_prefill_burst_longs": 0,
         **tt_extra,
     }
     with _model_resolution(_BlockChunkModel):
@@ -643,16 +652,34 @@ def test_a_small_kv_pool_warns_at_boot():
 
 
 def test_a_burst_of_long_prompts_falls_back_to_prefill_first():
+    """A burst is prefilled as without the policy: every waiting prompt whole in
+    one step (not one long prompt per step, which would hand each its first
+    token early and then stall it behind the others: a different TTFT/TPOT
+    split than the unchunked server's)."""
     s = _scheduler(max_num_seqs=8, decode_steps=2, chunked_prefill_burst_longs=2)
     _start_decoders(s, 1)
     for i in range(3):
         s.add_request(_request(f"L{i}", 3 * CHUNK + 5))
-    kind, spans = _step(s)  # 3 long pending: whole prompt, one at a time
-    assert kind == "prefill" and spans == {"L0": (0, 3 * CHUNK + 5)}
-    kind, spans = _step(s)  # 2 pending: still the burst
-    assert kind == "prefill" and spans == {"L1": (0, 3 * CHUNK + 5)}
-    kind, spans = _step(s)  # 1 pending: the burst drained, chunk again
-    assert kind == "prefill" and spans == {"L2": (0, CHUNK)}
+    kind, spans = _step(s)
+    assert kind == "prefill"
+    assert spans == {f"L{i}": (0, 3 * CHUNK + 5) for i in range(3)}
+    s.add_request(_request("L3", 3 * CHUNK + 5))
+    kind, spans = _step(s)  # 1 pending: no burst, chunk again
+    assert kind == "prefill" and spans == {"L3": (0, CHUNK)}
+
+
+def test_a_burst_admits_only_what_fits_the_token_budget_and_never_splits():
+    s = _scheduler(max_num_seqs=8, decode_steps=2, chunked_prefill_burst_longs=2)
+    budget = s.scheduler_config.max_num_batched_tokens
+    n = budget // 3 + 1  # two fit, the third does not
+    assert n <= MAX_MODEL_LEN
+    _start_decoders(s, 1)
+    for i in range(3):
+        s.add_request(_request(f"L{i}", n))
+    kind, spans = _step(s)
+    assert kind == "prefill" and spans == {"L0": (0, n), "L1": (0, n)}
+    kind, spans = _step(s)  # L2 is the only long prompt left: no burst, chunked
+    assert kind == "prefill" and spans == {"L2": (0, CHUNK)}, spans
 
 
 def test_one_long_prompt_with_decoders_is_still_chunked_under_the_burst_extra():
@@ -661,6 +688,150 @@ def test_one_long_prompt_with_decoders_is_still_chunked_under_the_burst_extra():
     s.add_request(_request("L1", 3 * CHUNK + 5))
     kind, spans = _step(s)
     assert spans == {"L1": (0, CHUNK)}
+
+
+# ------------------------------------------- E2 policy: min_tokens, burst, no decoders
+
+MIN = 4 * CHUNK  # scaled chunked_prefill_min_tokens (8192 / 2048 on the server)
+
+
+def _e2_scheduler(**kw):
+    """The block-output defaults of the E2 policy, scaled: min_tokens = 4
+    chunks, burst fallback at 2 long prompts."""
+    kw.setdefault("max_num_seqs", 8)
+    kw.setdefault("decode_steps", 2)
+    return _scheduler(
+        chunked_prefill_min_tokens=MIN, chunked_prefill_burst_longs=2, **kw
+    )
+
+
+def test_with_nobody_decoding_every_waiting_prompt_runs_whole_in_one_step():
+    """Nothing to protect: the step is the unchunked server's step (all waiting
+    prompts, whole), not one long prompt per step."""
+    s = _e2_scheduler()
+    for i in range(2):
+        s.add_request(_request(f"L{i}", 6 * CHUNK))
+    s.add_request(_request("M", 2 * CHUNK + 3))
+    s.add_request(_request("s", 10))
+    kind, spans = _step(s)
+    assert kind == "prefill"
+    assert spans == {
+        "L0": (0, 6 * CHUNK),
+        "L1": (0, 6 * CHUNK),
+        "M": (0, 2 * CHUNK + 3),
+        "s": (0, 10),
+    }
+
+
+def test_with_nobody_decoding_and_no_burst_extra_one_long_prompt_per_step():
+    """Negative control of the test above: burst_longs 0 keeps lane C's rule."""
+    s = _scheduler(max_num_seqs=8, decode_steps=2, chunked_prefill_min_tokens=MIN)
+    for i in range(2):
+        s.add_request(_request(f"L{i}", 6 * CHUNK))
+    kind, spans = _step(s)
+    assert kind == "prefill" and spans == {"L0": (0, 6 * CHUNK)}
+
+
+def test_a_lone_medium_prompt_with_nobody_decoding_runs_without_the_burst_extra():
+    s = _scheduler(max_num_seqs=8, decode_steps=2, chunked_prefill_min_tokens=MIN)
+    s.add_request(_request("M1", 3 * CHUNK))
+    s.add_request(_request("M2", 3 * CHUNK))
+    kind, spans = _step(s)
+    assert kind == "prefill" and spans == {"M1": (0, 3 * CHUNK)}
+
+
+def test_a_prompt_above_min_tokens_is_chunked_while_others_decode():
+    s = _e2_scheduler()
+    _start_decoders(s, 1)
+    s.add_request(_request("L", MIN + 1))
+    kind, spans = _step(s)
+    assert kind == "prefill" and spans == {"L": (0, CHUNK)}
+
+
+def test_a_medium_prompt_runs_whole_and_the_cadence_follows_it():
+    """min_tokens: a prompt of more than one chunk but at most min_tokens runs
+    whole next to decoders (the old policy split it), and the next chunk step
+    waits the cadence after it, like after an oversized rider's step."""
+    s = _e2_scheduler(decode_steps=2)
+    _start_decoders(s, 1)
+    s.add_request(_request("M", MIN))
+    trace = _Trace()
+    _step(s, trace)
+    assert trace.steps[-1][:2] == ("prefill", {"M": (0, MIN)})
+    s.add_request(_request("L", MIN + 2 * CHUNK))
+    _run_until(s, lambda: s.requests["L"].num_computed_tokens > 0, trace)
+    kinds = trace.kinds()
+    idx = [i for i, k in enumerate(kinds) if k == "prefill"]
+    assert idx[1] - idx[0] >= 3, kinds  # two decode steps between
+
+
+def test_without_min_tokens_the_same_prompt_is_chunked():
+    """Negative control: min_tokens 0 (the pre-E2 policy) splits it."""
+    s = _scheduler(max_num_seqs=8, decode_steps=2)
+    _start_decoders(s, 1)
+    s.add_request(_request("M", MIN))
+    kind, spans = _step(s)
+    assert spans == {"M": (0, CHUNK)}
+
+
+def test_a_medium_prompt_goes_before_a_long_one_and_hides_it():
+    s = _e2_scheduler(decode_steps=1)
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 8 * CHUNK))
+    s.add_request(_request("M1", 3 * CHUNK))
+    s.add_request(_request("M2", 2 * CHUNK + 1))
+    s.add_request(_request("s", 10))
+    kind, spans = _step(s)  # one long waiting: no burst; the mediums whole, L hidden
+    assert kind == "prefill"
+    assert spans == {"M1": (0, 3 * CHUNK), "M2": (0, 2 * CHUNK + 1), "s": (0, 10)}
+    trace = _Trace()
+    _run_until(s, lambda: s.requests["L"].num_computed_tokens > 0, trace)
+    assert trace.steps[-1][1] == {"L": (0, CHUNK)}
+
+
+def test_two_long_prompts_waiting_next_to_decoders_are_a_burst():
+    s = _e2_scheduler()
+    _start_decoders(s, 1)
+    s.add_request(_request("L0", 6 * CHUNK))
+    s.add_request(_request("L1", 6 * CHUNK))
+    kind, spans = _step(s)
+    assert spans == {"L0": (0, 6 * CHUNK), "L1": (0, 6 * CHUNK)}
+
+
+@pytest.mark.parametrize("hard_budget", [True, False])
+def test_a_medium_prompt_gets_its_own_step_while_a_partial_is_in_flight(hard_budget):
+    """A medium prompt cannot ride a chunk step (the step's threshold would split
+    it into a second partial): with a partial in flight it takes a prefill step
+    alone, whole, whatever the hard rider budget says, and the partial goes on."""
+    s = _e2_scheduler(decode_steps=1, chunked_prefill_oversized_rider_step=hard_budget)
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 8 * CHUNK))
+    trace = _Trace()
+    _step(s, trace)
+    assert trace.steps[-1][1] == {"L": (0, CHUNK)}
+    s.add_request(_request("M", 3 * CHUNK + 7))
+    _run_until(s, lambda: not s.requests["L"].is_prefill_chunk, trace)
+    prefills = [sp for k, sp, _ in trace.steps if k == "prefill"]
+    assert {"M": (0, 3 * CHUNK + 7)} in prefills, prefills
+    assert all(b - a <= CHUNK for sp in prefills if "L" in sp for a, b in [sp["L"]])
+    assert not any("M" in sp and "L" in sp for sp in prefills), prefills
+
+
+def test_a_burst_arriving_on_a_partial_finishes_it_whole_then_admits_the_rest():
+    s = _e2_scheduler(decode_steps=1)
+    _start_decoders(s, 1)
+    s.add_request(_request("L0", 8 * CHUNK))
+    _step(s)  # L0's first chunk
+    assert s.requests["L0"].is_prefill_chunk
+    for i in (1, 2):
+        s.add_request(_request(f"L{i}", 6 * CHUNK))
+    trace = _Trace()
+    _run_until(s, lambda: s.requests["L2"].num_computed_tokens > 0, trace)
+    prefills = [sp for k, sp, _ in trace.steps if k == "prefill"]
+    assert prefills == [
+        {"L0": (CHUNK, 8 * CHUNK)},
+        {"L1": (0, 6 * CHUNK), "L2": (0, 6 * CHUNK)},
+    ], prefills
 
 
 def test_a_preempted_decoders_replay_is_never_split():

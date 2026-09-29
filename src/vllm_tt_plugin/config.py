@@ -385,7 +385,11 @@ def clear_tt_prefill_chunk_policy(vllm_config: "VllmConfig") -> None:
 # - ``cadence_after_final``: the decode cadence also separates a partial's
 #   final chunk from the next long prompt's first chunk.
 # - ``burst_longs``: with this many long prompts pending (0 = never), prefill
-#   first like the default policy (no split, no cadence).
+#   first like the default policy (no split, no cadence; with no partial in
+#   flight every waiting prompt that fits the token budget is admitted whole).
+# - ``min_tokens``: a prompt is long (chunked, one in flight) only with more
+#   than max(chunk, min_tokens) tokens left; a shorter prompt above the chunk
+#   ("medium") is prefilled whole, never riding a chunk step.
 # - ``chunk_without_decoders``: a partial keeps advancing one chunk per step
 #   when nothing decodes (instead of its whole remainder in one step), so a
 #   request arriving meanwhile waits at most one chunk.
@@ -396,6 +400,8 @@ def clear_tt_prefill_chunk_policy(vllm_config: "VllmConfig") -> None:
 _PREFILL_CHUNK_EXTRAS_KEY = "_tt_prefill_chunk_extras"
 _DEFAULT_BLOCK_OUTPUT_RIDER_TOKENS = 512
 _DEFAULT_BLOCK_OUTPUT_MAX_RIDERS = 1
+_DEFAULT_BLOCK_OUTPUT_BURST_LONGS = 2
+_DEFAULT_BLOCK_OUTPUT_MIN_TOKENS = 8192
 
 
 def get_tt_prefill_chunk_extras(vllm_config: "VllmConfig") -> dict[str, Any]:
@@ -408,6 +414,7 @@ def get_tt_prefill_chunk_extras(vllm_config: "VllmConfig") -> dict[str, Any]:
         "max_riders": None,
         "cadence_after_final": False,
         "burst_longs": 0,
+        "min_tokens": 0,
         "chunk_without_decoders": False,
         "oversized_rider_step": False,
     }
@@ -451,8 +458,14 @@ def resolve_tt_prefill_chunk_policy(
       model, off otherwise.
     - ``chunked_prefill_burst_longs``: with at least this many long prompts
       pending (the partial included), prefill first as without the policy (the
-      remainder in one step, no cadence): bursts keep today's throughput and
-      TTFT at the cost of the decode stall. Default 0 (never).
+      remainder in one step, no cadence; with no partial in flight, every
+      waiting prompt that fits the token budget in one step): bursts keep the
+      unchunked throughput, TTFT and TPOT at the cost of the decode stall.
+      Default: 2 for a block-output model, 0 (never) otherwise.
+    - ``chunked_prefill_min_tokens``: a prompt is chunked only when more than
+      max(chunk, this) of its tokens remain; a shorter prompt is prefilled
+      whole (with a partial in flight, in a prefill step of its own). Default:
+      8192 for a block-output model, 0 (the chunk size) otherwise.
     - ``chunked_prefill_chunk_without_decoders``: while a partial is in flight
       and nothing decodes, keep advancing it one chunk per step (no cadence)
       instead of running its whole remainder in one step, so a request that
@@ -546,7 +559,10 @@ def resolve_tt_prefill_chunk_policy(
             "additional_config.tt.chunked_prefill_cadence_after_final must be a "
             f"boolean, got {cadence_after_final!r}"
         )
-    burst_longs = tt_config.get("chunked_prefill_burst_longs", 0)
+    burst_longs = tt_config.get(
+        "chunked_prefill_burst_longs",
+        _DEFAULT_BLOCK_OUTPUT_BURST_LONGS if block_output else 0,
+    )
     if (
         isinstance(burst_longs, bool)
         or not isinstance(burst_longs, int)
@@ -556,6 +572,19 @@ def resolve_tt_prefill_chunk_policy(
         raise ValueError(
             "additional_config.tt.chunked_prefill_burst_longs must be 0 (off) or an "
             f"integer >= 2, got {burst_longs!r}"
+        )
+    min_tokens = tt_config.get(
+        "chunked_prefill_min_tokens",
+        _DEFAULT_BLOCK_OUTPUT_MIN_TOKENS if block_output else 0,
+    )
+    if (
+        isinstance(min_tokens, bool)
+        or not isinstance(min_tokens, int)
+        or min_tokens < 0
+    ):
+        raise ValueError(
+            "additional_config.tt.chunked_prefill_min_tokens must be an integer "
+            f">= 0, got {min_tokens!r}"
         )
     flags = {}
     for key in ("chunk_without_decoders", "oversized_rider_step"):
@@ -575,6 +604,7 @@ def resolve_tt_prefill_chunk_policy(
         "max_riders": max_riders,
         "cadence_after_final": cadence_after_final,
         "burst_longs": burst_longs,
+        "min_tokens": min_tokens,
         **flags,
     }
     return chunk, steps

@@ -247,10 +247,22 @@ Policy extras (same `tt` dict), resolved with the policy and cleared with it:
   prompt's first chunk after a partial's final chunk, so decoders never see two
   chunk steps back to back. Default: on for a block-output model, off otherwise.
 - `chunked_prefill_burst_longs`: with at least this many long prompts pending
-  (the partial included), the policy prefills first as without chunking (the
-  whole remainder in one step, no cadence) until fewer are pending: a burst
-  keeps its throughput and TTFT at the cost of the decode stall. Default 0
-  (never); otherwise at least 2.
+  (the partial included), the policy prefills first as without chunking (no
+  cadence; a partial's whole remainder in one step, then, with no partial in
+  flight, every waiting prompt that fits the token budget whole in one step)
+  until fewer are pending: a burst keeps the unchunked throughput, TTFT and
+  TPOT at the cost of the decode stall. The same whole-step admission applies
+  whenever nothing decodes and no partial is in flight. Default: 2 for a
+  block-output model, 0 (never; one long prompt per step with nothing
+  decoding) otherwise; any other value must be at least 2.
+- `chunked_prefill_min_tokens`: a prompt counts as long (chunked, one in
+  flight, counted by `chunked_prefill_burst_longs`) only with more than
+  max(chunk, this) tokens left. A "medium" prompt (more than one chunk, at
+  most this) is never split: with requests decoding and no partial it runs
+  whole in a step that hides the long prompts and counts toward the cadence;
+  with a partial in flight it takes a prefill step of its own (it can never
+  ride a chunk step, whose threshold would split it). Default: 8192 for a
+  block-output model, 0 (the chunk size) otherwise.
 - `chunked_prefill_chunk_without_decoders`: while a partial is in flight and
   the last decoding request leaves, keep advancing it one chunk per step (no
   cadence: nothing decodes) instead of running its whole remainder in one step.

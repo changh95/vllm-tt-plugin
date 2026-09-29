@@ -705,17 +705,25 @@ class TTScheduler(AsyncScheduler):
     ) -> SchedulerOutput:
         """Default-mode step under the TT chunk policy (chunk C, cadence N).
 
-        - At most ONE long prompt (more than C tokens left to compute) is in
-          flight: while it is partial, every other long waiting request is
-          hidden from the prefill pass; with none partial, only the oldest long
-          waiting request is visible.
+        - At most ONE long prompt (more than max(C, extra ``min_tokens``)
+          tokens left to compute) is in flight: while it is partial, every other
+          waiting request with more than C tokens left is hidden from the
+          prefill pass; with none partial, only the oldest long waiting request
+          is visible.
         - While requests decode, the long prompt advances C tokens per prefill
           step (``long_prefill_token_threshold``), so every chunk starts and ends
-          on a multiple of C; with nothing decoding, the threshold is 0 and the
-          whole remainder runs in one step (1-user TTFT unchanged). Extra
-          ``chunk_without_decoders``: a partial already in flight keeps one
-          chunk per step when the last decoder leaves, so a request arriving
+          on a multiple of C. With nothing decoding and no partial, the
+          threshold is 0 and every waiting prompt that fits the token budget
+          runs whole in one step, as without the policy (1-user TTFT unchanged;
+          with extra ``burst_longs`` 0, only one long prompt per step).
+          Extra ``chunk_without_decoders``: a partial already in flight keeps
+          one chunk per step when the last decoder leaves, so a request arriving
           meanwhile waits one chunk, not the remainder.
+        - Extra ``min_tokens``: a "medium" prompt (more than C but at most
+          ``min_tokens`` tokens left) is never split. With no partial and
+          requests decoding it runs whole in a threshold-0 step that hides the
+          long prompts (counted toward the cadence like an oversized rider's
+          step); with a partial in flight it takes a prefill step of its own.
         - Cadence: while a partial exists and requests decode, a prefill step
           runs only after N decode steps since the previous prefill step. The
           gate holds short prompts too, so they share the chunk's step (one
@@ -754,6 +762,7 @@ class TTScheduler(AsyncScheduler):
                 )
                 and cadence_holds
             )
+        long_tokens = max(chunk, int(extras.get("min_tokens") or 0))
         burst = False
         burst_longs = int(extras.get("burst_longs") or 0)
         if burst_longs and has_pending_prefill:
@@ -761,7 +770,7 @@ class TTScheduler(AsyncScheduler):
             # them serially costs more than the decode stall it saves; prefill
             # first (the remainder in one step, no cadence) until the burst drains.
             burst = (1 if partial is not None else 0) + self._cp_count_long_waiting(
-                chunk
+                long_tokens
             ) >= burst_longs
             gate_open = gate_open or burst
         starved = (
@@ -771,15 +780,30 @@ class TTScheduler(AsyncScheduler):
             and not self._cp_partial_fits(partial, chunk)
         )
         if has_pending_prefill and gate_open and not starved:
-            keep_chunking = has_running_decode or (
-                partial is not None and extras.get("chunk_without_decoders")
-            )
-            threshold = chunk if keep_chunking and not burst else 0
+            # Which waiting prompts the pass may see (_cp_hide_waiting): "one"
+            # long prompt in flight (the partial, or the oldest long waiting),
+            # everything that fits the token budget ("all", as without the
+            # policy), or everything but the long prompts ("mediums").
+            visible = "one"
+            if partial is not None:
+                keep_chunking = has_running_decode or bool(
+                    extras.get("chunk_without_decoders")
+                )
+                threshold = chunk if keep_chunking and not burst else 0
+            elif burst or not has_running_decode:
+                # Nothing decoding (or a burst): nothing to protect, prefill as
+                # without the policy. burst_longs 0 keeps the lane C rule (one
+                # long prompt per step).
+                threshold, visible = 0, "all" if burst_longs else "one"
+            elif self._cp_medium_waiting(chunk, long_tokens):
+                threshold, visible = 0, "mediums"
+            else:
+                threshold = chunk
             if (
                 threshold
                 and partial is None
                 and extras.get("block_output")
-                and self._cp_next_long_is_replay(chunk)
+                and self._cp_next_long_is_replay(long_tokens)
             ):
                 # A preempted request replays prompt + outputs. Split, its later
                 # chunks start past the prompt, where the block accounting's
@@ -787,21 +811,24 @@ class TTScheduler(AsyncScheduler):
                 # replay whole instead (one stall, as without the policy).
                 threshold = 0
             rider = None
-            if (
-                threshold
-                and extras.get("oversized_rider_step")
-                and not getattr(self, "_cp_last_rider_step", False)
-            ):
+            if threshold and not getattr(self, "_cp_last_rider_step", False):
                 rider = self._cp_oversized_rider(
-                    chunk, extras.get("rider_tokens"), partial
+                    chunk,
+                    long_tokens,
+                    extras.get("rider_tokens")
+                    if extras.get("oversized_rider_step")
+                    else None,
+                    partial,
                 )
             if rider is not None:
                 # Extra (oversized_rider_step): the oldest short prompt exceeds
                 # the rider budget; it takes this step alone (one stall of its
                 # own size instead of a chunk plus it), counted toward the
-                # cadence like a chunk step.
+                # cadence like a chunk step. A medium prompt (min_tokens) always
+                # does: sharing a chunk step would split it. Threshold 0: the
+                # rider is never split.
                 prefill_result = self._schedule_prefill_only(
-                    chunked_threshold=threshold, only=rider
+                    chunked_threshold=0, only=rider
                 )
             else:
                 prefill_result = self._schedule_prefill_only(
@@ -809,6 +836,8 @@ class TTScheduler(AsyncScheduler):
                     rider_tokens=extras.get("rider_tokens") if threshold else None,
                     max_riders=extras.get("max_riders") if threshold else None,
                     hard_rider_tokens=bool(extras.get("oversized_rider_step")),
+                    long_tokens=long_tokens,
+                    visible=visible,
                 )
             if prefill_result.total_num_scheduled_tokens > 0:
                 self._cp_check_alignment(prefill_result, chunk)
@@ -816,7 +845,15 @@ class TTScheduler(AsyncScheduler):
                 self._cp_last_prefill_long = self._cp_carries_long_chunk(
                     prefill_result, chunk
                 )
-                self._cp_last_rider_step = rider is not None
+                # A medium prompt's whole prefill next to decoders is a stall
+                # like an oversized rider's step: the cadence separates it from
+                # the next chunk step.
+                self._cp_last_rider_step = rider is not None or (
+                    visible == "mediums"
+                    and any(
+                        n > chunk for n in prefill_result.num_scheduled_tokens.values()
+                    )
+                )
                 return self._finalize_scheduler_output(prefill_result)
             if has_running_decode:
                 result = self._schedule_decode_only()
@@ -831,19 +868,32 @@ class TTScheduler(AsyncScheduler):
         self._cp_note_decode_step(result)
         return self._finalize_scheduler_output(result)
 
-    def _cp_next_long_is_replay(self, chunk: int) -> bool:
-        """Whether the long waiting request the next prefill pass admits (the
-        oldest, see _cp_hide_long_waiting) is a preempted request's replay."""
+    def _cp_waiting(self) -> list[Request]:
         queues = [self.waiting]
         skipped_waiting = getattr(self, "skipped_waiting", None)
         if skipped_waiting is not None:
             queues.append(skipped_waiting)
+        return [r for q in queues for r in q]
+
+    def _cp_next_long_is_replay(self, long_tokens: int) -> bool:
+        """Whether the long waiting request the next prefill pass admits (the
+        oldest, see _cp_hide_waiting) is a preempted request's replay."""
         longs = [
-            r for q in queues for r in q if r.num_tokens - r.num_computed_tokens > chunk
+            r
+            for r in self._cp_waiting()
+            if r.num_tokens - r.num_computed_tokens > long_tokens
         ]
         if not longs:
             return False
         return min(longs, key=lambda r: r.arrival_time).num_output_tokens > 0
+
+    def _cp_medium_waiting(self, chunk: int, long_tokens: int) -> bool:
+        """Whether a medium prompt (more than one chunk, at most ``long_tokens``
+        left: extra ``min_tokens``) is waiting."""
+        return any(
+            chunk < r.num_tokens - r.num_computed_tokens <= long_tokens
+            for r in self._cp_waiting()
+        )
 
     def _cp_warn_small_kv_pool(self) -> None:
         """Block-output chunked prefill is validated lossless without
@@ -872,34 +922,35 @@ class TTScheduler(AsyncScheduler):
             )
 
     def _cp_oversized_rider(
-        self, chunk: int, rider_tokens: int | None, partial: Request | None
+        self,
+        chunk: int,
+        long_tokens: int,
+        rider_tokens: int | None,
+        partial: Request | None,
     ) -> Request | None:
-        """The oldest waiting short prompt when it exceeds the rider budget and
-        a long prompt is in play (partial, or a long waiting request the pass
-        would start); None otherwise (it rides, or no chunk step is due)."""
-        if rider_tokens is None:
+        """The oldest waiting non-long prompt when it cannot ride a chunk step
+        -- it exceeds the rider budget (``rider_tokens``, None = no hard budget)
+        or the chunk (a medium prompt, extra ``min_tokens``) -- and a long
+        prompt is in play (partial, or a long waiting request the pass would
+        start); None otherwise (it rides, or no chunk step is due)."""
+        remaining = [
+            (r, r.num_tokens - r.num_computed_tokens) for r in self._cp_waiting()
+        ]
+        if partial is None and not any(n > long_tokens for _, n in remaining):
             return None
-        queues = [self.waiting]
-        skipped_waiting = getattr(self, "skipped_waiting", None)
-        if skipped_waiting is not None:
-            queues.append(skipped_waiting)
-        waiting = [r for q in queues for r in q]
-        remaining = [(r, r.num_tokens - r.num_computed_tokens) for r in waiting]
-        if partial is None and not any(n > chunk for _, n in remaining):
-            return None
-        shorts = [(r, n) for r, n in remaining if n <= chunk]
+        shorts = [(r, n) for r, n in remaining if n <= long_tokens]
         if not shorts:
             return None
         oldest, n = min(shorts, key=lambda rn: rn[0].arrival_time)
-        return oldest if n > rider_tokens else None
+        if n > chunk or (rider_tokens is not None and n > rider_tokens):
+            return oldest
+        return None
 
-    def _cp_count_long_waiting(self, chunk: int) -> int:
-        queues = [self.waiting]
-        skipped_waiting = getattr(self, "skipped_waiting", None)
-        if skipped_waiting is not None:
-            queues.append(skipped_waiting)
+    def _cp_count_long_waiting(self, long_tokens: int) -> int:
         return sum(
-            1 for q in queues for r in q if r.num_tokens - r.num_computed_tokens > chunk
+            1
+            for r in self._cp_waiting()
+            if r.num_tokens - r.num_computed_tokens > long_tokens
         )
 
     def _cp_carries_long_chunk(self, result: SchedulerOutput, chunk: int) -> bool:
@@ -926,7 +977,7 @@ class TTScheduler(AsyncScheduler):
         (extra ``oversized_rider_step``: an oversized short gets its own step
         instead). Only when the pass carries a long prompt's chunk; a pass of
         short prompts alone keeps today's admission. Returns [(queue, taken)]
-        like _cp_hide_long_waiting."""
+        like _cp_hide_waiting."""
         if not long_in_pass:
             return []
 
@@ -1001,25 +1052,60 @@ class TTScheduler(AsyncScheduler):
                     f"(num_tokens={request.num_tokens})"
                 )
 
-    def _cp_hide_long_waiting(self, chunk: int, partial_in_flight: bool):
-        """Take the long waiting requests the pass must not see (one long prompt
-        in flight). Returns [(queue, taken)] for ``_restore_requests_by_arrival``."""
+    def _cp_hide_waiting(
+        self,
+        chunk: int,
+        long_tokens: int,
+        partial_in_flight: bool,
+        visible: str = "one",
+    ):
+        """Take the waiting requests the pass must not see. Returns
+        [(queue, taken)] for ``_restore_requests_by_arrival``.
 
-        def is_long(r: Request) -> bool:
-            return r.num_tokens - r.num_computed_tokens > chunk
-
+        - ``one``: one long prompt in flight. Every waiting request with more
+          than one chunk left is hidden, except, with no partial in flight, the
+          oldest long one (more than ``long_tokens`` left), or with none waiting
+          the oldest medium one (a threshold-0 pass, which runs it whole).
+        - ``all`` (threshold 0, no partial): nothing is hidden but the requests
+          beyond the token budget, oldest first, so no prompt is split.
+        - ``mediums`` (threshold 0, no partial): like ``all``, with the long
+          prompts hidden too.
+        """
         queues = [self.waiting]
         skipped_waiting = getattr(self, "skipped_waiting", None)
         if skipped_waiting is not None:
             queues.append(skipped_waiting)
-        longs = [(q, r) for q in queues for r in q if is_long(r)]
-        keep = None
-        if not partial_in_flight and longs:
-            keep = min(longs, key=lambda qr: qr[1].arrival_time)[1]
+        entries = [
+            (q, r, r.num_tokens - r.num_computed_tokens) for q in queues for r in q
+        ]
+        hidden: set[int] = set()
+        if visible == "one":
+            longs = [r for _, r, n in entries if n > long_tokens] or [
+                r for _, r, n in entries if n > chunk
+            ]
+            keep = None
+            if not partial_in_flight and longs:
+                keep = min(longs, key=lambda r: r.arrival_time)
+            hidden = {id(r) for _, r, n in entries if n > chunk and r is not keep}
+        else:
+            if partial_in_flight:
+                raise RuntimeError(
+                    f"TT chunk policy: visible={visible!r} with a partial in flight"
+                )
+            if visible == "mediums":
+                hidden = {id(r) for _, r, n in entries if n > long_tokens}
+            used = 0
+            budget = self.scheduler_config.max_num_batched_tokens
+            for _, r, n in sorted(entries, key=lambda e: e[1].arrival_time):
+                if id(r) in hidden:
+                    continue
+                if used + n > budget:
+                    hidden.add(id(r))
+                else:
+                    used += n
         taken = []
         for q in queues:
-            hide = [r for qq, r in longs if qq is q and r is not keep]
-            t = self._take_requests(q, hide)
+            t = self._take_requests(q, [r for r in q if id(r) in hidden])
             if t is not None:
                 taken.append((q, t))
         return taken
@@ -1099,6 +1185,8 @@ class TTScheduler(AsyncScheduler):
         max_riders: int | None = None,
         hard_rider_tokens: bool = False,
         only: Request | None = None,
+        long_tokens: int | None = None,
+        visible: str = "one",
     ) -> SchedulerOutput:
         """Schedule prefill work: waiting requests and partial continuations.
 
@@ -1107,8 +1195,10 @@ class TTScheduler(AsyncScheduler):
         admits new ones.  Adjusts max_num_running_reqs so the waiting loop
         respects the true capacity with the decodes hidden.
 
-        ``chunked_threshold`` (TT chunk policy only): the pass hides the long
-        waiting requests beyond the one allowed in flight and runs with
+        ``chunked_threshold`` (TT chunk policy only): the pass hides the
+        waiting requests ``_cp_hide_waiting`` names for ``visible`` (default:
+        the long ones beyond the one allowed in flight; ``long_tokens``, default
+        the chunk, is what counts as long) and runs with
         ``long_prefill_token_threshold`` set to it, restored afterwards (the
         base scheduler reads the field per request, and a discarded prefill
         pass may be followed by a decode pass in the same step).
@@ -1160,8 +1250,11 @@ class TTScheduler(AsyncScheduler):
                     if t is not None:
                         taken_long.append((q, t))
             else:
-                taken_long = self._cp_hide_long_waiting(
-                    chunk, partial_in_flight=bool(partial_prefills)
+                taken_long = self._cp_hide_waiting(
+                    chunk,
+                    chunk if long_tokens is None else long_tokens,
+                    partial_in_flight=bool(partial_prefills),
+                    visible=visible,
                 )
             if only is None and (rider_tokens is not None or max_riders is not None):
                 long_visible = any(
