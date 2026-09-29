@@ -257,16 +257,16 @@ Policy extras (same `tt` dict), resolved with the policy and cleared with it:
   block-output model, 0 (never; one long prompt per step with nothing
   decoding) otherwise; any other value must be at least 2.
 - `chunked_prefill_min_tokens`: a prompt counts as long (chunked, one in
-  flight, counted by `chunked_prefill_burst_longs`) only with more than
-  max(chunk, this) tokens left. A "medium" prompt (more than one chunk, at
-  most this) is never split: with requests decoding, no partial, and no older
+  flight, counted by `chunked_prefill_burst_longs`) only with more than one
+  chunk and at least this many tokens left. A "medium" prompt (more than one
+  chunk, fewer than this) is never split: with requests decoding, no partial, and no older
   long prompt waiting, it runs whole in a step that hides the long prompts
   (with a long prompt still waiting, the cadence then holds that prompt's
   first chunk); with a partial in flight or behind an older long prompt it
   takes a prefill step of its own when a seat is free (it can never ride a
-  chunk step, whose threshold would split it). Prompts that never exceed this
+  chunk step, whose threshold would split it). Prompts that stay below this
   schedule exactly as with chunked prefill off. Default: 8192 for a
-  block-output model, 0 (the chunk size) otherwise.
+  block-output model, 0 (any prompt above one chunk is long) otherwise.
 - `chunked_prefill_chunk_without_decoders`: while a partial is in flight and
   the last decoding request leaves, keep advancing it one chunk per step (no
   cadence: nothing decodes) instead of running its whole remainder in one step.

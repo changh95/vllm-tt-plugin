@@ -705,11 +705,11 @@ class TTScheduler(AsyncScheduler):
     ) -> SchedulerOutput:
         """Default-mode step under the TT chunk policy (chunk C, cadence N).
 
-        - At most ONE long prompt (more than max(C, extra ``min_tokens``)
-          tokens left to compute) is in flight: while it is partial, every other
-          waiting request with more than C tokens left is hidden from the
-          prefill pass; with none partial, only the oldest long waiting request
-          is visible.
+        - At most ONE long prompt (more than C and at least extra
+          ``min_tokens`` tokens left to compute) is in flight: while it is
+          partial, every other waiting request with more than C tokens left is
+          hidden from the prefill pass; with none partial, only the oldest long
+          waiting request is visible.
         - While requests decode, the long prompt advances C tokens per prefill
           step (``long_prefill_token_threshold``), so every chunk starts and ends
           on a multiple of C. With nothing decoding and no partial, the
@@ -719,7 +719,7 @@ class TTScheduler(AsyncScheduler):
           Extra ``chunk_without_decoders``: a partial already in flight keeps
           one chunk per step when the last decoder leaves, so a request arriving
           meanwhile waits one chunk, not the remainder.
-        - Extra ``min_tokens``: a "medium" prompt (more than C but at most
+        - Extra ``min_tokens``: a "medium" prompt (more than C but fewer than
           ``min_tokens`` tokens left) is never split. With no partial and
           requests decoding it runs whole in a threshold-0 step that hides the
           long prompts, when it is older than every waiting long prompt (with
@@ -765,7 +765,9 @@ class TTScheduler(AsyncScheduler):
                 )
                 and cadence_holds
             )
-        long_tokens = max(chunk, int(extras.get("min_tokens") or 0))
+        # Long = more than long_tokens left: more than one chunk AND at least
+        # min_tokens (a prompt below min_tokens is prefilled whole).
+        long_tokens = max(chunk, int(extras.get("min_tokens") or 0) - 1)
         burst = False
         burst_longs = int(extras.get("burst_longs") or 0)
         if burst_longs and has_pending_prefill:
@@ -922,7 +924,7 @@ class TTScheduler(AsyncScheduler):
 
     def _cp_medium_first(self, chunk: int, long_tokens: int) -> bool:
         """Whether the oldest waiting prompt of more than one chunk is a medium
-        one (at most ``long_tokens`` left: extra ``min_tokens``). Only then does
+        one (fewer than extra ``min_tokens`` left). Only then does
         a medium pass (long prompts hidden) run; an older long prompt goes first
         (its chunk step), so a stream of medium prompts cannot starve it."""
         big = [

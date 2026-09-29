@@ -388,8 +388,8 @@ def clear_tt_prefill_chunk_policy(vllm_config: "VllmConfig") -> None:
 #   first like the default policy (no split, no cadence; with no partial in
 #   flight every waiting prompt that fits the token budget is admitted whole).
 # - ``min_tokens``: a prompt is long (chunked, one in flight) only with more
-#   than max(chunk, min_tokens) tokens left; a shorter prompt above the chunk
-#   ("medium") is prefilled whole, never riding a chunk step.
+#   than one chunk and at least min_tokens tokens left; a shorter prompt above
+#   the chunk ("medium") is prefilled whole, never riding a chunk step.
 # - ``chunk_without_decoders``: a partial keeps advancing one chunk per step
 #   when nothing decodes (instead of its whole remainder in one step), so a
 #   request arriving meanwhile waits at most one chunk.
@@ -462,10 +462,11 @@ def resolve_tt_prefill_chunk_policy(
       waiting prompt that fits the token budget in one step): bursts keep the
       unchunked throughput, TTFT and TPOT at the cost of the decode stall.
       Default: 2 for a block-output model, 0 (never) otherwise.
-    - ``chunked_prefill_min_tokens``: a prompt is chunked only when more than
-      max(chunk, this) of its tokens remain; a shorter prompt is prefilled
-      whole (with a partial in flight, in a prefill step of its own). Default:
-      8192 for a block-output model, 0 (the chunk size) otherwise.
+    - ``chunked_prefill_min_tokens``: a prompt is chunked only when at least
+      this many (and more than one chunk) of its tokens remain; a shorter
+      prompt is prefilled whole (with a partial in flight, in a prefill step
+      of its own). Default: 8192 for a block-output model, 0 (any prompt above
+      one chunk) otherwise.
     - ``chunked_prefill_chunk_without_decoders``: while a partial is in flight
       and nothing decodes, keep advancing it one chunk per step (no cadence)
       instead of running its whole remainder in one step, so a request that

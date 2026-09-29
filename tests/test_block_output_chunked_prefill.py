@@ -783,15 +783,15 @@ def _admission_trace(s, arrivals, steps):
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_prompts_up_to_min_tokens_schedule_exactly_like_the_unchunked_policy(seed):
-    """Differential: an arrival trace whose prompts never exceed min_tokens,
+def test_prompts_below_min_tokens_schedule_exactly_like_the_unchunked_policy(seed):
+    """Differential: an arrival trace whose prompts stay below min_tokens,
     with and without decoders, gives the same steps under the E2 policy as
     under the unchunked TT default policy (``_chunk_policy`` None)."""
     rng = np.random.default_rng(seed)
     arrivals = {}
     for i in range(24):
         t = int(rng.integers(0, 120))
-        n = int(rng.choice([10, CHUNK, CHUNK + 1, 3 * CHUNK, MIN]))
+        n = int(rng.choice([10, CHUNK, CHUNK + 1, 3 * CHUNK, MIN - 1]))
         arrivals.setdefault(t, []).append((f"r{i}", n, int(rng.integers(4, 60))))
     e2 = _e2_scheduler(max_num_seqs=4, decode_steps=3)
     # the unchunked server: no chunk policy, no chunked prefill, budget
@@ -804,26 +804,27 @@ def test_prompts_up_to_min_tokens_schedule_exactly_like_the_unchunked_policy(see
     assert _admission_trace(e2, arrivals, 200) == _admission_trace(plain, arrivals, 200)
 
 
-def test_a_prompt_above_min_tokens_is_chunked_while_others_decode():
+@pytest.mark.parametrize("n", [MIN, MIN + 1])
+def test_a_prompt_of_min_tokens_or_more_is_chunked_while_others_decode(n):
     s = _e2_scheduler()
     _start_decoders(s, 1)
-    s.add_request(_request("L", MIN + 1))
+    s.add_request(_request("L", n))
     kind, spans = _step(s)
     assert kind == "prefill" and spans == {"L": (0, CHUNK)}
 
 
 def test_a_medium_prompt_runs_whole_and_the_cadence_follows_it():
-    """min_tokens: a prompt of more than one chunk but at most min_tokens runs
+    """min_tokens: a prompt of more than one chunk but fewer than min_tokens runs
     whole next to decoders (the old policy split it), and the waiting long
     prompt's first chunk waits the cadence after it, like after an oversized
     rider's step."""
     s = _e2_scheduler(decode_steps=2)
     _start_decoders(s, 1)
-    s.add_request(_request("M", MIN))
+    s.add_request(_request("M", MIN - 1))
     s.add_request(_request("L", MIN + 2 * CHUNK))
     trace = _Trace()
     _step(s, trace)
-    assert trace.steps[-1][:2] == ("prefill", {"M": (0, MIN)})
+    assert trace.steps[-1][:2] == ("prefill", {"M": (0, MIN - 1)})
     _run_until(s, lambda: s.requests["L"].num_computed_tokens > 0, trace)
     kinds = trace.kinds()
     idx = [i for i, k in enumerate(kinds) if k == "prefill"]
@@ -836,8 +837,8 @@ def test_a_medium_prompt_with_no_long_prompt_waiting_holds_nothing():
     once, not held for the cadence."""
     s = _e2_scheduler(decode_steps=4)
     _start_decoders(s, 1)
-    s.add_request(_request("M", MIN))
-    assert _step(s) == ("prefill", {"M": (0, MIN)})
+    s.add_request(_request("M", MIN - 1))
+    assert _step(s) == ("prefill", {"M": (0, MIN - 1)})
     s.add_request(_request("M2", 2 * CHUNK + 1))
     assert _step(s) == ("prefill", {"M2": (0, 2 * CHUNK + 1)})
 
@@ -846,7 +847,7 @@ def test_without_min_tokens_the_same_prompt_is_chunked():
     """Negative control: min_tokens 0 (the pre-E2 policy) splits it."""
     s = _scheduler(max_num_seqs=8, decode_steps=2)
     _start_decoders(s, 1)
-    s.add_request(_request("M", MIN))
+    s.add_request(_request("M", MIN - 1))
     kind, spans = _step(s)
     assert spans == {"M": (0, CHUNK)}
 
