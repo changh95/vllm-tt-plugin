@@ -29,7 +29,9 @@ boundary. What runs:
   so they do not stop a request speculating. A request carrying logprobs,
   structured output or a token filter is refused per request, because no path
   on the launch applies those. A request without drafts can still be part of a
-  verify step, and there it commits the target argmax. Section 4d.
+  verify step, and there it commits the target argmax, unless the model's
+  `SpecPlan` sets `verify_requires_speculable_rows`: then no step that holds
+  such a request verifies, and the request is sampled as it asked. Section 4d.
 - **ordinary decode steps inside a speculating launch**, for a model
   declaring `supports_narrow_decode`: a step with nothing to verify is sent as
   that model's own decode call and can overlap, so configuring speculation does
@@ -47,8 +49,9 @@ boundary. What runs:
 
 Every one of those is a refusal that raises with the offending values, never a
 silent fallback. The one exception is a request that is not speculable inside
-a verify step: it commits the target argmax, and the runner logs that
-(section 4d). Structured output over drafts, `fused_sample`, `drafter_scores`
+a verify step, which only a plan without `verify_requires_speculable_rows`
+sends: it commits the target argmax, and the runner logs that (section 4d).
+Structured output over drafts, `fused_sample`, `drafter_scores`
 and a scheduler-owned paged drafter cache each need their own execution path
 before the matching refusal can go. The sampled accept walk needs one before a
 sampled request can speculate.
@@ -75,13 +78,14 @@ upstream method is a plugin change rather than a model release.
 
 ## 1a. What each static declaration promises, and what it does not
 
-Five declarations decide, before any request arrives, which call shapes a
+Six declarations decide, before any request arrives, which call shapes a
 launch can use at all. The model states each one once, at configuration time,
-and the plugin does not revise it while the server runs. None of the five
+and the plugin does not revise it while the server runs. None of the six
 names a batch size, and none of them turns asynchronous scheduling on. A model
-author can predict which input shape the plugin sends from these five plus the
-per-step `DraftOutput.num_valid` counts of section 4b, without reading any
-other model's adapter.
+author can predict which input shape the plugin sends from these six plus the
+per-step `DraftOutput.num_valid` counts of section 4b and, on a plan that sets
+`verify_requires_speculable_rows`, whether the decode batch holds a request
+that is not speculable, without reading any other model's adapter.
 
 **`SpecPlan.supports_narrow_decode`** is a field of the `SpecPlan` the model's
 `spec_plan` classmethod returns, not a `model_capabilities` key.
@@ -96,6 +100,17 @@ promise that any step will actually be narrow:
 runtime values of section 4d.
 `TTModelRunner.load_model` revokes `supports_narrow_decode` for exactly one
 declared pairing, named under `spec_hidden_handoff` below.
+
+**`SpecPlan.verify_requires_speculable_rows`** is a second `SpecPlan` field,
+default `False`. `verify_requires_speculable_rows=True` asks the plugin never
+to send a verify that carries a request it does not speculate for: while the
+decode batch holds one, every decode step is the ordinary decode call of
+section 4. It promises that the model serves that call at any step, including
+the step after a verify that committed more than one token, without being sent
+that commit's `accepted_counts`. `SpecPlan` refuses the field without
+`supports_narrow_decode`, because a held-back step is the narrow call, and
+`TTModelRunner.load_model` refuses it for the pairing whose
+`supports_narrow_decode` it revokes. Section 4d gives the rule.
 
 **`supports_async_decode`** is a `model_capabilities` key, and it is not
 speculative. It promises the split submission and readback of an ordinary
@@ -134,10 +149,12 @@ is required by `speculative_config.method` or declared by the model.
 `spec_hidden_handoff` together: a model declaring `hidden_feed` and
 `roundtrip` loses `supports_narrow_decode` for the whole launch, because an
 ordinary decode returns no `VerifyOutput` and so hands that drafter no hidden
-handle. A model declaring `on_device`, or declaring no `hidden_feed`, keeps
+handle. If its plan also sets `verify_requires_speculable_rows`,
+`TTModelRunner.load_model` raises instead, because that field needs ordinary
+decodes. A model declaring `on_device`, or declaring no `hidden_feed`, keeps
 `supports_narrow_decode`.
 
-None of the five is evidence. Each is a statement by the model author that the
+None of the six is evidence. Each is a statement by the model author that the
 adapter behaves that way. The plugin enforces shapes, dtypes and value ranges
 at run time; it enforces nothing about whether the adapter's drafter state
 actually survives a step it promised to survive.
@@ -187,8 +204,10 @@ occupies, which is not a lane-DP lane; `extra_bytes_per_seq` and
 and per KV token respectively; `accept_modes` names what the verify call
 returns; `drafter_state` says where the drafter's own state lives;
 `drafter_target_cache_requires` carries what a drafter sharing the target's
-caches needs to stay true of them; and `supports_narrow_decode` is the
-second-call-shape promise of section 1a.
+caches needs to stay true of them; `supports_narrow_decode` is the
+second-call-shape promise of section 1a; and `verify_requires_speculable_rows`
+asks that no verify carry a request the runner does not speculate for, which
+sections 1a and 4d describe.
 
 `lanes_per_request`, `extra_bytes_per_seq` and `extra_bytes_per_token` are
 declared but not yet budgeted against. The byte fields need a bytes-per-KV-token
@@ -343,7 +362,9 @@ value would be truncated on the way in.
 drafts the drafter is offering. A count of 0 declines drafting for that row.
 A fully draftless batch can use ordinary decode only when narrow decoding is
 available and no live row has an unresolved multi-token commit (section 4d).
-Another row with drafts still requires a verification call. `None` means every row offers
+Another row with drafts still requires a verification call, except on a plan
+that sets `verify_requires_speculable_rows` while the batch holds a request
+that is not speculable, where no step verifies. `None` means every row offers
 all `K`, which is what a drafter that always drafts returns, so a drafter
 written before this field keeps working. A drafter with nothing for a row still
 returns ids in that row, because a device graph has one shape; those ids are
@@ -475,9 +496,10 @@ enlarge what a model that already declares `supports_async_decode` promised.
 `vllm_tt_plugin.model_runner._step_verifies` makes this choice once per decode
 step, from three values the input builder hands it: the effective
 `supports_narrow_decode`, the step's `num_valid_drafts` row vector, and the
-step's `accepted_counts` row vector.
-`vllm_tt_plugin.model_runner._step_verifies` returns true, and the step is a
-verify, when any one of the following holds.
+step's `accepted_counts` row vector. On a plan that sets
+`verify_requires_speculable_rows`, one test comes first and overrides it,
+described below. `vllm_tt_plugin.model_runner._step_verifies` returns true,
+and the step is a verify, when any one of the following holds.
 
 1. **Narrow decode is unavailable.** The `SpecPlan` did not set
    `supports_narrow_decode`, or `TTModelRunner.load_model` revoked it for the
@@ -502,7 +524,8 @@ would have built and sends the plain `[B, 1]` tokens and 1-D `start_pos`, with
 no `spec_mode`, neither side tensor, and the sampling path a non-speculating
 launch uses.
 
-**A request that is not speculable is still verified with its step.**
+**A request that is not speculable is still verified with its step**, on a
+plan that does not set `verify_requires_speculable_rows`.
 `TTModelRunner._request_is_speculable` is false for a request with a non-zero
 temperature or a penalty, and `TTModelRunner._publish_draft` then offers no
 drafts for it. That keeps the request from causing a verify, but
@@ -515,9 +538,51 @@ penalties. Without `supports_narrow_decode` this happens on every decode step;
 with it, on every step that the request shares with a row carrying drafts or
 an unresolved commit. `TTModelRunner._note_unspeculable_verify_rows` counts
 these rows and warns once, and `TTModelRunner.shutdown` logs the total.
-Removing the limit needs stochastic acceptance (accept a draft with
-probability `min(1, p_target / p_draft)`, and on rejection sample from the
-normalized residual), which needs the target distribution, not `argmax_ids`.
+Speculating for the request itself needs stochastic acceptance (accept a draft
+with probability `min(1, p_target / p_draft)`, and on rejection sample from
+the normalized residual), which needs the target distribution, not
+`argmax_ids`.
+
+**`verify_requires_speculable_rows` holds the whole step back instead.** On a
+plan that sets it, `TTModelRunner._prepare_model_inputs` reads
+`vllm_tt_plugin.model_runner._speculation_held_back` before
+`vllm_tt_plugin.model_runner._step_verifies`. While the persistent batch holds
+a request `TTModelRunner._request_is_speculable` rejects, the step is an
+ordinary decode whatever the three rules say, and four things follow.
+
+- The request is sampled by the ordinary tail with its own temperature, top-k,
+  top-p, seed and penalties, as on a launch without speculation.
+- Drafts scheduled for the other rows are dropped unverified. Each row returns
+  one token, so upstream's scheduler counts every draft it scheduled for that
+  step as rejected and rewinds `num_computed_tokens` by that many, as it does
+  after a verify that rejected them all.
+- No multi-token commit is resolved. The step carries no `accepted_counts`,
+  and `TTModelRunner._prepare_model_inputs` drops every row's
+  `TTModelRunner._req_accepted_counts` entry, because the step commits one
+  token per row: the next verify reads a count of 1.
+- `TTModelRunner._publish_draft` publishes nothing, for any request, while the
+  batch holds such a request: the step that would verify a proposal is held
+  back unless the request leaves first. The drafter is still asked after every
+  step, as below, and what it offers is discarded.
+
+Speculation then resumes by itself: once the last such request has left the
+batch, `TTModelRunner._publish_draft` publishes the next proposal and a later
+step verifies it. A mixed batch does not speculate while it is mixed. Under
+synchronous scheduling the proposal is made after the first step without that
+request, which has no drafts and no count to resolve and so is itself an
+ordinary decode: the batch pays one more ordinary step after it stops being
+mixed. On such a launch `TTModelRunner._note_unspeculable_verify_rows` counts
+nothing.
+
+The field obliges the model to two things. Its ordinary decode must be correct
+at any step, including the first one after a verify that committed more than
+one token: that step may be held back, so the model never receives the count
+the third rule would have sent it. A model that selects a per-candidate state
+slot from `accepted_counts` must therefore not set the field. And a proposal
+the model offered may be followed by an ordinary decode rather than the verify
+that would have consumed it, so a model answering a verify from a result
+computed at proposal time (section 4a) must not assume the next decode call is
+that verify.
 
 **Overlap follows from that choice, and only an ordinary decode is eligible.**
 `TTAsyncDecodeController.submit_async_decode` reads `TTModelInput.spec_mode`:
@@ -605,15 +670,19 @@ and selects a verify, and the adapter receives a `[B, 1+K]` block in which A's r
 real drafts while B's row carries its own committed token in column 0 and
 `PLACEHOLDER_TOKEN_ID` with position -1 in columns 1..K. B joining does not
 turn A's existing drafts into an ordinary decode. The adapter must serve that
-mixed block and must respect per-row `num_valid_drafts`.
+mixed block and must respect per-row `num_valid_drafts`. The one exception is
+a B that is not speculable on a plan that sets
+`verify_requires_speculable_rows`: that step is an ordinary decode, and A's
+drafts are dropped unverified (section 4d).
 
 **Declining the next proposal is always available.** In that same step the
 adapter can return `DraftOutput.num_valid=[0, 0]`, offering nothing for either
 row. The following step is then an ordinary decode, unless A's commit was
 multi-token, in which case `vllm_tt_plugin.model_runner._step_verifies` sends
 one more verify to resolve A's `accepted_counts` and the ordinary decode follows it.
-The plugin always resolves a multi-token acceptance before it selects an
-ordinary decode.
+The plugin resolves a multi-token acceptance before it selects an ordinary
+decode, except while a plan that sets `verify_requires_speculable_rows` holds
+the step back (section 4d).
 
 **The runner truncates a proposal; it never rewrites it.** Between
 `propose_draft_tokens` and the verify that consumes its drafts, a stored draft
@@ -838,7 +907,10 @@ admits an off-by-one that only shows up as wrong output text.
 ## 7. What the plugin does with a refusal
 
 `resolve_speculative_plan` rejects unsupported launch settings during
-configuration. `TTPlatform.validate_request` rejects unsupported sampling
+configuration. `SpecPlan` rejects `verify_requires_speculable_rows` without
+`supports_narrow_decode` when the model's `spec_plan` builds it, and
+`TTModelRunner.load_model` rejects it for a drafter whose hidden state crosses
+through the runner. `TTPlatform.validate_request` rejects unsupported sampling
 controls during request admission. `submit_decode` validates `VerifyOutput`
 at execution time and raises the corresponding type or mode error. These
 checks report the offending values rather than silently replacing the requested

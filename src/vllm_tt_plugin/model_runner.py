@@ -153,6 +153,10 @@ def _step_verifies(
 
     A model that does not declare ``supports_narrow_decode`` implements one
     input shape, so every step it is sent is a verify.
+
+    On a plan that sets ``verify_requires_speculable_rows``, the input builder
+    asks ``_speculation_held_back`` first, and a step it holds back is an
+    ordinary decode without consulting this.
     """
     if not supports_narrow_decode:
         return True
@@ -162,6 +166,44 @@ def _step_verifies(
     # default of 1 and owns no request, so it says nothing about state to
     # resolve.
     return any(int(accepted_counts[row]) > 1 for row in range(num_rows))
+
+
+# The persistent batch's sets naming the requests ``accept_greedy_drafts``
+# cannot certify: a non-zero temperature, or a penalty that reshapes the
+# logits. ``TTModelRunner._request_is_speculable`` asks whether one request is
+# in any of them, and ``_speculation_held_back`` whether any request is.
+_UNSPECULABLE_REQUEST_SETS = (
+    "random_reqs",
+    "presence_penalties_reqs",
+    "frequency_penalties_reqs",
+    "repetition_penalties_reqs",
+)
+
+
+def _speculation_held_back(runner) -> bool:
+    """Whether ``SpecPlan.verify_requires_speculable_rows`` stops speculation now.
+
+    True on a launch whose plan sets that field, while the persistent batch
+    holds a request ``TTModelRunner._request_is_speculable`` rejects. A verify
+    in ``argmax_ids`` mode answers every row with the target argmax, so such a
+    request commits the argmax on any verify it shares, drafts or no drafts.
+    The field asks for the alternative: no step verifies while such a request
+    is in the batch, and nothing is proposed for a verify that will not run.
+
+    One read covers the whole batch, because the sets hold exactly the
+    requests the persistent batch holds: ``InputBatch.add_request`` adds to
+    them and ``InputBatch.remove_request`` discards from them. A front-packed
+    decode step carries every request of the batch, so for the step being
+    built this is also the per-row answer.
+
+    The flag is read with ``getattr`` so that a runner the field never reached,
+    such as the ``SimpleNamespace`` stand-ins the input-build tests pass as
+    ``self``, keeps the per-request behaviour.
+    """
+    if not getattr(runner, "_spec_verify_requires_speculable_rows", False):
+        return False
+    batch = runner.input_batch
+    return any(getattr(batch, name, ()) for name in _UNSPECULABLE_REQUEST_SETS)
 
 
 def _coerce_output_block(
@@ -258,6 +300,11 @@ class TTModelRunner:
         # server. ``load_model`` narrows this further, once the model exists.
         self._spec_supports_narrow_decode = bool(
             spec_plan and spec_plan.supports_narrow_decode
+        )
+        # A model that sets this never has a verify carry a request the greedy
+        # walk cannot certify: see ``_speculation_held_back``.
+        self._spec_verify_requires_speculable_rows = bool(
+            spec_plan and spec_plan.verify_requires_speculable_rows
         )
         # Who proposes: the model's own drafter on device, or a host drafter.
         # Read from the one requirements table rather than from a second list of
@@ -454,6 +501,24 @@ class TTModelRunner:
         )
         if self._spec_supports_narrow_decode:
             self._spec_supports_narrow_decode = self._narrow_steps_serve_the_drafter()
+        if (
+            self._spec_verify_requires_speculable_rows
+            and not self._spec_supports_narrow_decode
+        ):
+            # ``SpecPlan`` refuses the field without ``supports_narrow_decode``,
+            # so only the revocation above reaches this. Holding a step back
+            # sends the ordinary decode, which this drafter cannot follow.
+            raise ValueError(
+                f"{type(self.model).__name__} sets "
+                "SpecPlan.verify_requires_speculable_rows, which sends a decode "
+                "step holding a request that is not speculated for as the "
+                "model's ordinary decode, but its drafter takes the target "
+                "hidden state through the runner (spec_requirements "
+                "'hidden_feed' with spec_hidden_handoff 'roundtrip'), and an "
+                "ordinary decode returns no hidden handle. Keep the hidden "
+                "state on device ('on_device'), or drop "
+                "verify_requires_speculable_rows"
+            )
 
     def _narrow_steps_serve_the_drafter(self) -> bool:
         """Whether a step that verifies nothing can still feed the drafter.
@@ -1383,11 +1448,23 @@ class TTModelRunner:
         be bypassed by adding one: there is a single accept walk behind all of
         them, and it certifies by id equality only.
 
+        On a plan that sets ``verify_requires_speculable_rows`` the gate is
+        also batch-wide: while the persistent batch holds a request that is
+        not speculable, nothing is published for any request
+        (``_speculation_held_back``). The step that would verify the proposal
+        is an ordinary decode unless that request leaves the batch first, and
+        an ordinary decode drops the drafts it was scheduled unverified, which
+        the scheduler then counts as rejected.
+
         Erasing on an empty offer is not optional. This map is what the
         scheduler is told to verify next, so an entry nothing rewrote would be
         verified against a token the request has already moved past.
         """
-        if tokens and self._request_is_speculable(req_id):
+        if (
+            tokens
+            and self._request_is_speculable(req_id)
+            and not _speculation_held_back(self)
+        ):
             self._proposed_draft_token_ids[req_id] = list(tokens)
         else:
             self._proposed_draft_token_ids.pop(req_id, None)
@@ -1407,12 +1484,7 @@ class TTModelRunner:
         # any batch the runner is handed. A batch that tracks none of these
         # sets has no sampled request to withhold drafts from, so the answer is
         # the same as an empty set -- speculable.
-        for attr in (
-            "random_reqs",
-            "presence_penalties_reqs",
-            "frequency_penalties_reqs",
-            "repetition_penalties_reqs",
-        ):
+        for attr in _UNSPECULABLE_REQUEST_SETS:
             if req_id in getattr(batch, attr, ()):
                 return False
         return True
@@ -1425,7 +1497,9 @@ class TTModelRunner:
         multi-token commit, or a model without ``supports_narrow_decode`` makes
         the whole step one. A verify in ``argmax_ids`` mode answers every row
         with the target's argmax, so the row commits that argmax, not a token
-        drawn with its request's temperature and penalties.
+        drawn with its request's temperature and penalties. A plan that sets
+        ``verify_requires_speculable_rows`` sends no such verify
+        (``_speculation_held_back``), so on that launch this counts nothing.
         """
         rows = sum(
             1 for req_id in row_req_ids if not self._request_is_speculable(req_id)
@@ -1950,13 +2024,19 @@ class TTModelRunner:
             decode_layout_changed = self._decode_layout_changed_since_last_decode
 
             if self._num_speculative_tokens:
+                # Built even on a step that will not verify: under asynchronous
+                # scheduling ``_drafts_to_verify`` consumes the runner's
+                # retained proposals, and a proposal is handed over once.
                 spec_drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
                     self._req_accepted_counts,
                     self._drafts_to_verify(scheduler_output, row_req_ids),
                     row_req_ids,
                     self._num_speculative_tokens,
                 )
-                if _step_verifies(
+                # Ahead of ``_step_verifies`` because it overrides all three of
+                # its rules: see ``_speculation_held_back``.
+                held_back = _speculation_held_back(self)
+                if not held_back and _step_verifies(
                     self._spec_supports_narrow_decode,
                     num_valid_drafts,
                     accepted_counts,
@@ -1969,17 +2049,33 @@ class TTModelRunner:
                         spec_drafts, num_valid_drafts, input_tokens, input_positions
                     )
                 else:
-                    # No row carries a draft and no row has a multi-token
-                    # commit left to resolve, so this step has nothing to
-                    # verify. It runs as the ordinary decode it is: no
-                    # ``spec_mode``, no side tensors, the sampler's own tail,
-                    # and eligible for asynchronous overlap, which a verify
-                    # never is. That is what keeps batched baseline decoding
-                    # overlapped inside a server with speculation configured.
-                    # Only a model that declares ``supports_narrow_decode``
-                    # reaches this: for any other, the step stays a wide verify
-                    # whose rows all carry zero valid drafts, because that
-                    # model implements one input shape.
+                    # The step runs as an ordinary decode: no ``spec_mode``, no
+                    # side tensors, the sampler's own tail, and eligible for
+                    # asynchronous overlap, which a verify never is. Only a
+                    # model that declares ``supports_narrow_decode`` reaches
+                    # this; for any other every step is a wide verify, because
+                    # that model implements one input shape. Two cases lead
+                    # here.
+                    #
+                    # Nothing to verify: no row carries a draft and no row has
+                    # a multi-token commit left to resolve. That is what keeps
+                    # batched baseline decoding overlapped inside a server with
+                    # speculation configured.
+                    #
+                    # Held back: the plan sets
+                    # ``verify_requires_speculable_rows`` and the batch holds a
+                    # request that is not speculable, which a verify would
+                    # answer with the argmax. Drafts scheduled for the other
+                    # rows are dropped unverified; handed one token per row,
+                    # the scheduler counts them as rejected. That token is each
+                    # row's whole commit, so every count returns to 1, which in
+                    # this map is absent. A count left above 1 would describe a
+                    # commit this step has overtaken, and would turn the first
+                    # step after the request leaves into a verify with nothing
+                    # to resolve.
+                    if held_back:
+                        for req_id in row_req_ids:
+                            self._req_accepted_counts.pop(req_id, None)
                     spec_drafts = None
                     num_valid_drafts = None
                     accepted_counts = None

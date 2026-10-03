@@ -182,6 +182,18 @@ class SpecPlan:
     # shape rather than two; a model that sets this offers a second, narrower
     # shape and the runner prefers it on those steps.
     supports_narrow_decode: bool = False
+    # Whether every row of a verify must belong to a request the runner
+    # speculates for. A verify in "argmax_ids" mode answers every row with the
+    # target argmax, so a sampled or penalized request, which is offered no
+    # drafts, still commits the argmax on any verify another row causes. A
+    # model that sets this has such a step sent as its ordinary decode
+    # instead: while the decode batch holds such a request, every decode step
+    # is the narrow call, whatever drafts or unresolved multi-token commit the
+    # other rows carry, and no proposal is published. That is why it requires
+    # supports_narrow_decode, and why the model must not need accepted_counts
+    # to resolve its own state after a multi-token commit: the step that
+    # follows one may be an ordinary decode, after which the count is 1.
+    verify_requires_speculable_rows: bool = False
 
     def __post_init__(self) -> None:
         if self.effective_k < 1:
@@ -223,6 +235,15 @@ class SpecPlan:
                 f"drafter_state {DRAFTER_STATE_SHARED_WITH_TARGET!r}, but "
                 f"drafter_state is {self.drafter_state!r} with requirements "
                 f"{list(requires)}"
+            )
+        if self.verify_requires_speculable_rows and not self.supports_narrow_decode:
+            raise ValueError(
+                "SpecPlan.verify_requires_speculable_rows=True needs "
+                "supports_narrow_decode=True, got supports_narrow_decode="
+                f"{self.supports_narrow_decode!r}: a decode step holding a "
+                "request that is not speculated for is sent as the model's "
+                "ordinary decode, and a model without supports_narrow_decode "
+                "serves only the verify call"
             )
 
     @property
