@@ -2412,6 +2412,17 @@ class TTPlatform(Platform):
         A request asking for those would be answered without them, silently --
         a grammar or token filter unapplied, requested logprobs arriving empty.
 
+        ``min_p`` and ``logit_bias`` never get this far on a speculative
+        launch. vLLM itself refuses both, on any platform, in
+        ``SamplingParams.verify`` (``_validate_spec_decode``: "The min_p and
+        logit_bias sampling parameters are not yet supported with speculative
+        decoding"), which ``InputProcessor`` runs before this hook. A greedy
+        request is the exception for ``min_p`` only: vLLM resets ``min_p`` to
+        0 when the temperature is 0, so it is served, with speculation. Send
+        sampled ``min_p`` or any ``logit_bias`` traffic to a launch without
+        speculative flags. ``logit_bias`` stays in the list below as a
+        backstop for a caller that skips vLLM's validation.
+
         Refused per request rather than at config time because these are
         per-request controls, and a launch may legitimately mix requests that
         speculate with requests that cannot.
@@ -2421,8 +2432,10 @@ class TTPlatform(Platform):
             return
 
         unsupported = []
-        # temperature / min_p / the penalties are intentionally absent: those
-        # requests are decoded without speculation instead of being refused.
+        # temperature, top_p / top_k and the penalties are intentionally absent:
+        # those requests are decoded without speculation instead of being
+        # refused. min_p is absent because vLLM refuses a sampled min_p on
+        # every speculative launch before this hook (see the docstring).
         if params.logprobs is not None:
             unsupported.append(f"logprobs={params.logprobs!r}")
         if getattr(params, "structured_outputs", None) is not None:
@@ -2441,10 +2454,11 @@ class TTPlatform(Platform):
                 f"Speculative decoding on {cls.device_name} cannot serve this "
                 f"request's {unsupported}. No path on this launch applies "
                 "those, so answering without them would change what was asked "
-                "for without saying so. Sampled requests (temperature, "
-                "min_p, the penalties) ARE served here -- they simply decode "
-                "without speculation. Drop the controls above, or drop the "
-                "speculative flags from the server"
+                "for without saying so. Sampled requests (temperature, top_p, "
+                "top_k, the penalties) ARE served here -- they decode without "
+                "speculation. min_p and logit_bias are not: vLLM refuses them "
+                "on every speculative launch. Drop the controls above, or send "
+                "the request to a server launched without the speculative flags"
             )
 
     @classmethod
