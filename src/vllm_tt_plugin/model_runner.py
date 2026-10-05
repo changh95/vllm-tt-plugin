@@ -180,6 +180,42 @@ _UNSPECULABLE_REQUEST_SETS = (
 )
 
 
+def _params_need_host_filter(params) -> bool:
+    """Whether a request's sampling params constrain tokens on the host.
+
+    A grammar (``structured_outputs``, which ``response_format`` and a
+    ``tool_choice`` of ``"required"`` or a named function become), ``bad_words``,
+    ``allowed_token_ids`` and ``min_tokens`` are applied by the host sampler to
+    an ordinary step's logits: ``check_perform_device_sampling`` routes such a
+    step to the host, and the grammar bitmask is attached at sample time. A
+    verify in ``argmax_ids`` mode returns ids only, so none of them could be
+    applied there, and the persistent batch tracks none of them in
+    ``_UNSPECULABLE_REQUEST_SETS``: the runner reads them from the request's own
+    ``sampling_params`` instead.
+
+    Total over anything the runner may hold for a request (``None``, a pooling
+    request's params, a stand-in): a field that is absent constrains nothing.
+    """
+    if params is None:
+        return False
+    return (
+        getattr(params, "structured_outputs", None) is not None
+        or bool(getattr(params, "bad_words", None))
+        or bool(getattr(params, "allowed_token_ids", None))
+        or bool(getattr(params, "min_tokens", 0))
+    )
+
+
+def _request_needs_host_filter(runner, req_id) -> bool:
+    """``_params_need_host_filter`` for the request ``runner`` tracks as ``req_id``.
+
+    ``getattr`` throughout so the gate stays total for the stand-in runners the
+    unit tests pass as ``self`` (no ``requests`` map means no such request).
+    """
+    state = (getattr(runner, "requests", None) or {}).get(req_id)
+    return _params_need_host_filter(getattr(state, "sampling_params", None))
+
+
 def _speculation_held_back(runner) -> bool:
     """Whether ``SpecPlan.verify_requires_speculable_rows`` stops speculation now.
 
@@ -203,7 +239,37 @@ def _speculation_held_back(runner) -> bool:
     if not getattr(runner, "_spec_verify_requires_speculable_rows", False):
         return False
     batch = runner.input_batch
-    return any(getattr(batch, name, ()) for name in _UNSPECULABLE_REQUEST_SETS)
+    if any(getattr(batch, name, ()) for name in _UNSPECULABLE_REQUEST_SETS):
+        return True
+    # The host-filtered requests (``_params_need_host_filter``) are not in
+    # those sets, so they are found through the batch's own request ids:
+    # ``req_id_to_index`` holds exactly the requests the persistent batch
+    # holds, like the sets. At most ``max_num_seqs`` dict reads.
+    return any(
+        _request_needs_host_filter(runner, req_id)
+        for req_id in (getattr(batch, "req_id_to_index", None) or ())
+    )
+
+
+def _check_one_bitmask_row_per_request(grammar_output) -> None:
+    """Refuse a grammar bitmask that does not hold one row per request.
+
+    ``StructuredOutputManager.grammar_bitmask`` emits ``len(drafts) + 1`` rows
+    per structured-output request, and the TT reorder maps row ``i`` to the
+    ``i``-th request id. That is one row per request exactly when no
+    structured-output request was scheduled drafts, which the speculability
+    gate guarantees (``TTModelRunner._request_is_speculable``). A bitmask of
+    another height would apply one request's grammar to another's row, so it
+    is raised rather than reordered.
+    """
+    rows = int(grammar_output.grammar_bitmask.shape[0])
+    num_reqs = len(grammar_output.structured_output_request_ids)
+    if rows != num_reqs:
+        raise RuntimeError(
+            f"grammar bitmask has {rows} rows for {num_reqs} structured-output "
+            "request(s); the TT runner applies one row per request, so a "
+            "structured-output request must never be scheduled draft tokens"
+        )
 
 
 def _coerce_output_block(
@@ -1478,6 +1544,12 @@ class TTModelRunner:
         logits -- has to be decoded ordinarily. top_p/top_k need no entry: they
         only narrow a distribution that temperature 0 has already collapsed to a
         point, so a greedy request carrying them is still greedy.
+
+        The same holds for a request whose tokens the host sampler constrains:
+        structured outputs (a grammar bitmask), ``bad_words``,
+        ``allowed_token_ids`` and ``min_tokens`` (``_params_need_host_filter``).
+        A verify returns ids only, so none of those would be applied to its
+        rows; an ordinary decode applies all of them.
         """
         batch = self.input_batch
         # getattr rather than attribute access: the gate has to stay total for
@@ -1487,7 +1559,7 @@ class TTModelRunner:
         for attr in _UNSPECULABLE_REQUEST_SETS:
             if req_id in getattr(batch, attr, ()):
                 return False
-        return True
+        return not _request_needs_host_filter(self, req_id)
 
     def _note_unspeculable_verify_rows(self, row_req_ids: list[str]) -> None:
         """Count the live rows of a verify whose request is not speculable.
@@ -2178,14 +2250,17 @@ class TTModelRunner:
             # unpadded for prefill, padded for decode
             batch_length = input_tokens.shape[0]
             # `structured_output_request_ids` comes from GrammarOutput as a list
-            # of request IDs (bitmask rows are in this order). TT does not support
-            # speculative decoding in this path, so we assume a single bitmask row
-            # per request.
+            # of request IDs (bitmask rows are in this order), one row per
+            # request: a structured-output request is never offered drafts
+            # (``_request_is_speculable``), so vLLM sizes its rows at 0 drafts
+            # + 1 (``_check_one_bitmask_row_per_request``).
             structured_output_request_ids = (
                 grammar_output.structured_output_request_ids
                 if grammar_output is not None
                 else []
             )
+            if grammar_output is not None:
+                _check_one_bitmask_row_per_request(grammar_output)
             bitmask = reorder_grammar_bitmask_for_tt_batch(
                 bitmask=bitmask,
                 structured_output_request_ids=structured_output_request_ids,
@@ -2619,6 +2694,7 @@ class TTModelRunner:
 
         assert model_input.row_req_ids is not None
 
+        _check_one_bitmask_row_per_request(grammar_output)
         bitmask = torch.from_numpy(grammar_output.grammar_bitmask)
         return reorder_grammar_bitmask_for_tt_batch(
             bitmask=bitmask,
@@ -2946,6 +3022,16 @@ class TTModelRunner:
             ),
         )
         if fwd.model_input.spec_mode is not None:
+            if any(b is not None for b in fwd.model_input.grammar_bitmask or ()):
+                # A verify commits ids it never filtered. A structured-output
+                # request is unspeculable, so on a plan that sets
+                # ``verify_requires_speculable_rows`` (the only one the
+                # platform admits it on) no verify can hold one.
+                raise RuntimeError(
+                    "a speculative verify step carries a grammar bitmask: a "
+                    "structured-output request shared a verify, which returns "
+                    "unconstrained ids"
+                )
             return self._finish_spec_decode(fwd)
 
         sampled_token_ids_per_dp, logprobs_per_dp = self._sample_sync_forward(fwd)

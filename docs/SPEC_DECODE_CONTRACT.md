@@ -26,12 +26,20 @@ boundary. What runs:
   continuation. A request with a non-zero temperature or a penalty is admitted
   and decoded without speculation: `TTModelRunner._publish_draft` offers no
   drafts for it. `min_p`, `top_p` and `top_k` alone do not change the argmax,
-  so they do not stop a request speculating. A request carrying logprobs,
-  structured output or a token filter is refused per request, because no path
-  on the launch applies those. A request without drafts can still be part of a
-  verify step, and there it commits the target argmax, unless the model's
-  `SpecPlan` sets `verify_requires_speculable_rows`: then no step that holds
-  such a request verifies, and the request is sampled as it asked. Section 4d.
+  so they do not stop a request speculating. A request without drafts can
+  still be part of a verify step, and there it commits the target argmax,
+  unless the model's `SpecPlan` sets `verify_requires_speculable_rows`: then no
+  step that holds such a request verifies, and the request is sampled as it
+  asked. Section 4d. On such a plan a request carrying structured output (a
+  grammar: `response_format`, `tool_choice` `"required"` or a named function),
+  `bad_words`, `allowed_token_ids` or `min_tokens` is admitted the same way:
+  it is not speculable, it holds speculation back while it is in the batch,
+  and the host sampler applies its filter to every ordinary step it takes.
+  Structured output additionally needs synchronous scheduling, because under
+  asynchronous scheduling vLLM sizes the grammar bitmask for placeholder
+  drafts. A plan without the field refuses those requests per request, and
+  every speculating launch refuses logprobs, which the verify path cannot
+  produce.
 - **ordinary decode steps inside a speculating launch**, for a model
   declaring `supports_narrow_decode`: a step with nothing to verify is sent as
   that model's own decode call and can overlap, so configuring speculation does

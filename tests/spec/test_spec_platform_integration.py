@@ -336,6 +336,104 @@ def test_a_sampled_request_is_admitted_and_decoded_unspeculated(
     _validate(SamplingParams(**kwargs))  # must not raise
 
 
+def _speculating_platform_holding_back(monkeypatch, vllm_config, *, async_scheduling=False):
+    """A live plan that sets ``verify_requires_speculable_rows`` (Motif-3's)."""
+    import dataclasses
+
+    from vllm_tt_plugin.config import store_tt_spec_plan
+
+    platform = _speculating_platform(monkeypatch, vllm_config)
+    plan = get_tt_spec_plan(vllm_config)
+    store_tt_spec_plan(
+        vllm_config,
+        dataclasses.replace(
+            plan, supports_narrow_decode=True, verify_requires_speculable_rows=True
+        ),
+    )
+    vllm_config.scheduler_config.async_scheduling = async_scheduling
+    return platform
+
+
+def _structured_params(**kwargs):
+    from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+
+    return SamplingParams(
+        structured_outputs=StructuredOutputsParams(json={"type": "object"}),
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.7])
+def test_a_structured_output_request_is_admitted_on_a_holding_back_plan(
+    monkeypatch, vllm_config, temperature
+):
+    """On a plan that keeps unspeculable rows out of every verify, a grammar
+    is served the way a sampled request is: decoded without speculation, with
+    the host sampler applying the bitmask to each ordinary step.
+    ``response_format`` and ``tool_choice`` "required" / named reach here as
+    ``structured_outputs``."""
+    _speculating_platform_holding_back(monkeypatch, vllm_config)
+    _validate(_structured_params(temperature=temperature))  # must not raise
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("min_tokens", 4), ("bad_words", ["no"]), ("allowed_token_ids", [1, 2])],
+)
+def test_a_host_token_filter_is_admitted_on_a_holding_back_plan(
+    monkeypatch, vllm_config, field, value
+):
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform_holding_back(monkeypatch, vllm_config)
+    _validate(SamplingParams(temperature=0.0, **{field: value}))  # must not raise
+
+
+def test_a_structured_output_request_is_refused_on_a_plan_without_hold_back(
+    monkeypatch, vllm_config
+):
+    """Without the field the request can share another row's verify, which
+    answers with unfiltered argmax ids."""
+    _speculating_platform(monkeypatch, vllm_config)
+    with pytest.raises(ValueError) as excinfo:
+        _validate(_structured_params(temperature=0.0))
+    assert "structured_outputs" in str(excinfo.value)
+
+
+def test_a_structured_output_request_is_refused_under_async_scheduling(
+    monkeypatch, vllm_config
+):
+    """Async scheduling schedules placeholder drafts for every request, so
+    vLLM would size the grammar bitmask at two rows for this one."""
+    _speculating_platform_holding_back(monkeypatch, vllm_config, async_scheduling=True)
+    with pytest.raises(ValueError) as excinfo:
+        _validate(_structured_params(temperature=0.0))
+    assert "structured_outputs" in str(excinfo.value)
+    # The token filters do not use the bitmask and stay admitted.
+    from vllm.sampling_params import SamplingParams
+
+    _validate(SamplingParams(temperature=0.0, min_tokens=2))
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("logprobs", 1), ("logit_bias", {1: 1.0})],
+)
+def test_the_remaining_refusals_hold_on_a_holding_back_plan(
+    monkeypatch, vllm_config, field, value
+):
+    """logprobs: the verify path cannot produce them. logit_bias: vLLM refuses
+    it on every speculative launch; the platform list is the backstop."""
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform_holding_back(monkeypatch, vllm_config)
+    params = SamplingParams(temperature=0.0)
+    setattr(params, field, value)  # past SamplingParams' own spec validation
+    with pytest.raises(ValueError) as excinfo:
+        _validate(params)
+    assert field in str(excinfo.value)
+
+
 def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_config):
     """The gate is speculation's, not the backend's."""
     from vllm.sampling_params import SamplingParams
@@ -358,13 +456,64 @@ class _FakeBatch:
         self.repetition_penalties_reqs = set(repetition)
 
 
-def _speculable(**batch_kwargs):
+def _speculable(requests=None, **batch_kwargs):
     """Call the runner's gate without building a runner."""
     from vllm_tt_plugin.model_runner import TTModelRunner
 
     runner = object.__new__(TTModelRunner)
     runner.input_batch = _FakeBatch(**batch_kwargs)
+    if requests is not None:
+        runner.requests = requests
     return TTModelRunner._request_is_speculable(runner, "r0")
+
+
+def _req_state(**params):
+    """A ``CachedRequestState`` stand-in: the gate reads ``sampling_params``."""
+    from vllm.sampling_params import SamplingParams
+
+    return SimpleNamespace(sampling_params=SamplingParams(**params))
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"structured_outputs": "json"},
+        {"bad_words": ["no"]},
+        {"allowed_token_ids": [1, 2]},
+        {"min_tokens": 3},
+    ],
+    ids=["structured_outputs", "bad_words", "allowed_token_ids", "min_tokens"],
+)
+def test_a_host_filtered_request_is_not_speculable(params):
+    """A verify returns ids only, so a grammar or token filter would not be
+    applied to its row; the persistent batch's sets do not track these, so the
+    gate reads the request's own sampling params."""
+    from vllm.sampling_params import StructuredOutputsParams
+
+    if params.get("structured_outputs") == "json":
+        params = {"structured_outputs": StructuredOutputsParams(json={"type": "object"})}
+    assert _speculable(requests={"r0": _req_state(**params)}) is False
+
+
+def test_a_greedy_request_with_a_request_map_is_speculable():
+    assert _speculable(requests={"r0": _req_state(temperature=0.0)}) is True
+
+
+def test_another_request_s_grammar_does_not_block_this_one_per_request():
+    from vllm.sampling_params import StructuredOutputsParams
+
+    requests = {
+        "r0": _req_state(),
+        "other": _req_state(
+            structured_outputs=StructuredOutputsParams(json={"type": "object"})
+        ),
+    }
+    assert _speculable(requests=requests) is True
+
+
+def test_the_gate_is_total_for_an_unknown_or_paramless_request():
+    assert _speculable(requests={}) is True
+    assert _speculable(requests={"r0": SimpleNamespace(sampling_params=None)}) is True
 
 
 def test_a_greedy_request_is_speculable():

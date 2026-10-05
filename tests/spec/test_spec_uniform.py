@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.sample.sampler import Sampler
 
@@ -211,6 +211,22 @@ class UndeclaredTarget(ScoredTarget):
 
 
 # endregion The target
+
+# Requests whose tokens the host sampler filters (a grammar or a token
+# filter). The persistent batch tracks them in none of its sampling sets, so the
+# runner finds them through each request's own sampling params. Greedy, so a
+# test can tell a held-back step from a verify by the calls alone.
+HOST_FILTERED = {
+    "structured outputs": SamplingParams(
+        temperature=0.0,
+        structured_outputs=StructuredOutputsParams(json={"type": "object"}),
+    ),
+    "bad_words": SamplingParams(temperature=0.0, bad_words=["x"]),
+    "allowed_token_ids": SamplingParams(
+        temperature=0.0, allowed_token_ids=list(range(0, VOCAB_SIZE, 7))
+    ),
+    "min_tokens": SamplingParams(temperature=0.0, min_tokens=STEPS),
+}
 
 # region Test helpers
 
@@ -490,6 +506,74 @@ def test_without_the_declaration_the_same_traffic_commits_the_argmax(case):
     assert speculated["greedy"][:STEPS] == reference["greedy"]
 
 
+@pytest.mark.parametrize("case", sorted(HOST_FILTERED))
+def test_a_step_holding_a_host_filtered_request_never_verifies(case):
+    """A grammar or a token filter holds speculation back like sampling does.
+
+    A verify answers each row with an unfiltered argmax, so the request must
+    never ride along on one, and no draft is published for the greedy peer
+    while it is live.
+    """
+    model = ScoredTarget()
+    runner, emitted, handed_any = _mixed_traffic(model, HOST_FILTERED[case])
+
+    assert model.verify_calls == [], "a step holding a host-filtered request verified"
+    assert model.plain_calls == STEPS
+    assert len(emitted["greedy"]) == len(emitted["peer"]) == STEPS
+    assert not handed_any, "a proposal was published while the peer was live"
+    assert runner._req_accepted_counts == {}
+    assert runner._num_unspeculable_verify_rows == 0
+    assert not runner._request_is_speculable("peer")
+    assert runner._request_is_speculable("greedy")
+
+
+@pytest.mark.parametrize(
+    "case", ["bad_words", "allowed_token_ids", "min_tokens"]
+)
+def test_a_host_filtered_request_decodes_as_without_speculation(case):
+    """The filtered request emits what an unspeculated launch emits.
+
+    (Structured outputs need a grammar bitmask, which this harness does not
+    build; the device E2E covers them.)
+    """
+    _, speculated, _ = _mixed_traffic(ScoredTarget(), HOST_FILTERED[case])
+    _, reference, _ = _mixed_traffic(
+        ScoredTarget(), HOST_FILTERED[case], speculating=False
+    )
+    assert speculated == reference
+
+
+def test_speculation_resumes_once_the_structured_request_leaves():
+    """Held back while a structured-output request is live, verifying after."""
+    model = ScoredTarget()
+    runner = _runner(model)
+    _add_request(runner, "greedy", 1, SamplingParams(temperature=0.0))
+    start = _tail(runner, "greedy")
+    emitted: list[int] = []
+    kinds: list[str] = []
+
+    def step(*req_ids, drafts):
+        verifies = len(model.verify_calls)
+        emitted.extend(_step(runner, *req_ids, drafts=drafts)["greedy"])
+        kinds.append("verify" if len(model.verify_calls) > verifies else "plain")
+        return _handoff(runner)
+
+    drafts = step("greedy", drafts={})
+    drafts = step("greedy", drafts=drafts)
+    _add_request(runner, "peer", 200, HOST_FILTERED["structured outputs"])
+    drafts = step("greedy", "peer", drafts=drafts)
+    assert drafts == {}
+    drafts = step("greedy", "peer", drafts=drafts)
+    assert drafts == {}
+    _finish(runner, "peer")
+    drafts = step("greedy", drafts=drafts)
+    assert set(drafts) == {"greedy"}, "speculation did not resume"
+    step("greedy", drafts=drafts)
+
+    assert kinds == ["plain", "verify", "plain", "plain", "plain", "verify"]
+    assert emitted == model.greedy(*start, len(emitted))
+
+
 def test_an_all_greedy_batch_still_speculates():
     """The declaration costs a batch of greedy requests nothing.
 
@@ -621,10 +705,17 @@ class _FakeBatch:
         self.repetition_penalties_reqs = set(repetition)
 
 
-def _publish(declares: bool, **batch_kwargs) -> dict[str, list[int]]:
+def _publish(
+    declares: bool, requests=None, **batch_kwargs
+) -> dict[str, list[int]]:
     """Publish a greedy request's offer next to whatever else the batch holds."""
     runner = object.__new__(TTModelRunner)
     runner.input_batch = _FakeBatch(**batch_kwargs)
+    if requests is not None:
+        runner.requests = requests
+        runner.input_batch.req_id_to_index = {
+            req_id: row for row, req_id in enumerate(requests)
+        }
     runner._spec_verify_requires_speculable_rows = declares
     runner._proposed_draft_token_ids = {"greedy": [9, 9]}  # a stale earlier offer
     TTModelRunner._publish_draft(runner, "greedy", [1, 2, 3])
@@ -642,6 +733,25 @@ def test_nothing_is_published_while_an_unspeculable_request_is_live(sampling_set
     has already moved past.
     """
     assert _publish(True, **{sampling_set: ["peer"]}) == {}
+
+
+@pytest.mark.parametrize("case", sorted(HOST_FILTERED))
+def test_nothing_is_published_while_a_host_filtered_request_is_live(case):
+    requests = {
+        "greedy": SimpleNamespace(sampling_params=SamplingParams(temperature=0.0)),
+        "peer": SimpleNamespace(sampling_params=HOST_FILTERED[case]),
+    }
+    assert _publish(True, requests=requests) == {}
+    # Without the declaration the gate stays per request.
+    assert _publish(False, requests=requests) == {"greedy": [1, 2, 3]}
+
+
+def test_the_hold_back_is_total_for_a_paramless_request():
+    requests = {
+        "greedy": SimpleNamespace(sampling_params=SamplingParams(temperature=0.0)),
+        "pooled": SimpleNamespace(sampling_params=None),
+    }
+    assert _publish(True, requests=requests) == {"greedy": [1, 2, 3]}
 
 
 def test_a_batch_of_speculable_requests_still_publishes():

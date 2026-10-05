@@ -2407,10 +2407,25 @@ class TTPlatform(Platform):
         them made a speculating launch unusable for any sampled client and, in
         our case, failed every prompt of two standard evals with HTTP 400.
 
-        What remains here is what no path on this launch serves: controls that
-        need logits or a token filter the model-owned sampler does not apply.
-        A request asking for those would be answered without them, silently --
-        a grammar or token filter unapplied, requested logprobs arriving empty.
+        Token filters the host sampler applies -- structured outputs (a
+        grammar bitmask; also what ``response_format`` and a ``tool_choice`` of
+        ``"required"`` or a named function become), ``bad_words``,
+        ``allowed_token_ids`` and ``min_tokens`` -- are served the same way,
+        on a plan that sets ``SpecPlan.verify_requires_speculable_rows``: the
+        request is not speculable, so while it is in the batch no step
+        verifies (``model_runner._speculation_held_back``), and every step it
+        takes is an ordinary decode that the host sampler filters. On a plan
+        without that field the request could still share another row's
+        verify, which returns unfiltered argmax ids, so they stay refused
+        there. Structured outputs also need synchronous scheduling: under
+        asynchronous scheduling vLLM schedules placeholder drafts for every
+        request and sizes the grammar bitmask at two rows for it, and the TT
+        runner applies one.
+
+        What remains here is what no path on this launch serves: requested
+        logprobs, which the verify path cannot produce and which would arrive
+        empty, and the filters above where the plan cannot keep them out of a
+        verify.
 
         ``min_p`` and ``logit_bias`` never get this far on a speculative
         launch. vLLM itself refuses both, on any platform, in
@@ -2431,6 +2446,15 @@ class TTPlatform(Platform):
         if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
             return
 
+        plan = get_tt_spec_plan(vllm_config)
+        # The filters an ordinary decode applies on the host are served
+        # unspeculated when the plan keeps unspeculable rows out of every
+        # verify (see the docstring).
+        host_filters_served = bool(plan.verify_requires_speculable_rows)
+        structured_served = host_filters_served and not bool(
+            getattr(vllm_config.scheduler_config, "async_scheduling", False)
+        )
+
         unsupported = []
         # temperature, top_p / top_k and the penalties are intentionally absent:
         # those requests are decoded without speculation instead of being
@@ -2438,15 +2462,18 @@ class TTPlatform(Platform):
         # every speculative launch before this hook (see the docstring).
         if params.logprobs is not None:
             unsupported.append(f"logprobs={params.logprobs!r}")
-        if getattr(params, "structured_outputs", None) is not None:
+        if (
+            getattr(params, "structured_outputs", None) is not None
+            and not structured_served
+        ):
             unsupported.append("structured_outputs")
         if params.logit_bias:
             unsupported.append("logit_bias")
-        if params.bad_words:
+        if params.bad_words and not host_filters_served:
             unsupported.append("bad_words")
-        if params.allowed_token_ids:
+        if params.allowed_token_ids and not host_filters_served:
             unsupported.append("allowed_token_ids")
-        if params.min_tokens:
+        if params.min_tokens and not host_filters_served:
             unsupported.append(f"min_tokens={params.min_tokens!r}")
 
         if unsupported:
@@ -2456,9 +2483,12 @@ class TTPlatform(Platform):
                 "those, so answering without them would change what was asked "
                 "for without saying so. Sampled requests (temperature, top_p, "
                 "top_k, the penalties) ARE served here -- they decode without "
-                "speculation. min_p and logit_bias are not: vLLM refuses them "
-                "on every speculative launch. Drop the controls above, or send "
-                "the request to a server launched without the speculative flags"
+                "speculation, and so are structured outputs, bad_words, "
+                "allowed_token_ids and min_tokens where the model's speculative "
+                "plan keeps such requests out of every verify. min_p and "
+                "logit_bias are not: vLLM refuses them on every speculative "
+                "launch. Drop the controls above, or send the request to a "
+                "server launched without the speculative flags"
             )
 
     @classmethod
