@@ -19,8 +19,13 @@ boundary. What runs:
   proposing on device through `propose_draft_tokens`. Every other method vLLM
   knows is refused at configuration time rather than admitted to draft
   nothing.
-- the **`argmax_ids`** accept mode, and no other. A plan offering only `logits`
-  is refused, because the runner requests `argmax_ids` on every step.
+- the two id accept modes, **`argmax_ids`** and **`sampled_ids`**, and no
+  other. A plan offering only `logits` is refused, because the runner requests
+  an id mode on every step. A plan that offers `sampled_ids` on a launch that
+  samples decode steps on device (`sample_on_device_mode` `decode_only` or
+  `all`) is asked for `sampled_ids` on every verify, and its sampled requests
+  speculate (section "Speculative sampling" below); otherwise the runner asks
+  for `argmax_ids` when the plan offers it.
 - **speculation for greedy requests**, and no others. The accept walk
   compares token ids and never sees logits, so it can certify only an argmax
   continuation. A request with a non-zero temperature or a penalty is admitted
@@ -195,9 +200,32 @@ when it cannot. It must not raise, and it must not return anything else.
 model that can serve less returns a lower value and a model that can serve
 nothing returns `SpecReject`. `drafter_state` must not be `paged`, which needs
 a scheduler-owned drafter cache the plugin does not yet allocate.
-`accept_modes` must include `argmax_ids`, the return format the current runner
-executes. A model may also declare `logits` or `fused_sample`, but neither
-additional declaration enables an execution path for that return format.
+`accept_modes` must include `argmax_ids` or `sampled_ids`, the return formats
+the current runner executes. A model may also declare `logits` or
+`fused_sample`, but neither additional declaration enables an execution path
+for that return format.
+
+**Speculative sampling (`sampled_ids`).** A verify in this mode returns
+`VerifyOutput(spec_mode="sampled_ids", sampled_ids=[B, 1+K])`: column `j` is a
+draw from the row's own sampling distribution (the step's `sampling_params`:
+temperature, top-k, top-p, seed) at candidate position `j`, made with noise
+that does not depend on the drafts. A greedy row's draw is its argmax. The
+runner walks it exactly as it walks `argmax_ids` (`accept_greedy_drafts`, id
+equality). For a model whose drafter proposes a point mass (a greedy draft
+`d`, `q = onehot(d)`) that walk is lossless rejection sampling: the draft is
+accepted iff `x == d`, which has probability `p(d) = min(1, p(d) / q(d))`; a
+rejected position commits `x`, which is distributed as `p` with `d` removed
+and renormalised, `norm(max(0, p - q))`; after an accepted draft the next
+column's draw is the bonus. A drafter that proposes from a distribution must
+not offer this mode. The runner latches the mode at start-up
+(`TTModelRunner._spec_verify_samples`): the plan offers `sampled_ids` and the
+launch samples decode steps on device, so every verify carries the step's
+`sampling_params` (a step holding a request that needs host sampling is held
+back and never verifies). On that launch a request with a non-zero temperature
+is speculable; penalties and the host filters of section 4d still hold
+speculation back, because the device never sees those logits. A model with
+counter-based sampling noise keyed by `(seed, position)` commits, for a seeded
+request, exactly the tokens a launch without speculation commits.
 
 **`SpecReject.supported_k`** carries the draft lengths that would have worked at
 that concurrency, and the plugin quotes it to the operator. Populate it.

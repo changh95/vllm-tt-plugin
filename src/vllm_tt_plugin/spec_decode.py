@@ -49,12 +49,33 @@ if TYPE_CHECKING:
 #                  describes. It is the only mode that may be followed by a
 #                  verify with accepted_counts=None, because it is the only one
 #                  that leaves an authoritative count on the device.
+#   "sampled_ids"  returns sampled ids [B, 1+K]: column j is a draw from the
+#                  row's own sampling distribution at candidate position j
+#                  (temperature, top-k, top-p, seed: what the step's
+#                  sampling_params describe), with noise independent of the
+#                  drafts. A greedy row's draw is its argmax, so this mode is a
+#                  superset of "argmax_ids", and the host walks it the same way:
+#                  id equality (accept_greedy_drafts). For a point-mass drafter
+#                  (a greedy draft, q = onehot(d)) that walk IS lossless
+#                  rejection sampling: accept iff x == d has probability p(d) =
+#                  min(1, p(d) / q(d)), a rejected x is distributed as p with d
+#                  removed and renormalised (norm(max(0, p - q))), and the column
+#                  past an accepted draft is the bonus. A drafter whose q is not
+#                  a point mass needs "logits" or "fused_sample" instead.
 ACCEPT_MODE_LOGITS = "logits"
 ACCEPT_MODE_ARGMAX_IDS = "argmax_ids"
 ACCEPT_MODE_FUSED_SAMPLE = "fused_sample"
+ACCEPT_MODE_SAMPLED_IDS = "sampled_ids"
 ACCEPT_MODES = frozenset(
-    {ACCEPT_MODE_LOGITS, ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_FUSED_SAMPLE}
+    {
+        ACCEPT_MODE_LOGITS,
+        ACCEPT_MODE_ARGMAX_IDS,
+        ACCEPT_MODE_FUSED_SAMPLE,
+        ACCEPT_MODE_SAMPLED_IDS,
+    }
 )
+# The modes whose return is a [B, 1+K] id block the host walks by id equality.
+ID_WALK_ACCEPT_MODES = frozenset({ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_SAMPLED_IDS})
 
 # Where a drafter's own state lives. The first two describe a cost the runner
 # must budget through the two byte fields of SpecPlan: "internal" means the
@@ -140,6 +161,7 @@ MODE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     ACCEPT_MODE_LOGITS: ("logits",),
     ACCEPT_MODE_ARGMAX_IDS: ("argmax_ids",),
     ACCEPT_MODE_FUSED_SAMPLE: ("accepted_token_ids", "accepted_counts"),
+    ACCEPT_MODE_SAMPLED_IDS: ("sampled_ids",),
 }
 
 
@@ -339,6 +361,11 @@ class VerifyOutput:
     spec_mode: str
     # [B, 1+K] verify argmax ids, for spec_mode "argmax_ids".
     argmax_ids: "torch.Tensor | None" = None
+    # [B, 1+K] verify sampled ids, for spec_mode "sampled_ids": column j is a
+    # draw from the row's sampling distribution at candidate position j, with
+    # noise independent of the drafts (the argmax on a greedy row). Columns past
+    # a row's drafts are PLACEHOLDER_TOKEN_ID or ignored.
+    sampled_ids: "torch.Tensor | None" = None
     # [B, 1+K, V] over the whole vocabulary, for spec_mode "logits".
     logits: "torch.Tensor | None" = None
     # [B, 1+K] committed prefix plus correction or bonus, for "fused_sample".
@@ -538,6 +565,8 @@ __all__ = [
     "ACCEPT_MODE_ARGMAX_IDS",
     "ACCEPT_MODE_FUSED_SAMPLE",
     "ACCEPT_MODE_LOGITS",
+    "ACCEPT_MODE_SAMPLED_IDS",
+    "ID_WALK_ACCEPT_MODES",
     "DRAFTER_STATES",
     "DRAFTER_STATE_SHARED_WITH_TARGET",
     "DRAFTER_STATE_INTERNAL",

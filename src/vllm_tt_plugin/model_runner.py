@@ -71,6 +71,7 @@ from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_SAMPLED_IDS,
     HIDDEN_HANDOFF_ROUNDTRIP,
     HIDDEN_HANDOFFS,
     PLACEHOLDER_TOKEN_ID,
@@ -178,6 +179,26 @@ _UNSPECULABLE_REQUEST_SETS = (
     "frequency_penalties_reqs",
     "repetition_penalties_reqs",
 )
+# The same sets on a launch that verifies in ``sampled_ids`` mode with the
+# step's sampling on device (``TTModelRunner._spec_verify_samples``): a sampled
+# request is speculable there, because the verify returns a draw from its own
+# distribution and the id walk is lossless for the model's point-mass drafts
+# (``spec_decode.ACCEPT_MODE_SAMPLED_IDS``). Penalties still reshape logits the
+# device never sees (``supports_device_penalties``), so they stay.
+_UNSPECULABLE_REQUEST_SETS_SAMPLED = tuple(
+    name for name in _UNSPECULABLE_REQUEST_SETS if name != "random_reqs"
+)
+
+
+def _unspeculable_request_sets(runner) -> tuple[str, ...]:
+    """The persistent-batch sets naming unspeculable requests on this launch.
+
+    ``getattr`` so the stand-in runners the unit tests pass keep the greedy
+    gate (no latch means ``argmax_ids``).
+    """
+    if getattr(runner, "_spec_verify_samples", False):
+        return _UNSPECULABLE_REQUEST_SETS_SAMPLED
+    return _UNSPECULABLE_REQUEST_SETS
 
 
 def _params_need_host_filter(params) -> bool:
@@ -239,7 +260,7 @@ def _speculation_held_back(runner) -> bool:
     if not getattr(runner, "_spec_verify_requires_speculable_rows", False):
         return False
     batch = runner.input_batch
-    if any(getattr(batch, name, ()) for name in _UNSPECULABLE_REQUEST_SETS):
+    if any(getattr(batch, name, ()) for name in _unspeculable_request_sets(runner)):
         return True
     # The host-filtered requests (``_params_need_host_filter``) are not in
     # those sets, so they are found through the batch's own request ids:
@@ -372,6 +393,11 @@ class TTModelRunner:
         self._spec_verify_requires_speculable_rows = bool(
             spec_plan and spec_plan.verify_requires_speculable_rows
         )
+        # The accept modes the plan offers; the mode this runner asks for is
+        # fixed below, once the device-sampling mode is known.
+        self._spec_plan_accept_modes = (
+            tuple(spec_plan.accept_modes) if spec_plan else ()
+        )
         # Who proposes: the model's own drafter on device, or a host drafter.
         # Read from the one requirements table rather than from a second list of
         # method names, and once, because that table is rebuilt per call.
@@ -398,6 +424,26 @@ class TTModelRunner:
         # Whether to sample on device
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
+        # Speculative sampling: a plan offering ``sampled_ids`` on a launch that
+        # samples decode steps on device verifies in that mode, and a sampled
+        # request is then speculable (``_unspeculable_request_sets``). Every
+        # verify of such a launch carries the step's sampling_params, because a
+        # step with a request that needs host sampling (penalties, host
+        # filters) is held back and never verifies. Without device sampling a
+        # verify would carry no sampling parameters, so sampled requests keep
+        # the PS-1 path and the plan's ``argmax_ids`` is asked for (when it
+        # offers it).
+        accept_modes = self._spec_plan_accept_modes
+        self._spec_verify_samples = (
+            ACCEPT_MODE_SAMPLED_IDS in accept_modes
+            and self.sample_on_device_mode in ("all", "decode_only")
+        )
+        self._spec_accept_mode = (
+            ACCEPT_MODE_SAMPLED_IDS
+            if self._spec_verify_samples
+            or (accept_modes and ACCEPT_MODE_ARGMAX_IDS not in accept_modes)
+            else ACCEPT_MODE_ARGMAX_IDS
+        )
         # Whether the model supports top-K logprobs on device.
         # Detected from model_type (available to all DP ranks without
         # requiring the model to be loaded). Models like gpt-oss-120b
@@ -1555,8 +1601,10 @@ class TTModelRunner:
         # getattr rather than attribute access: the gate has to stay total for
         # any batch the runner is handed. A batch that tracks none of these
         # sets has no sampled request to withhold drafts from, so the answer is
-        # the same as an empty set -- speculable.
-        for attr in _UNSPECULABLE_REQUEST_SETS:
+        # the same as an empty set -- speculable. On a launch that verifies in
+        # ``sampled_ids`` mode a sampled request is speculable
+        # (``_unspeculable_request_sets``).
+        for attr in _unspeculable_request_sets(self):
             if req_id in getattr(batch, attr, ()):
                 return False
         return not _request_needs_host_filter(self, req_id)
@@ -2406,7 +2454,11 @@ class TTModelRunner:
             num_valid_drafts=num_valid_drafts,
             accepted_counts=accepted_counts,
             draft_token_ids=spec_drafts,
-            spec_mode=ACCEPT_MODE_ARGMAX_IDS if spec_drafts is not None else None,
+            spec_mode=(
+                getattr(self, "_spec_accept_mode", ACCEPT_MODE_ARGMAX_IDS)
+                if spec_drafts is not None
+                else None
+            ),
         )
 
     def build_model_input(
@@ -2777,8 +2829,8 @@ class TTModelRunner:
 
         if not isinstance(argmax_ids, torch.Tensor):
             raise TypeError(
-                "a verify in argmax_ids mode must return a token id tensor, got "
-                f"{type(argmax_ids).__name__}"
+                f"a verify in {model_input.spec_mode} mode must return a token id "
+                f"tensor, got {type(argmax_ids).__name__}"
             )
         # The draft block is built at the full width K even on a narrow step,
         # where the model was handed one column because no row carried a draft.

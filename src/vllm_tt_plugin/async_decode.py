@@ -17,7 +17,8 @@ from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_decode import (
-    ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_SAMPLED_IDS,
+    ID_WALK_ACCEPT_MODES,
     MODE_REQUIRED_FIELDS,
     PLACEHOLDER_TOKEN_ID,
     VerifyOutput,
@@ -37,10 +38,12 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
     token per row, so the run commits one token per step for its whole life
     and reports nothing. Refused by type here, where the answer arrives.
 
-    Only ``argmax_ids`` is driven today, so a model that answers in another
-    mode is refused by name rather than having its tensor read as ids.
-    ``VerifyOutput`` has already checked that the field its mode declares is
-    present.
+    The runner drives the id-walk modes (``argmax_ids``, ``sampled_ids``) and
+    asks for exactly one of them per launch, so an answer in any other mode, or
+    in the other id mode, is refused by name rather than having its tensor read
+    as ids: an ``argmax_ids`` answer to a ``sampled_ids`` question would commit
+    argmax tokens for sampled rows. ``VerifyOutput`` has already checked that
+    the field its mode declares is present.
     """
     if not isinstance(tt_out, VerifyOutput):
         raise TypeError(
@@ -50,13 +53,21 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
             "vllm_tt_plugin.spec_decode, so a model whose decode_forward "
             "serves no verify must not declare supports_spec_decode"
         )
-    if tt_out.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
+    if tt_out.spec_mode not in ID_WALK_ACCEPT_MODES:
         raise NotImplementedError(
-            f"TT decode asked for spec_mode {ACCEPT_MODE_ARGMAX_IDS!r} and the "
+            f"TT decode asked for spec_mode {spec_mode!r} and the "
             f"model answered in {tt_out.spec_mode!r}, which carries "
             f"{list(MODE_REQUIRED_FIELDS[tt_out.spec_mode])}; the runner drives "
             "no accept walk for that mode yet"
         )
+    if tt_out.spec_mode != spec_mode:
+        raise ValueError(
+            f"TT decode asked for spec_mode {spec_mode!r} and the model "
+            f"answered in {tt_out.spec_mode!r}: a verify answers in the mode "
+            "it was asked for"
+        )
+    if tt_out.spec_mode == ACCEPT_MODE_SAMPLED_IDS:
+        return tt_out.sampled_ids
     return tt_out.argmax_ids
 
 

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, get_args
 
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_SAMPLED_IDS,
     DRAFTER_STATE_PAGED,
     HIDDEN_HANDOFFS,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
@@ -41,7 +42,14 @@ if TYPE_CHECKING:
 # ``argmax_ids`` on every step and refuses any other answer, so admitting a
 # logits-only plan would pass a launch that fails on its first decode. The
 # sampled accept walk is what adds it back.
-_RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS,)
+#
+# ``sampled_ids`` is driven by the same id-equality walk: the runner asks for it
+# instead of ``argmax_ids`` when the plan offers it and the launch samples decode
+# steps on device (``TTModelRunner._spec_verify_samples``). A plan offering only
+# ``sampled_ids`` is runnable too: without device sampling the runner still asks
+# for it, keeps sampled rows out of verify steps (PS-1), and a greedy row's
+# sampled id is its argmax.
+_RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_SAMPLED_IDS)
 
 # Upstream custom_class is a user-provided proposer extension that needs no
 # separate draft checkpoint configuration. The TT runner uses that category
