@@ -272,6 +272,30 @@ def _speculation_held_back(runner) -> bool:
     )
 
 
+def _sampled_verify_needs_host_sampling(runner, req_indices) -> bool:
+    """Whether a ``sampled_ids`` verify of this step would lack sampling params.
+
+    On a launch that verifies sampled requests
+    (``TTModelRunner._spec_verify_samples``) a verify draws each row from its
+    own distribution with the step's device sampling parameters. A step that
+    ``check_perform_device_sampling`` routes to the host carries none, and its
+    verify would answer every row with the argmax. That is exact only when
+    every row is greedy, so while the batch holds a sampled request such a step
+    is held back (decoded ordinarily, with host sampling) rather than verified.
+    False on every other launch, and whenever no sampled request is in the
+    batch. ``getattr`` keeps it total for the stand-in runners of the tests.
+    """
+    if not getattr(runner, "_spec_verify_samples", False):
+        return False
+    if not getattr(runner.input_batch, "random_reqs", ()):
+        return False
+    return not runner.check_perform_device_sampling(
+        is_decode=True,
+        has_structured_outputs=False,
+        sampling_rows=req_indices,
+    )
+
+
 def _check_one_bitmask_row_per_request(grammar_output) -> None:
     """Refuse a grammar bitmask that does not hold one row per request.
 
@@ -433,10 +457,18 @@ class TTModelRunner:
         # verify would carry no sampling parameters, so sampled requests keep
         # the PS-1 path and the plan's ``argmax_ids`` is asked for (when it
         # offers it).
+        #
+        # Launch-level custom logits processors (``--logits-processors``) make
+        # ``check_perform_device_sampling`` refuse device sampling on every
+        # step, so a verify there would carry no sampling parameters: such a
+        # launch keeps the PS-1 path. Any other step that would sample on the
+        # host while a sampled request is in the batch is held back per step
+        # (``_sampled_verify_needs_host_sampling``).
         accept_modes = self._spec_plan_accept_modes
         self._spec_verify_samples = (
             ACCEPT_MODE_SAMPLED_IDS in accept_modes
             and self.sample_on_device_mode in ("all", "decode_only")
+            and not bool(getattr(self.model_config, "logits_processors", None))
         )
         self._spec_accept_mode = (
             ACCEPT_MODE_SAMPLED_IDS
@@ -2155,7 +2187,9 @@ class TTModelRunner:
                 )
                 # Ahead of ``_step_verifies`` because it overrides all three of
                 # its rules: see ``_speculation_held_back``.
-                held_back = _speculation_held_back(self)
+                held_back = _speculation_held_back(
+                    self
+                ) or _sampled_verify_needs_host_sampling(self, req_indices)
                 if not held_back and _step_verifies(
                     self._spec_supports_narrow_decode,
                     num_valid_drafts,

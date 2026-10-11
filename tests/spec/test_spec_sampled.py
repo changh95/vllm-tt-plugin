@@ -592,3 +592,76 @@ def test_an_argmax_launch_keeps_sampled_requests_off_verify_steps():
 
 
 # endregion End to end
+
+# region Launches and steps without device sampling
+
+
+def test_custom_logits_processors_never_reach_a_speculative_runner(monkeypatch):
+    """``--logits-processors`` with speculation is refused at runner build.
+
+    vLLM's ``build_logitsprocs`` raises for custom logits processors on a
+    speculative launch, so the latch's own guard against them
+    (``_spec_verify_samples`` requires none) is defence in depth, and the
+    per-step hold-back below covers every other host-sampled step.
+    """
+    monkeypatch.setattr(
+        model_runner_module.TTPlatform,
+        "sample_on_device_mode",
+        "decode_only",
+        raising=False,
+    )
+    vllm_config = uniform._runner_config()
+    vllm_config.model_config.logits_processors = ["my.module:Proc"]
+    store_tt_spec_plan(
+        vllm_config,
+        uniform._plan(
+            accept_modes=(ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_SAMPLED_IDS),
+            verify_requires_speculable_rows=True,
+        ),
+    )
+    with pytest.raises(ValueError, match="speculative decoding"):
+        TTModelRunner(
+            vllm_config,
+            mesh_device=None,
+            trace_mode="decode_only",
+            enable_model_warmup=False,
+            num_devices=1,
+        )
+
+
+def test_a_host_sampled_step_with_a_sampled_request_is_held_back():
+    """A latched launch never sends a sampled_ids verify without sampling params.
+
+    The step is built while ``check_perform_device_sampling`` says host: with a
+    sampled request in the batch it must decode ordinarily (no ``spec_mode``),
+    even though drafts are scheduled; once the device samples again, it
+    verifies.
+    """
+    model = CounterSampledTarget()
+    runner = _device_runner(model, speculating=True)
+    uniform._add_request(runner, "s", 1, SamplingParams(temperature=1.0, seed=1))
+    token, position = uniform._tail(runner, "s")
+    drafts = {"s": model.greedy(token, position, 1)}
+    runner.check_perform_device_sampling = lambda **_: False
+    assert model_runner_module._sampled_verify_needs_host_sampling(runner, [0]) is True
+    model_input = uniform._build(runner, "s", drafts=drafts)
+    assert not model_input.perform_device_sampling
+    assert model_input.spec_mode is None
+
+
+def test_a_host_sampled_step_of_greedy_requests_still_verifies():
+    model = CounterSampledTarget()
+    runner = _device_runner(model, speculating=True)
+    uniform._add_request(runner, "g", 1, SamplingParams(temperature=0.0))
+    runner.check_perform_device_sampling = lambda **_: False
+    assert model_runner_module._sampled_verify_needs_host_sampling(runner, [0]) is False
+
+
+def test_an_unlatched_launch_never_asks():
+    runner = object.__new__(TTModelRunner)
+    runner._spec_verify_samples = False
+    runner.input_batch = uniform._FakeBatch(random=["s"])
+    assert model_runner_module._sampled_verify_needs_host_sampling(runner, [0]) is False
+
+
+# endregion Launches and steps without device sampling

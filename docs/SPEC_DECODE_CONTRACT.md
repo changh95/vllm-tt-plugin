@@ -227,6 +227,23 @@ speculation back, because the device never sees those logits. A model with
 counter-based sampling noise keyed by `(seed, position)` commits, for a seeded
 request, exactly the tokens a launch without speculation commits.
 
+Two guards keep that true. The latch also requires that the launch sets no
+custom logits processors (vLLM refuses them with speculation anyway), and a
+step that `check_perform_device_sampling` routes to host sampling while a
+sampled request is in the batch is held back rather than verified
+(`model_runner._sampled_verify_needs_host_sampling`). So a `sampled_ids` verify
+always carries `sampling_params`, and a model may refuse one that does not
+(the Motif-3 bridge raises).
+
+**Stop strings under speculation.** A verify can commit several tokens at once
+(an accepted draft plus the bonus). Upstream's frontend detokenizer then checks
+stop strings once over all of them and takes the first stop string in list
+order, not the one ordinary decoding would hit first, and keeps the tokens
+past the stop in `token_ids`. The plugin replays such an update one token at a
+time (`platform._install_tt_spec_stop_string_patch`, installed in the API
+server process), so the stop string, the text and the token ids are those of
+one-token-per-step decoding, for greedy and sampled rows alike.
+
 **`SpecReject.supported_k`** carries the draft lengths that would have worked at
 that concurrency, and the plugin quotes it to the operator. Populate it.
 

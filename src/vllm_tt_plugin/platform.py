@@ -740,6 +740,53 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
 
+def _install_tt_spec_stop_string_patch() -> None:
+    """Check stop strings token by token when one step commits several tokens.
+
+    A speculative step (an accepted draft plus the bonus) hands the frontend
+    detokenizer several tokens at once. Upstream's
+    ``BaseIncrementalDetokenizer.update`` detokenizes them all and then runs
+    ``check_stop_strings`` once, which returns the first stop string in *list*
+    order that occurs anywhere in the new text, not the one ordinary decoding
+    (one token per update) would have hit first: with ``stop=["\\n", "."]`` and
+    new text ``" hearts.\\n"`` it truncates at the newline and keeps the ``"."``.
+    It also leaves the tokens after the stopping token in the request's
+    ``token_ids``.
+
+    Replayed one token at a time through the original method, a multi-token
+    update evaluates exactly the checks ordinary decoding evaluates, in the same
+    order, and stops at the same token with the same text. The committed list
+    (the caller's ``engine_core_output.new_token_ids``, which it passes on to
+    the request output) is trimmed in place to end at that token. An update of
+    at most one token, or of a request without stop strings, takes the original
+    path unchanged.
+
+    TODO: remove once vLLM core checks stop strings per token.
+    """
+    import vllm.v1.engine.detokenizer as detokenizer
+
+    cls = detokenizer.BaseIncrementalDetokenizer
+    if getattr(cls.update, "_tt_spec_stop_string_patch", False):
+        return
+    original = cls.update
+
+    def update_tt(self, new_token_ids, stop_terminated):
+        if not self.stop or len(new_token_ids) <= 1:
+            return original(self, new_token_ids, stop_terminated)
+        last = len(new_token_ids) - 1
+        for i, token_id in enumerate(list(new_token_ids)):
+            stop_string = original(self, [token_id], stop_terminated and i == last)
+            if stop_string is not None:
+                if i < last and isinstance(new_token_ids, list):
+                    del new_token_ids[i + 1 :]
+                return stop_string
+        return None
+
+    update_tt._tt_spec_stop_string_patch = True
+    update_tt._tt_original = original
+    cls.update = update_tt
+
+
 def _install_tt_async_spec_method_patch() -> None:
     """Let the TT model-owned drafter through upstream's async-scheduling gate.
 
@@ -1521,6 +1568,7 @@ class TTPlatform(Platform):
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
+        _install_tt_spec_stop_string_patch()
         # Before ``EngineArgs.create_engine_config`` builds the VllmConfig,
         # which is where upstream decides asynchronous scheduling against the
         # speculative method name. This hook is that call's first statement.
@@ -1601,6 +1649,7 @@ class TTPlatform(Platform):
         # ``VllmConfig.__post_init__`` performs immediately after this hook.
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
+        _install_tt_spec_stop_string_patch()
         # Too late to change this config's asynchronous setting, which upstream
         # resolved before calling this hook. Installed anyway, for a process
         # that reaches configuration without the CLI path: a second engine, or
