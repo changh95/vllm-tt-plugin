@@ -244,6 +244,13 @@ class TTModelRunner:
         # A model declaring tt_prefill_chunk_tokens resumes a prompt across
         # prefill calls and is told which rows' chunks end their prompt.
         self._prefill_chunk_unit = get_tt_prefill_chunk_unit(vllm_config)
+        # Such a model hands its state off only at a sequence's final chunk, so
+        # every chunk must reach it through prefill_forward. These requests'
+        # last prefill chunk was intermediate: their next step is prefill work
+        # even when exactly one token remains past the prompt (the last chunk of
+        # a split replay resumed from preemption), which _is_still_prefilling's
+        # output-width rule would otherwise dispatch as a decode.
+        self._split_prefill_req_ids: set[str] = set()
         self._persistent_capture_released = False
 
         # Resolved and validated by the platform's config-time admission;
@@ -905,6 +912,12 @@ class TTModelRunner:
         # unscheduling does not: a request may simply be hidden for this step.
         for req_id in scheduler_output.preempted_req_ids or ():
             self._release_model_request(req_id)
+        # A finished or preempted request's split prefill is over (a resume
+        # replays from position 0 as a resumed request).
+        split = getattr(self, "_split_prefill_req_ids", None)
+        if split:
+            split.difference_update(scheduler_output.finished_req_ids)
+            split.difference_update(scheduler_output.preempted_req_ids or ())
 
         # Only after the model released by slot: the release calls above read
         # the request's slot from the ownership map before it is dropped.
@@ -1903,6 +1916,10 @@ class TTModelRunner:
             # comparison dispatched every post-first block step as prompt
             # work, re-encoding the entire session per canvas: quadratic
             # prefill and decode never ran.
+            if req_id in getattr(self, "_split_prefill_req_ids", ()):
+                # Its last chunk was intermediate (a chunk-unit model): see
+                # __init__.
+                return True
             row = input_batch.req_id_to_index[req_id]
             # ``num_computed_tokens`` is the scheduler's pre-step snapshot.
             num_computed = input_batch.num_computed_tokens_cpu[row]
@@ -2240,6 +2257,18 @@ class TTModelRunner:
                     for req_id, pos in zip(row_req_ids, input_positions.tolist())
                     if pos > 0 and req_id in self._req_state_slot
                 }
+                # The rows whose chunk is intermediate continue in a later
+                # prefill step, whatever remains of them (see __init__).
+                split = getattr(self, "_split_prefill_req_ids", None)
+                if split is None:
+                    split = self._split_prefill_req_ids = set()
+                for req_id, intermediate in zip(
+                    row_req_ids, intermediate_prefill_mask.tolist(), strict=True
+                ):
+                    if intermediate:
+                        split.add(req_id)
+                    else:
+                        split.discard(req_id)
             if continuing:
                 prefill_empty_slots = self._alloc_prefill_state_slots(
                     row_req_ids, continuing=continuing

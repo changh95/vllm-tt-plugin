@@ -182,6 +182,58 @@ def test_resumed_replay_past_prompt_length_remains_prefill():
     assert model_input.intermediate_prefill_mask.tolist() == [True]
 
 
+def _chunk_unit_runner(prompt_len, output_len, num_computed_tokens, runner=None):
+    """A runner of a model that declares tt_prefill_chunk_tokens, on a fresh batch
+    holding request ``r`` at num_computed_tokens (``runner``: keep its state)."""
+    batch, request = _batch_with_one_request(
+        prompt_len, output_len, num_computed_tokens
+    )
+    fresh = _fake_runner(batch, request)
+    if runner is None:
+        runner = fresh
+        runner._prefill_chunk_unit = 64
+        runner._req_state_slot = {}
+        runner._alloc_prefill_state_slots = lambda ids, continuing=None: list(
+            range(len(ids))
+        )
+    runner.input_batch, runner.requests = fresh.input_batch, fresh.requests
+    return runner
+
+
+def test_a_split_replay_ends_through_prefill_for_a_chunk_unit_model():
+    """A chunk-unit model hands its state off only at a sequence's final chunk.
+
+    A replay resumed from preemption (4-token prompt, 6 outputs: 10 tokens)
+    whose first chunk [0, 9) was intermediate has exactly one token left, past
+    the prompt: the output-width rule alone takes that for a steady decode.
+    After an intermediate chunk it is the replay's final prefill chunk.
+    """
+    runner = _chunk_unit_runner(4, 6, 0)
+    first = _prepare(runner, ("r", 9, 0, 6))
+    assert first.prompt_lens.tolist() == [9]
+    assert first.intermediate_prefill_mask.tolist() == [True]
+
+    runner = _chunk_unit_runner(4, 6, 9, runner)
+    last = _prepare(runner, ("r", 1, 9, 6))
+    assert last.prompt_lens is not None, "the final chunk dispatched as a decode"
+    assert last.prompt_lens.tolist() == [10]
+    assert last.intermediate_prefill_mask.tolist() == [False]
+    assert runner._split_prefill_req_ids == set()
+
+    # the replay is over: the next step with one token outstanding is a decode
+    runner = _chunk_unit_runner(4, 7, 10, runner)
+    assert _prepare(runner, ("r", 1, 10, 7)).prompt_lens is None
+
+
+def test_without_an_intermediate_chunk_the_last_token_is_a_decode():
+    """The output-width rule is unchanged for a model without the chunk unit,
+    and for a chunk-unit request whose previous prefill was final."""
+    batch, request = _batch_with_one_request(4, 6, 9)
+    assert _prepare(_fake_runner(batch, request), ("r", 1, 9, 6)).prompt_lens is None
+    runner = _chunk_unit_runner(4, 6, 9)
+    assert _prepare(runner, ("r", 1, 9, 6)).prompt_lens is None
+
+
 # endregion Prefill classification
 
 # region Decode input construction
