@@ -1124,10 +1124,19 @@ class TTModelRunner:
         for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
 
-    def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
+    def _alloc_prefill_state_slots(
+        self, row_req_ids: list[str], continuing: set[str] | None = None
+    ) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
         off-batch requests own. Prefers its own row (where it decodes), so the
         steady state moves nothing.
+
+        ``continuing``: requests whose row resumes a split prompt this step (a
+        model that declares tt_prefill_chunk_tokens). Each keeps the slot it
+        already owns -- the model holds the prompt's partial state there, and a
+        decode gather in between moved the slot with it -- and that slot is held
+        against every other row before any is placed. A continuation without a
+        slot, or a slot claimed twice, raises.
 
         Exhaustion is unreachable: holders and prefills are disjoint and both count
         against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
@@ -1146,9 +1155,29 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        sticky: dict[str, int] = {}
+        for req_id in row_req_ids:
+            if not continuing or req_id not in continuing:
+                continue
+            slot = self._req_state_slot.get(req_id)
+            if slot is None:
+                raise RuntimeError(
+                    f"chunked-prefill continuation {req_id!r} has no device state "
+                    f"slot: map={self._req_state_slot}"
+                )
+            if slot in held or slot in sticky.values():
+                raise RuntimeError(
+                    f"chunked-prefill continuation {req_id!r} owns slot {slot}, which "
+                    f"another request also claims: held={sorted(held)}, "
+                    f"continuations={sticky}, map={self._req_state_slot}"
+                )
+            sticky[req_id] = slot
+        held |= set(sticky.values())
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
-            if row not in held:
+            if req_id in sticky:
+                slot = sticky[req_id]
+            elif row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]
@@ -2198,7 +2227,21 @@ class TTModelRunner:
         prefill_empty_slots = None
         slot_remap = None
         if is_prompt:
-            prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
+            # A split prompt's continuation keeps the state slot its earlier
+            # chunks filled (``getattr``: host tests build through bare runners).
+            continuing = None
+            if getattr(self, "_prefill_chunk_unit", 0):
+                continuing = {
+                    req_id
+                    for req_id, pos in zip(row_req_ids, input_positions.tolist())
+                    if pos > 0 and req_id in self._req_state_slot
+                }
+            if continuing:
+                prefill_empty_slots = self._alloc_prefill_state_slots(
+                    row_req_ids, continuing=continuing
+                )
+            else:
+                prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
         else:
             # Advances the ownership map to the post-gather layout, so the returned
             # remap has to reach the device: dropping it would leave the map claiming

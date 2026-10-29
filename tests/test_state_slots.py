@@ -449,3 +449,46 @@ def test_a_model_without_the_move_hook_still_releases():
     _decode(r, ["B"])  # a real gather, with nothing to notify
     TTModelRunner._release_model_request(r, "B")
     assert released == [0], "released by B's current slot"
+
+
+def test_a_chunk_continuation_keeps_the_slot_its_first_chunk_filled():
+    """A split prompt's partial state lives in the slot its first chunk was given.
+    Without the continuation set, the next chunk takes the lowest free slot, which
+    can be a slot another request released in between: the model would then
+    resume the prompt from the wrong slot."""
+    r = _runner(slots=4)
+    assert _prefill(r, ["X", "Y"]) == [0, 1]
+    assert _prefill(r, ["A"]) == [2], "row 0 is held by X; A's first chunk takes 2"
+    # Y leaves: its slot 1 is the lowest free one now
+    r._req_state_slot.pop("Y")
+    r.requests.pop("Y")
+    assert _decode(r, ["X"]) is None, "X decodes in place; A's slot 2 stays"
+    # negative control: the plain allocation moves the continuation to slot 1
+    plain = TTModelRunner._alloc_prefill_state_slots(
+        SimpleNamespace(**{**vars(r), "_req_state_slot": dict(r._req_state_slot)}), ["A"]
+    )
+    assert plain == [1]
+    assert TTModelRunner._alloc_prefill_state_slots(r, ["A"], continuing={"A"}) == [2]
+    assert r._req_state_slot["A"] == 2
+
+
+def test_a_chunk_continuation_follows_a_decode_gather():
+    """A decode gather between two chunks moves every slot, the partial's included;
+    the continuation keeps the slot the gather moved it to."""
+    r = _runner(slots=4)
+    assert _prefill(r, ["X", "Y"]) == [0, 1]
+    assert _prefill(r, ["A"]) == [2]
+    r._req_state_slot.pop("X")
+    r.requests.pop("X")
+    remap = _decode(r, ["Y"])  # Y's state gathers to row 0
+    assert remap is not None and remap[0] == 1
+    a_slot = r._req_state_slot["A"]
+    assert a_slot == remap.index(2), "the ownership map moved A with the gather"
+    assert TTModelRunner._alloc_prefill_state_slots(r, ["A"], continuing={"A"}) == [a_slot]
+
+
+def test_a_continuation_without_a_slot_raises():
+    r = _runner(slots=4)
+    r.requests["A"] = None
+    with pytest.raises(RuntimeError, match="no device state slot"):
+        TTModelRunner._alloc_prefill_state_slots(r, ["A"], continuing={"A"})
