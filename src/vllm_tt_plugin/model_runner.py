@@ -1931,6 +1931,7 @@ class TTModelRunner:
         )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
+        prefill_total_lens: torch.Tensor | None = None
         num_valid_drafts: torch.Tensor | None = None
         accepted_counts: torch.Tensor | None = None
         spec_drafts: torch.Tensor | None = None
@@ -1954,6 +1955,9 @@ class TTModelRunner:
             prompt_lens = input_positions + chunk_lens
             intermediate_prefill_mask = torch.from_numpy(
                 prompt_lens < input_batch.num_tokens[req_indices]
+            )
+            prefill_total_lens = torch.from_numpy(
+                input_batch.num_tokens[req_indices].astype(np.int64)
             )
             max_prefill_tokens = int(prompt_lens.max())
             input_tokens = input_batch.token_ids_cpu_tensor[
@@ -2276,6 +2280,7 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prefill_total_lens=prefill_total_lens,
             # Already in post-remap row order: ``req_indices`` reads the
             # persistent batch after ``condense`` moved every surviving
             # request's speculative state down with it.
@@ -3174,6 +3179,15 @@ class TTModelRunner:
             kwargs["prefill_final_mask"] = [
                 not bool(m) for m in model_input.intermediate_prefill_mask.tolist()
             ]
+            # Each row's whole sequence length, so the model can process every
+            # chunk of a sequence alike, split or not. ``getattr``: as above.
+            total_lens = getattr(model_input, "prefill_total_lens", None)
+            if total_lens is None:
+                raise RuntimeError(
+                    "prefill input carries no prefill_total_lens for a model "
+                    "that declares tt_prefill_chunk_tokens"
+                )
+            kwargs["prefill_total_lens"] = [int(t) for t in total_lens.tolist()]
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)

@@ -197,6 +197,13 @@ class TTModelInput:
     # ``None`` for decode.
     intermediate_prefill_mask: torch.Tensor | None = None
 
+    # Prefill only: per row, the length of the whole sequence this step's chunk
+    # belongs to (the prompt, or prompt plus outputs for a request resumed from
+    # preemption). A model that declares ``tt_prefill_chunk_tokens`` gets it as
+    # ``prefill_total_lens``, so it can process every chunk of a sequence the
+    # same way whether or not the scheduler split it. ``None`` for decode.
+    prefill_total_lens: torch.Tensor | None = None
+
     # Request id per forward row. A prefill build can drop rows, so forward row
     # order is not recoverable from the persistent batch; sample-time consumers
     # must resolve rows through this. ``None`` for lane builds, whose rows are

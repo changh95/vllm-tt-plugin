@@ -1292,6 +1292,9 @@ class TTLaneInputBatch(InputBatch):
         intermediate_prefill_mask = torch.from_numpy(
             prompt_lens < lane_batch.num_tokens[rows_np]
         )
+        prefill_total_lens = torch.from_numpy(
+            lane_batch.num_tokens[rows_np].astype(np.int64)
+        )
         max_prefill = int(prompt_lens.max())
         input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]
 
@@ -1361,6 +1364,7 @@ class TTLaneInputBatch(InputBatch):
                 else None
             ),
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prefill_total_lens=prefill_total_lens,
         )
 
     def extract_output(

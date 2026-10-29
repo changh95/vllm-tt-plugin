@@ -350,7 +350,7 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
 # region Prefill final mask
 
 
-def _submit_prefill(prefill_chunk_unit, intermediate_mask):
+def _submit_prefill(prefill_chunk_unit, intermediate_mask, total_lens=None):
     import torch
 
     captured: dict = {}
@@ -380,6 +380,9 @@ def _submit_prefill(prefill_chunk_unit, intermediate_mask):
         perform_device_sampling=False,
         prefill_empty_slots=None,
         intermediate_prefill_mask=torch.tensor(intermediate_mask, dtype=torch.bool),
+        prefill_total_lens=(
+            None if total_lens is None else torch.tensor(total_lens, dtype=torch.int64)
+        ),
     )
     TTModelRunner.submit_prefill(runner, model_input, [rows])
     return captured
@@ -388,16 +391,30 @@ def _submit_prefill(prefill_chunk_unit, intermediate_mask):
 def test_prefill_final_mask_reaches_a_model_that_declares_the_chunk_unit():
     """A chunk is final iff it ends its prompt: the complement of the
     intermediate-prefill mask, row for row."""
-    captured = _submit_prefill(64, [True, False, False])
+    captured = _submit_prefill(64, [True, False, False], [300, 64, 9])
 
     assert captured["prefill_final_mask"] == [False, True, True]
 
 
+def test_prefill_total_lens_reach_a_model_that_declares_the_chunk_unit():
+    """Each row's whole sequence length, so the model can process a split
+    sequence's chunks as it would the unsplit sequence."""
+    captured = _submit_prefill(64, [True, False], [300, 64])
+
+    assert captured["prefill_total_lens"] == [300, 64]
+
+
+def test_a_chunk_unit_model_needs_the_total_lens():
+    with pytest.raises(RuntimeError, match="prefill_total_lens"):
+        _submit_prefill(64, [True, False])
+
+
 @pytest.mark.parametrize("prefill_chunk_unit", [None, 0])
 def test_prefill_final_mask_is_not_passed_to_an_undeclaring_model(prefill_chunk_unit):
-    captured = _submit_prefill(prefill_chunk_unit, [True, False])
+    captured = _submit_prefill(prefill_chunk_unit, [True, False], [300, 64])
 
     assert "prefill_final_mask" not in captured
+    assert "prefill_total_lens" not in captured
     assert "tokens" in captured
 
 
