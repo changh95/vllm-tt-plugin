@@ -14,6 +14,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
+    TTPrefillChunkPolicy,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
@@ -23,11 +24,15 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_prefill_chunk_capabilities,
+    resolve_tt_prefill_chunk_tokens,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_prefill_chunk_policy,
+    store_tt_prefill_chunk_unit,
     store_tt_spec_plan,
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
@@ -161,6 +166,7 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     """Disable split prefills and restore a full-prompt scheduler budget."""
     scheduler_config = vllm_config.scheduler_config
     model_config = vllm_config.model_config
+    store_tt_prefill_chunk_policy(vllm_config, None)
 
     if scheduler_config.enable_chunked_prefill:
         logger.info(
@@ -206,12 +212,42 @@ def _validate_and_log_decode_interleave_policy(vllm_config: "VllmConfig") -> Non
     )
 
 
+def _prefill_chunk_policy_off_reason(
+    vllm_config: "VllmConfig", model_class: type
+) -> str | None:
+    """Why the TT chunk core cannot serve this launch, or ``None`` if it can.
+
+    Lane-DP is read ahead of ``_convert_dp_to_lanes``, which runs later in the
+    same hook: either the lane count is already stored (a re-run in the worker)
+    or the model folds a requested DP size into lanes.
+    """
+    scheduler_config = vllm_config.scheduler_config
+    if int(scheduler_config.max_num_seqs) <= 1:
+        # Nothing decodes while a prompt prefills, so every prompt would run
+        # whole anyway: keep scheduling byte-identical to an unsplit model.
+        return "max_num_seqs 1"
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if get_tt_data_parallel_size(vllm_config) > 1 or (
+        int(getattr(parallel_config, "data_parallel_size", 1)) > 1
+        and _model_folds_dp_into_lanes(model_class)
+    ):
+        return "lane-DP"
+    if getattr(vllm_config, "kv_transfer_config", None) is not None:
+        return "KV transfer"
+    return None
+
+
 def _apply_chunked_prefill_policy(
     vllm_config: "VllmConfig",
     model_capabilities: dict | None,
     model_class: type,
 ) -> None:
-    """Restrict token-chunked prefill to the models that declare support for it."""
+    """Restrict token-chunked prefill to the models that declare support for it.
+
+    A model that also declares its resume unit (``tt_prefill_chunk_tokens``)
+    gets the TT chunk core instead of plain base-scheduler chunking, or no
+    chunking where the core cannot serve the launch; see docs/SCHEDULING.md.
+    """
     scheduler_config = vllm_config.scheduler_config
     model_desc = f"TT model {model_class.__name__} ({model_class.__module__})"
 
@@ -223,6 +259,11 @@ def _apply_chunked_prefill_policy(
     output_tokens_per_step = (
         model_capabilities.get("output_tokens_per_step", 1) if model_capabilities else 1
     )
+    chunk_unit, exclusive_chunks = resolve_tt_prefill_chunk_capabilities(
+        model_capabilities
+    )
+    chunk_tokens = resolve_tt_prefill_chunk_tokens(vllm_config, chunk_unit)
+    store_tt_prefill_chunk_unit(vllm_config, chunk_unit)
     if (
         not supports_chunked_prefill
         or not scheduler_config.enable_chunked_prefill
@@ -233,6 +274,38 @@ def _apply_chunked_prefill_policy(
             reason = f"{model_desc} (block-output)"
         _disable_chunked_prefill(vllm_config, reason)
         return
+
+    policy = None
+    if chunk_unit:
+        # The model resumes a prompt only at multiples of its unit, so where the
+        # core cannot run, prompts must not be split at all.
+        off_reason = _prefill_chunk_policy_off_reason(vllm_config, model_class)
+        if off_reason is not None:
+            _disable_chunked_prefill(vllm_config, f"{model_desc} ({off_reason})")
+            return
+        policy = TTPrefillChunkPolicy(chunk_tokens, exclusive_chunks)
+        # Only long_prefill_token_threshold may split a prompt, never the token
+        # budget: one long prompt (at most max_model_len) plus a chunk for every
+        # other seat must fit a single step.
+        budget = vllm_config.model_config.max_model_len + (
+            int(scheduler_config.max_num_seqs) * chunk_tokens
+        )
+        for field in ("max_num_batched_tokens", "max_num_scheduled_tokens"):
+            value = getattr(scheduler_config, field, None)
+            if value is not None and value < budget:
+                logger.info(
+                    "TT chunked prefill: raising %s %d -> %d (max_model_len + "
+                    "max_num_seqs * chunk) so only the chunk threshold splits a "
+                    "prompt.",
+                    field,
+                    value,
+                    budget,
+                )
+                setattr(scheduler_config, field, budget)
+        # TTScheduler sets the threshold per prefill pass (0 while nothing
+        # decodes); this is its value everywhere else.
+        scheduler_config.long_prefill_token_threshold = chunk_tokens
+    store_tt_prefill_chunk_policy(vllm_config, policy)
 
     # A chunk boundary inside a multimodal item would split its embeddings from
     # their positions. Only meaningful while prefill can be split, and vLLM
@@ -246,10 +319,11 @@ def _apply_chunked_prefill_policy(
     # CI gates its device tests on this line, so it is logged unconditionally.
     logger.info(
         "Chunked prefill enabled for %s: max_num_batched_tokens=%d, "
-        "long_prefill_token_threshold=%d.",
+        "long_prefill_token_threshold=%d, TT chunk core=%s.",
         model_desc,
         scheduler_config.max_num_batched_tokens,
         scheduler_config.long_prefill_token_threshold,
+        policy,
     )
 
 

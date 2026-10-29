@@ -345,3 +345,60 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
     )
     expected = not (has_penalties and declared is False)
     assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
+
+
+# region Prefill final mask
+
+
+def _submit_prefill(prefill_chunk_unit, intermediate_mask):
+    import torch
+
+    captured: dict = {}
+
+    class FakeModel:
+        def prefill_forward(self, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        model=FakeModel(),
+        async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
+    )
+    if prefill_chunk_unit is not None:
+        runner._prefill_chunk_unit = prefill_chunk_unit
+    rows = len(intermediate_mask)
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((rows, 1), dtype=torch.int32),
+        block_tables=torch.zeros((rows, 1), dtype=torch.int32),
+        prompt_lens=[1] * rows,
+        input_positions=torch.zeros((rows,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        multi_modal_kwargs={},
+        perform_device_sampling=False,
+        prefill_empty_slots=None,
+        intermediate_prefill_mask=torch.tensor(intermediate_mask, dtype=torch.bool),
+    )
+    TTModelRunner.submit_prefill(runner, model_input, [rows])
+    return captured
+
+
+def test_prefill_final_mask_reaches_a_model_that_declares_the_chunk_unit():
+    """A chunk is final iff it ends its prompt: the complement of the
+    intermediate-prefill mask, row for row."""
+    captured = _submit_prefill(64, [True, False, False])
+
+    assert captured["prefill_final_mask"] == [False, True, True]
+
+
+@pytest.mark.parametrize("prefill_chunk_unit", [None, 0])
+def test_prefill_final_mask_is_not_passed_to_an_undeclaring_model(prefill_chunk_unit):
+    captured = _submit_prefill(prefill_chunk_unit, [True, False])
+
+    assert "prefill_final_mask" not in captured
+    assert "tokens" in captured
+
+
+# endregion Prefill final mask

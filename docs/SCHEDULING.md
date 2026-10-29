@@ -210,6 +210,45 @@ Two things follow for the TT execution path:
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
 
+#### TT chunk core
+
+A model whose prefill can resume a prompt only at multiples of a unit declares
+`tt_prefill_chunk_tokens`, and `tt_prefill_exclusive_chunks` when it holds one
+partial prompt at a time. The chunk size is
+`--additional-config '{"tt": {"prefill_chunk_tokens": N}}'`, a positive multiple
+of the unit (default: the unit). The core is active when chunked prefill is
+enabled, `max_num_seqs > 1`, the launch is not lane-DP and has no
+`kv_transfer_config`, and the model is not block-output; otherwise chunked
+prefill is disabled for that model. At `max_num_seqs 1` the scheduler is
+exactly that of a model without chunked prefill. Async scheduling keeps it.
+
+`TTDecodeInterleavePolicy` still decides whether a step decodes or prefills.
+The core decides what a prefill step contains:
+
+- The platform raises `max_num_batched_tokens` (and a set
+  `max_num_scheduled_tokens`) to at least
+  `max_model_len + max_num_seqs * chunk`, so the token budget never splits a
+  prompt; only `long_prefill_token_threshold` does.
+- The threshold is the chunk while a running request decodes, and 0 otherwise:
+  with nothing decoding every prompt runs whole, so a lone request's time to
+  first token is unchanged, and a partial whose decoders left finishes in one
+  step.
+- A prompt with more than one chunk left is long. At most one long prompt is in
+  flight: while one is partial, the other long prompts are hidden from the
+  prefill pass; with none partial, only the oldest long prompt is visible.
+- Exclusive models: while a prompt is partial, a prefill step schedules it and
+  nothing else, final chunk included. With none partial, a step may carry any
+  number of whole prompts plus one long prompt's first chunk.
+- A partial whose next chunk does not fit the free KV blocks is not scheduled,
+  because vLLM would preempt it and drop every computed chunk; the step decodes
+  instead.
+- An intermediate chunk that does not start and end on a multiple of the chunk
+  raises `RuntimeError`.
+
+Every rule reads scheduling-side state that `schedule()` itself advances, so
+the core behaves the same under async scheduling. While the unit is declared,
+the runner passes `prefill_final_mask` to `prefill_forward`.
+
 ### Decode interleave
 
 Preferring prefill whenever prefill work is pending has one bad consequence.

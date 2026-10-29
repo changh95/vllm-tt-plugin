@@ -1,23 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
+from vllm.v1.core.sched.request_queue import (
+    FCFSRequestQueue,
+    RequestQueue,
+    create_request_queue,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
+    TTPrefillChunkPolicy,
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
+    get_tt_prefill_chunk_policy,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -254,6 +262,9 @@ class TTScheduler(AsyncScheduler):
         # before every one of its lanes' schedule() calls and owns the one
         # policy instance for the whole step, so this one stays dormant there.
         self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
+        # TT chunk core (models declaring tt_prefill_chunk_tokens), or None:
+        # shapes what a prefill step contains; see _schedule_prefill_chunk_pass.
+        self._prefill_chunk_policy = get_tt_prefill_chunk_policy(self.vllm_config)
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -650,6 +661,16 @@ class TTScheduler(AsyncScheduler):
                 )
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result, is_decode=True)
+            if has_running_decode and self._prefill_chunk_partial_starved():
+                # TT chunk core: the partial prompt's next chunk does not fit
+                # the free KV blocks, and scheduling it would make the base
+                # scheduler preempt it and drop every chunk it computed. Decode
+                # instead; finishing decodes free the blocks it needs.
+                self._decode_interleave.record_step(
+                    is_decode=True, prefill_pending=True
+                )
+                result = self._schedule_decode_only()
+                return self._finalize_scheduler_output(result, is_decode=True)
             prefill_result = self._schedule_prefill_only()
             # If prefill cannot make progress (e.g. KV pressure), do not stall
             # decode. Fall back to decode-only so running requests can advance
@@ -704,20 +725,192 @@ class TTScheduler(AsyncScheduler):
         Temporarily hides the running *decode* requests so the base scheduler's
         running loop only advances partial prefills, and its waiting loop
         admits new ones.  Adjusts max_num_running_reqs so the waiting loop
-        respects the true capacity with the decodes hidden.
+        respects the true capacity with the decodes hidden. Under the TT chunk
+        core the pass is shaped by ``_schedule_prefill_chunk_pass``.
         """
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
+        # ``getattr``: host tests drive bare ``TTScheduler.__new__`` instances.
+        chunk_policy = getattr(self, "_prefill_chunk_policy", None)
 
         saved_max = self.max_num_running_reqs
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
         try:
-            result = super().schedule()
+            if chunk_policy is None:
+                result = super().schedule()
+            else:
+                result = self._schedule_prefill_chunk_pass(
+                    chunk_policy,
+                    partial_prefills,
+                    has_running_decode=bool(pure_decodes),
+                )
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
         return result
+
+    # ---- TT chunk core (models declaring tt_prefill_chunk_tokens) -----------
+    #
+    # The model resumes a partially prefilled prompt only at multiples of its
+    # chunk and holds one partial prompt at a time. TTDecodeInterleavePolicy
+    # still decides whether a step decodes or prefills; the core decides what a
+    # prefill step contains. Every input is scheduling-side state that
+    # schedule() itself advances (num_computed_tokens, is_prefill_chunk, the
+    # queues), so the core is the same under async scheduling.
+
+    def _schedule_prefill_chunk_pass(
+        self,
+        policy: TTPrefillChunkPolicy,
+        partial_prefills: list[Request],
+        *,
+        has_running_decode: bool,
+    ) -> SchedulerOutput:
+        """Run the base prefill pass under the TT chunk core.
+
+        - A prompt is long when more than ``chunk`` of its tokens are left. At
+          most one long prompt is in flight: while one is partial, every long
+          waiting prompt is hidden from the pass; with none partial, every long
+          waiting prompt but the oldest is.
+        - Exclusive models: while a prompt is partial, every waiting prompt is
+          hidden, so the step carries that prompt alone, final chunk included.
+        - The threshold is ``chunk`` while a request decodes, so the long prompt
+          advances one aligned chunk per prefill step, and 0 otherwise: every
+          prompt then runs whole (a lone request's TTFT is unchanged, and a
+          partial whose decoders left finishes in one step).
+
+        The platform sized the token budget so that it never splits a prompt;
+        ``_check_prefill_chunk_alignment`` refuses any chunk off the grid.
+        """
+        if len(partial_prefills) > 1:
+            raise RuntimeError(
+                "TT chunk core: more than one partial prefill in flight: "
+                + ", ".join(
+                    f"{r.request_id} at {r.num_computed_tokens}/{r.num_tokens}"
+                    for r in partial_prefills
+                )
+            )
+        chunk = policy.chunk_tokens
+
+        def is_long(request: Request) -> bool:
+            return request.num_tokens - request.num_computed_tokens > chunk
+
+        oldest_long = None
+        if not partial_prefills:
+            waiting_longs = [r for q in self._waiting_queues() for r in q if is_long(r)]
+            # Request ordering is (priority, arrival_time): the long prompt the
+            # base scheduler would admit first.
+            oldest_long = min(waiting_longs) if waiting_longs else None
+
+        def hidden(request: Request) -> bool:
+            if partial_prefills:
+                return policy.exclusive or is_long(request)
+            return request is not oldest_long and is_long(request)
+
+        scheduler_config = self.scheduler_config
+        saved_threshold = scheduler_config.long_prefill_token_threshold
+        # The base scheduler reads the threshold per request, for the partial
+        # in its running loop and for every admission in its waiting loop.
+        scheduler_config.long_prefill_token_threshold = (
+            chunk if has_running_decode else 0
+        )
+        try:
+            with self._waiting_requests_hidden(hidden):
+                result = super().schedule()
+        finally:
+            scheduler_config.long_prefill_token_threshold = saved_threshold
+        self._check_prefill_chunk_alignment(result, chunk)
+        return result
+
+    def _waiting_queues(self) -> list[RequestQueue]:
+        """The queues the base scheduler's waiting loop admits from."""
+        queues = [self.waiting]
+        skipped_waiting = getattr(self, "skipped_waiting", None)
+        if skipped_waiting is not None:
+            queues.append(skipped_waiting)
+        return queues
+
+    @contextmanager
+    def _waiting_requests_hidden(
+        self, hidden: Callable[[Request], bool]
+    ) -> Iterator[None]:
+        """Keep the waiting requests ``hidden`` selects out of one base pass.
+
+        They go back where they were: an FCFS queue keeps their original
+        positions (anything the pass prepended stays at the front), and a
+        priority queue reorders them by its own key anyway.
+        """
+        taken: list[tuple[RequestQueue, list[Request], list[Request]]] = []
+        for queue in self._waiting_queues():
+            requests = [r for r in queue if hidden(r)]
+            if requests:
+                taken.append((queue, list(queue), requests))
+                queue.remove_requests(requests)
+        try:
+            yield
+        finally:
+            for queue, original, requests in taken:
+                if isinstance(queue, FCFSRequestQueue):
+                    present = set(queue) | set(requests)
+                    known = set(original)
+                    merged = [r for r in queue if r not in known] + [
+                        r for r in original if r in present
+                    ]
+                    queue.clear()
+                    queue.extend(merged)
+                else:
+                    for request in requests:
+                        queue.add_request(request)
+
+    def _check_prefill_chunk_alignment(
+        self, result: SchedulerOutput, chunk: int
+    ) -> None:
+        """Refuse a chunk that leaves its prompt partial off the chunk grid:
+        the model can only resume at a multiple of ``chunk``."""
+        for req_id, num_scheduled in result.num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            if not request.is_prefill_chunk:
+                continue
+            end = request.num_computed_tokens
+            start = end - num_scheduled
+            if start % chunk or end % chunk:
+                raise RuntimeError(
+                    "TT chunk core scheduled an unaligned intermediate chunk "
+                    f"[{start}, {end}) for {req_id} (chunk {chunk}, "
+                    f"num_tokens {request.num_tokens})"
+                )
+
+    def _prefill_chunk_partial_starved(self) -> bool:
+        """Whether the partial prompt's next chunk does not fit the free KV blocks.
+
+        Mirrors the block count ``KVCacheManager.allocate_slots`` would ask for
+        the partial's next ``chunk`` tokens (a running request: no watermark).
+        Only called while requests decode, so the threshold is ``chunk``.
+        """
+        # ``getattr``: host tests drive bare ``TTScheduler.__new__`` instances.
+        policy = getattr(self, "_prefill_chunk_policy", None)
+        if policy is None:
+            return False
+        partial = next((r for r in self.running if r.is_prefill_chunk), None)
+        if partial is None:
+            return False
+        num_new = min(
+            policy.chunk_tokens, partial.num_tokens - partial.num_computed_tokens
+        )
+        manager = self.kv_cache_manager
+        num_tokens_main_model = partial.num_computed_tokens + num_new
+        needed = manager.coordinator.get_num_blocks_to_allocate(
+            request_id=partial.request_id,
+            num_tokens=min(
+                num_tokens_main_model + self.num_lookahead_tokens, self.max_model_len
+            ),
+            new_computed_blocks=manager.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=partial.num_computed_tokens,
+            num_local_computed_tokens=partial.num_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+        )
+        return needed > manager.block_pool.get_num_free_blocks()
 
     def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running decode requests.

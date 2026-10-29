@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vllm_tt_plugin.logger import init_tt_logger
 
@@ -429,3 +429,136 @@ def get_tt_decode_interleave_config(
             _DECODE_INTERLEAVE_DECODE_STEPS_DEFAULT,
         ),
     )
+
+
+# TT chunk core for models whose prefill resumes only at multiples of a declared
+# unit. The unit is recorded whenever the model declares it (the runner then
+# passes ``prefill_final_mask``); the policy only while it is active (the
+# scheduler then shapes prefill steps). Platform-derived; see
+# _ADAPTIVE_BLOCK_OUTPUT_KEY.
+_PREFILL_CHUNK_UNIT_KEY = "_tt_prefill_chunk_unit"
+_PREFILL_CHUNK_POLICY_KEY = "_tt_prefill_chunk_policy"
+# Operator knob in the "tt" namespace: the chunk size, a multiple of the unit.
+_PREFILL_CHUNK_TOKENS_KNOB = "prefill_chunk_tokens"
+
+
+class TTPrefillChunkPolicy(NamedTuple):
+    """The active TT chunk core (see ``TTScheduler._schedule_prefill_chunk_pass``).
+
+    ``chunk_tokens``: every intermediate chunk starts and ends on a multiple of
+    it. ``exclusive``: while a prompt is partial, a prefill step carries that
+    prompt and nothing else.
+    """
+
+    chunk_tokens: int
+    exclusive: bool
+
+
+def resolve_tt_prefill_chunk_capabilities(
+    model_capabilities: dict | None,
+) -> tuple[int, bool]:
+    """Validate the chunk-core capabilities; return ``(unit, exclusive)``.
+
+    ``unit`` is 0 when the model does not declare ``tt_prefill_chunk_tokens``.
+    """
+    capabilities = model_capabilities or {}
+    unit = capabilities.get("tt_prefill_chunk_tokens")
+    exclusive = capabilities.get("tt_prefill_exclusive_chunks", False)
+    if not isinstance(exclusive, bool):
+        raise ValueError(
+            f"tt_prefill_exclusive_chunks must be a boolean, got {exclusive!r}"
+        )
+    if unit is None:
+        if exclusive:
+            raise ValueError(
+                "tt_prefill_exclusive_chunks requires tt_prefill_chunk_tokens"
+            )
+        return 0, False
+    if isinstance(unit, bool) or not isinstance(unit, int) or unit <= 0:
+        raise ValueError(
+            f"tt_prefill_chunk_tokens must be an integer > 0, got {unit!r}"
+        )
+    if not capabilities.get("supports_chunked_prefill", False):
+        raise ValueError("tt_prefill_chunk_tokens requires supports_chunked_prefill")
+    return unit, exclusive
+
+
+def resolve_tt_prefill_chunk_tokens(vllm_config: "VllmConfig", unit: int) -> int:
+    """Return the chunk size: ``additional_config['tt']['prefill_chunk_tokens']``
+    if set, else the model's unit. 0 when the model declares no unit.
+
+    The knob must be a positive multiple of the unit, since the model resumes a
+    prompt only there; setting it for a model without a unit is refused too.
+    """
+    tt_config = get_tt_config(vllm_config)
+    if _PREFILL_CHUNK_TOKENS_KNOB not in tt_config:
+        return unit
+    chunk = tt_config[_PREFILL_CHUNK_TOKENS_KNOB]
+    if not unit:
+        raise ValueError(
+            f"additional_config['tt']['{_PREFILL_CHUNK_TOKENS_KNOB}'] requires a "
+            "model that declares tt_prefill_chunk_tokens"
+        )
+    if (
+        isinstance(chunk, bool)
+        or not isinstance(chunk, int)
+        or chunk <= 0
+        or chunk % unit != 0
+    ):
+        raise ValueError(
+            f"additional_config['tt']['{_PREFILL_CHUNK_TOKENS_KNOB}'] must be a "
+            f"positive multiple of the model's tt_prefill_chunk_tokens={unit}, "
+            f"got {chunk!r}"
+        )
+    return chunk
+
+
+def get_tt_prefill_chunk_unit(vllm_config: "VllmConfig") -> int:
+    """The model's declared ``tt_prefill_chunk_tokens`` (0 = undeclared)."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return int(additional.get(_PREFILL_CHUNK_UNIT_KEY, 0))
+
+
+def store_tt_prefill_chunk_unit(vllm_config: "VllmConfig", unit: int) -> None:
+    """Record a declared unit, or drop the key for a model without one."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not unit:
+        if isinstance(additional, dict):
+            additional.pop(_PREFILL_CHUNK_UNIT_KEY, None)
+        return
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_PREFILL_CHUNK_UNIT_KEY] = int(unit)
+
+
+def get_tt_prefill_chunk_policy(
+    vllm_config: "VllmConfig",
+) -> TTPrefillChunkPolicy | None:
+    """The active chunk core, or ``None`` when it is off."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    stored = additional.get(_PREFILL_CHUNK_POLICY_KEY)
+    if stored is None:
+        return None
+    return TTPrefillChunkPolicy(
+        chunk_tokens=int(stored["chunk_tokens"]), exclusive=bool(stored["exclusive"])
+    )
+
+
+def store_tt_prefill_chunk_policy(
+    vllm_config: "VllmConfig", policy: TTPrefillChunkPolicy | None
+) -> None:
+    """Record the active chunk core (stored as a JSON-encodable dict), or clear
+    it with ``None``."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if policy is None:
+        if isinstance(additional, dict):
+            additional.pop(_PREFILL_CHUNK_POLICY_KEY, None)
+        return
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_PREFILL_CHUNK_POLICY_KEY] = {
+        "chunk_tokens": int(policy.chunk_tokens),
+        "exclusive": bool(policy.exclusive),
+    }

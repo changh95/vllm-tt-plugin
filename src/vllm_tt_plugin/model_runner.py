@@ -44,6 +44,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    get_tt_prefill_chunk_unit,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -240,6 +241,9 @@ class TTModelRunner:
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
         self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
+        # A model declaring tt_prefill_chunk_tokens resumes a prompt across
+        # prefill calls and is told which rows' chunks end their prompt.
+        self._prefill_chunk_unit = get_tt_prefill_chunk_unit(vllm_config)
         self._persistent_capture_released = False
 
         # Resolved and validated by the platform's config-time admission;
@@ -3115,6 +3119,18 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        # ``getattr``: host tests submit through bare runner namespaces.
+        if getattr(self, "_prefill_chunk_unit", 0):
+            # Row i's chunk ends its prompt iff prompt_lens[i] reaches the
+            # request's token count, i.e. the row is not intermediate.
+            if model_input.intermediate_prefill_mask is None:
+                raise RuntimeError(
+                    "prefill input carries no intermediate_prefill_mask for a model "
+                    "that declares tt_prefill_chunk_tokens"
+                )
+            kwargs["prefill_final_mask"] = [
+                not bool(m) for m in model_input.intermediate_prefill_mask.tolist()
+            ]
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
