@@ -28,6 +28,8 @@ from vllm_tt_plugin.config import (
     get_tt_prefill_chunk_policy,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
+    is_tt_async_block_exact_finish,
+    is_tt_async_prefill_output_first,
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -287,6 +289,20 @@ class TTScheduler(AsyncScheduler):
         self._adaptive_block_max_prompt = get_tt_adaptive_block_max_prompt_tokens(
             self.vllm_config
         )
+        # Async block scheduling the model opted into (see the config getters):
+        # a block request whose in-flight steps reach max_tokens is not
+        # scheduled again, and a prefill that samples a first token is followed
+        # by an empty step so the engine streams that token first.
+        async_scheduling = bool(self.scheduler_config.async_scheduling)
+        self._async_block_exact_finish = (
+            async_scheduling
+            and self._is_block_output_model
+            and is_tt_async_block_exact_finish(self.vllm_config)
+        )
+        self._async_prefill_output_first = (
+            async_scheduling and is_tt_async_prefill_output_first(self.vllm_config)
+        )
+        self._prefill_output_pending = False
         speculative_config = self.vllm_config.speculative_config
         self.num_lookahead_tokens = max(
             self.num_lookahead_tokens,
@@ -609,12 +625,74 @@ class TTScheduler(AsyncScheduler):
         return deferred_queue
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # ``getattr``: host tests drive bare ``TTScheduler.__new__`` instances.
+        if getattr(self, "_prefill_output_pending", False):
+            self._prefill_output_pending = False
+            return self._schedule_nothing()
         deferred_resumes = self._take_preempted_requests_with_pending_outputs()
         try:
-            return self._schedule_without_pending_output_resumes(throttle_prefills)
+            with self._finished_block_requests_hidden():
+                return self._schedule_without_pending_output_resumes(throttle_prefills)
         finally:
             if deferred_resumes:
                 self.waiting.prepend_requests(deferred_resumes)
+
+    def _schedule_nothing(self) -> SchedulerOutput:
+        """An empty step (``tt_async_prefill_output_first``).
+
+        EngineCore's batch queue pops a step's output only once the queue is
+        full or the step it just scheduled is empty, so this step, scheduled
+        right after a prefill, makes the engine pop the prefill's output (and
+        stream its token) before the first decode step runs. The base pass
+        still runs, with every request hidden, so the step carries the
+        finished-request events like any other.
+        """
+        running = self.running
+        self.running = []
+        try:
+            with self._waiting_requests_hidden(lambda request: True):
+                return super().schedule()
+        finally:
+            self.running = running
+
+    @contextmanager
+    def _finished_block_requests_hidden(self) -> Iterator[None]:
+        """Keep out of one schedule the requests whose in-flight steps reach max_tokens.
+
+        Upstream's running loop skips a request once ``num_computed_tokens + 2 -
+        num_output_placeholders`` reaches the prompt plus ``max_tokens``: every
+        placeholder past the first counts as a draft that may be rejected. A
+        block step reserves K placeholders and commits exactly K tokens (the
+        width check in ``_update_request_with_output``), so that test schedules
+        one more block step at the end of every request, and its whole output
+        is trimmed. With ``tt_async_block_exact_finish`` the in-flight
+        placeholders count as committed output. The hidden requests go back to
+        their places in ``running``; requests the pass admitted stay after them.
+        """
+        # ``getattr``: host tests drive bare ``TTScheduler.__new__`` instances.
+        if not getattr(self, "_async_block_exact_finish", False):
+            yield
+            return
+        original = self.running
+        done = {
+            r
+            for r in original
+            if not r.is_prefill_chunk
+            and r.num_output_placeholders > 0
+            and r.num_output_tokens + r.num_output_placeholders >= r.max_tokens
+        }
+        if not done:
+            yield
+            return
+        self.running = [r for r in original if r not in done]
+        try:
+            yield
+        finally:
+            present = set(self.running) | done
+            known = set(original)
+            self.running = [r for r in original if r in present] + [
+                r for r in self.running if r not in known
+            ]
 
     def _schedule_without_pending_output_resumes(
         self, throttle_prefills: bool = False
@@ -1026,6 +1104,19 @@ class TTScheduler(AsyncScheduler):
             pending = self._pending_async_output_frames = {}
         for req_id in output_frame_req_ids:
             pending[req_id] = pending.get(req_id, 0) + 1
+        if (
+            getattr(self, "_async_prefill_output_first", False)
+            and self._forced_mode == TTSchedulingMode.DEFAULT
+        ):
+            # A step whose output-producing rows include a prompt's last chunk
+            # (computed before this step: below the prompt) samples a first
+            # token: the next schedule is the empty step that streams it.
+            self._prefill_output_pending = any(
+                self.requests[req_id].num_computed_tokens
+                - scheduler_output.num_scheduled_tokens[req_id]
+                < self.requests[req_id].num_prompt_tokens
+                for req_id in output_frame_req_ids
+            )
         if self.num_spec_tokens and not self.scheduler_config.async_scheduling:
             # ``AsyncScheduler`` leaves every scheduled request holding
             # ``[-1] * num_spec_tokens``, which upstream's GPU runner

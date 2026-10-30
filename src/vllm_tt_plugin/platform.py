@@ -28,6 +28,7 @@ from vllm_tt_plugin.config import (
     resolve_tt_prefill_chunk_tokens,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
+    store_tt_async_block_scheduling,
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
@@ -1964,6 +1965,24 @@ class TTPlatform(Platform):
                 f"{output_tokens_per_step}"
             )
         store_tt_block_kv_extent_tokens(vllm_config, block_kv_extent)
+        # Async block scheduling the model opts into (TTScheduler): count an
+        # in-flight block as committed output at max_tokens, and stream a
+        # prefill's token before the first decode step.
+        block_exact_finish = bool(
+            (model_capabilities or {}).get("tt_async_block_exact_finish", False)
+        )
+        prefill_output_first = bool(
+            (model_capabilities or {}).get("tt_async_prefill_output_first", False)
+        )
+        if block_exact_finish and output_tokens_per_step <= 1:
+            raise ValueError(
+                "tt_async_block_exact_finish requires output_tokens_per_step > 1"
+            )
+        store_tt_async_block_scheduling(
+            vllm_config,
+            exact_finish=block_exact_finish,
+            prefill_output_first=prefill_output_first,
+        )
         is_block_output_model = is_tt_block_output_model(vllm_config)
         if is_diffusion_gemma and not is_block_output_model:
             raise ValueError(
