@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import json
+import os
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from enum import Enum
@@ -12,6 +15,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
     RequestQueue,
+    SchedulingPolicy,
     create_request_queue,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -150,6 +154,16 @@ class TTDecodeInterleavePolicy:
         self._prefill_run = 0
         self._decode_run = 0
 
+    def configure(
+        self, *, enabled: bool, prefill_steps: int, decode_steps: int
+    ) -> None:
+        """Replace the bounds (TT_SCHED_POLICY_FILE); the counters restart."""
+        self._enabled = enabled
+        self._prefill_steps = prefill_steps
+        self._decode_steps = decode_steps
+        self._prefill_run = 0
+        self._decode_run = 0
+
     def wants_decode_step(
         self, *, has_pending_prefill: bool, has_running_decode: bool
     ) -> bool:
@@ -198,6 +212,117 @@ class TTDecodeInterleavePolicy:
         else:
             self._prefill_run += 1
             self._decode_run = 0
+
+
+class _SchedPolicyFile:
+    """Experiment knob: ``TT_SCHED_POLICY_FILE`` names a JSON object whose keys
+    replace the scheduling policy while the server runs, so one server can A/B
+    policies without a restart. Read again whenever the file's mtime changes.
+
+    Keys (each optional): ``decode_interleave_enabled``,
+    ``decode_interleave_prefill_steps``, ``decode_interleave_decode_steps`` and,
+    under the TT chunk core, ``prefill_gang_tokens`` and
+    ``prefill_gang_idle_tokens``. A key left out keeps its
+    configured value. Scheduling only: none of these changes what a step
+    computes, only which prompts and decodes a step carries.
+    """
+
+    _KEYS = (
+        "decode_interleave_enabled",
+        "decode_interleave_prefill_steps",
+        "decode_interleave_decode_steps",
+        "prefill_gang_tokens",
+        "prefill_gang_idle_tokens",
+    )
+
+    def __init__(self, path: str, interleave, chunk_policy) -> None:
+        self.path = path
+        self._mtime = None
+        self._base_interleave = (
+            interleave._enabled,
+            interleave._prefill_steps,
+            interleave._decode_steps,
+        )
+        self._base_chunk_policy = chunk_policy
+
+    def poll(self, scheduler: "TTScheduler") -> None:
+        try:
+            mtime = os.stat(self.path).st_mtime_ns
+        except OSError:
+            return
+        if mtime == self._mtime:
+            return
+        self._mtime = mtime
+        try:
+            with open(self.path) as f:
+                values = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.warning("TT_SCHED_POLICY_FILE %s unreadable: %s", self.path, e)
+            return
+        unknown = sorted(set(values) - set(self._KEYS))
+        if unknown:
+            logger.warning("TT_SCHED_POLICY_FILE: ignoring unknown keys %s", unknown)
+        enabled, prefill_steps, decode_steps = self._base_interleave
+        scheduler._decode_interleave.configure(
+            enabled=bool(values.get("decode_interleave_enabled", enabled)),
+            prefill_steps=int(
+                values.get("decode_interleave_prefill_steps", prefill_steps)
+            ),
+            decode_steps=int(
+                values.get("decode_interleave_decode_steps", decode_steps)
+            ),
+        )
+        policy = self._base_chunk_policy
+        if policy is not None:
+            policy = policy._replace(
+                gang_tokens=int(values.get("prefill_gang_tokens", policy.gang_tokens)),
+                gang_idle_tokens=int(
+                    values.get("prefill_gang_idle_tokens", policy.gang_idle_tokens)
+                ),
+            )
+        scheduler._prefill_chunk_policy = policy
+        logger.info(
+            "TT_SCHED_POLICY_FILE applied %s: interleave %s, chunk core %s",
+            values,
+            (
+                scheduler._decode_interleave._enabled,
+                scheduler._decode_interleave._prefill_steps,
+                scheduler._decode_interleave._decode_steps,
+            ),
+            policy,
+        )
+
+
+class _SchedTrace:
+    """Experiment trace: ``TT_SCHED_TRACE`` names a file that gets one JSON line
+    per scheduled step: wall time, kind, and per request [start, tokens, prompt
+    length] (prefill) or the row count (decode), plus the waiting and decoding
+    counts the step was chosen from."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def record(self, scheduler: "TTScheduler", out: SchedulerOutput, kind: str) -> None:
+        if not out.num_scheduled_tokens:
+            return
+        line = {"t": round(time.time(), 4), "kind": kind}
+        if kind == "decode":
+            line["rows"] = len(out.num_scheduled_tokens)
+        else:
+            line["reqs"] = {
+                req_id: [
+                    scheduler.requests[req_id].num_computed_tokens - n,
+                    n,
+                    scheduler.requests[req_id].num_tokens,
+                ]
+                for req_id, n in out.num_scheduled_tokens.items()
+            }
+        line["waiting"] = len(scheduler.waiting) + len(
+            getattr(scheduler, "skipped_waiting", None) or ()
+        )
+        line["decoding"] = sum(not r.is_prefill_chunk for r in scheduler.running)
+        with open(self.path, "a") as f:
+            f.write(json.dumps(line) + "\n")
 
 
 class TTScheduler(AsyncScheduler):
@@ -265,6 +390,16 @@ class TTScheduler(AsyncScheduler):
         # TT chunk core (models declaring tt_prefill_chunk_tokens), or None:
         # shapes what a prefill step contains; see _schedule_prefill_chunk_pass.
         self._prefill_chunk_policy = get_tt_prefill_chunk_policy(self.vllm_config)
+        policy_file = os.environ.get("TT_SCHED_POLICY_FILE")
+        self._policy_file = (
+            _SchedPolicyFile(
+                policy_file, self._decode_interleave, self._prefill_chunk_policy
+            )
+            if policy_file
+            else None
+        )
+        trace = os.environ.get("TT_SCHED_TRACE")
+        self._sched_trace = _SchedTrace(trace) if trace else None
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -609,6 +744,9 @@ class TTScheduler(AsyncScheduler):
         return deferred_queue
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        policy_file = getattr(self, "_policy_file", None)
+        if policy_file is not None:
+            policy_file.poll(self)
         deferred_resumes = self._take_preempted_requests_with_pending_outputs()
         try:
             return self._schedule_without_pending_output_resumes(throttle_prefills)
@@ -703,6 +841,9 @@ class TTScheduler(AsyncScheduler):
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput, *, is_decode: bool
     ) -> SchedulerOutput:
+        trace = getattr(self, "_sched_trace", None)
+        if trace is not None:
+            trace.record(self, scheduler_output, "decode" if is_decode else "prefill")
         if is_decode:
             rows = len(scheduler_output.num_scheduled_tokens)
             if rows > getattr(self, "_widest_decode_batch_size", 0):
@@ -779,6 +920,12 @@ class TTScheduler(AsyncScheduler):
           prompt then runs whole (a lone request's TTFT is unchanged, and a
           partial whose decoders left finishes in one step).
 
+        - Gangs (``gang_tokens`` > 0), when no prompt is partial: the step
+          carries the waiting prompts whole, in admission order, up to
+          ``gang_tokens`` while requests decode and up to the token budget (or
+          ``gang_idle_tokens``) while nothing does (``_prefill_gang``). A first
+          prompt over the cap takes the chunk path above instead.
+
         The platform sized the token budget so that it never splits a prompt;
         ``_check_prefill_chunk_alignment`` refuses any chunk off the grid.
         """
@@ -795,14 +942,20 @@ class TTScheduler(AsyncScheduler):
         def is_long(request: Request) -> bool:
             return request.num_tokens - request.num_computed_tokens > chunk
 
+        gang = None
+        if not partial_prefills and policy.gang_tokens:
+            gang = self._prefill_gang(policy, has_running_decode=has_running_decode)
+
         oldest_long = None
-        if not partial_prefills:
+        if not partial_prefills and gang is None:
             waiting_longs = [r for q in self._waiting_queues() for r in q if is_long(r)]
             # Request ordering is (priority, arrival_time): the long prompt the
             # base scheduler would admit first.
             oldest_long = min(waiting_longs) if waiting_longs else None
 
         def hidden(request: Request) -> bool:
+            if gang is not None:
+                return request.request_id not in gang
             if partial_prefills:
                 return policy.exclusive or is_long(request)
             return request is not oldest_long and is_long(request)
@@ -810,9 +963,10 @@ class TTScheduler(AsyncScheduler):
         scheduler_config = self.scheduler_config
         saved_threshold = scheduler_config.long_prefill_token_threshold
         # The base scheduler reads the threshold per request, for the partial
-        # in its running loop and for every admission in its waiting loop.
+        # in its running loop and for every admission in its waiting loop. A
+        # gang runs whole.
         scheduler_config.long_prefill_token_threshold = (
-            chunk if has_running_decode else 0
+            chunk if has_running_decode and gang is None else 0
         )
         try:
             with self._waiting_requests_hidden(hidden):
@@ -821,6 +975,44 @@ class TTScheduler(AsyncScheduler):
             scheduler_config.long_prefill_token_threshold = saved_threshold
         self._check_prefill_chunk_alignment(result, chunk)
         return result
+
+    def _prefill_gang(
+        self, policy: TTPrefillChunkPolicy, *, has_running_decode: bool
+    ) -> set[str] | None:
+        """The request ids of a gang step, or ``None`` for the chunk path.
+
+        A gang is the longest prefix, in the order the base scheduler admits
+        waiting requests, whose remaining tokens fit the step whole: the token
+        budget (``_schedule_prefill_only`` hides the decodes, so nothing else
+        spends it), the free seats, and ``gang_tokens`` while requests decode
+        (``gang_idle_tokens``, if set, while nothing does). It is ``None`` only
+        when the first prompt alone exceeds that cap; the chunk path then runs
+        it (whole while nothing decodes, split otherwise), as without gangs.
+
+        The admitted prompts emit their first tokens together, so their decodes
+        start in the same step: a decode that starts mid-way through the others'
+        prefills has them all in its inter-token gaps instead.
+        """
+        if self.policy == SchedulingPolicy.FCFS:
+            # _select_waiting_queue_for_scheduling: skipped_waiting drains first
+            order = [r for q in reversed(self._waiting_queues()) for r in q]
+        else:
+            order = sorted(r for q in self._waiting_queues() for r in q)
+        limit = self.max_num_scheduled_tokens
+        if has_running_decode:
+            limit = min(limit, policy.gang_tokens)
+        elif policy.gang_idle_tokens:
+            limit = min(limit, policy.gang_idle_tokens)
+        seats = self.max_num_running_reqs - len(self.running)
+        gang: set[str] = set()
+        used = 0
+        for request in order:
+            num_new = request.num_tokens - request.num_computed_tokens
+            if len(gang) >= seats or used + num_new > limit:
+                break
+            gang.add(request.request_id)
+            used += num_new
+        return gang if gang or not order else None
 
     def _waiting_queues(self) -> list[RequestQueue]:
         """The queues the base scheduler's waiting loop admits from."""

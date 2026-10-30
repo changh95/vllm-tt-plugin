@@ -26,6 +26,7 @@ from vllm_tt_plugin.config import (
     require_tt_output_tokens_per_step,
     resolve_tt_prefill_chunk_capabilities,
     resolve_tt_prefill_chunk_tokens,
+    resolve_tt_prefill_gang_tokens,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
@@ -263,6 +264,9 @@ def _apply_chunked_prefill_policy(
         model_capabilities
     )
     chunk_tokens = resolve_tt_prefill_chunk_tokens(vllm_config, chunk_unit)
+    gang_tokens, gang_idle_tokens = resolve_tt_prefill_gang_tokens(
+        vllm_config, chunk_unit
+    )
     store_tt_prefill_chunk_unit(vllm_config, chunk_unit)
     if (
         not supports_chunked_prefill
@@ -283,7 +287,9 @@ def _apply_chunked_prefill_policy(
         if off_reason is not None:
             _disable_chunked_prefill(vllm_config, f"{model_desc} ({off_reason})")
             return
-        policy = TTPrefillChunkPolicy(chunk_tokens, exclusive_chunks)
+        policy = TTPrefillChunkPolicy(
+            chunk_tokens, exclusive_chunks, gang_tokens, gang_idle_tokens
+        )
         # Only long_prefill_token_threshold may split a prompt, never the token
         # budget: one long prompt (at most max_model_len) plus a chunk for every
         # other seat must fit a single step.

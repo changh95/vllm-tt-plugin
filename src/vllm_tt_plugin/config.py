@@ -440,6 +440,10 @@ _PREFILL_CHUNK_UNIT_KEY = "_tt_prefill_chunk_unit"
 _PREFILL_CHUNK_POLICY_KEY = "_tt_prefill_chunk_policy"
 # Operator knob in the "tt" namespace: the chunk size, a multiple of the unit.
 _PREFILL_CHUNK_TOKENS_KNOB = "prefill_chunk_tokens"
+# Operator knobs in the "tt" namespace: the gang caps (0 = off / no cap); see
+# TTPrefillChunkPolicy.gang_tokens and gang_idle_tokens.
+_PREFILL_GANG_TOKENS_KNOB = "prefill_gang_tokens"
+_PREFILL_GANG_IDLE_TOKENS_KNOB = "prefill_gang_idle_tokens"
 
 
 class TTPrefillChunkPolicy(NamedTuple):
@@ -447,11 +451,19 @@ class TTPrefillChunkPolicy(NamedTuple):
 
     ``chunk_tokens``: every intermediate chunk starts and ends on a multiple of
     it. ``exclusive``: while a prompt is partial, a prefill step carries that
-    prompt and nothing else.
+    prompt and nothing else. ``gang_tokens`` (0 = off): a step that starts
+    prompts admits the waiting prompts whole, in admission order, as one gang:
+    while requests decode, those whose tokens add up to at most ``gang_tokens``
+    (the stall the gang puts on the decodes); while nothing decodes, all that fit
+    the step, or at most ``gang_idle_tokens`` when that is set (a burst's first
+    tokens then come out in several gangs). Only a first prompt over the cap is
+    split into chunks, as without gangs.
     """
 
     chunk_tokens: int
     exclusive: bool
+    gang_tokens: int = 0
+    gang_idle_tokens: int = 0
 
 
 def resolve_tt_prefill_chunk_capabilities(
@@ -513,6 +525,39 @@ def resolve_tt_prefill_chunk_tokens(vllm_config: "VllmConfig", unit: int) -> int
     return chunk
 
 
+def resolve_tt_prefill_gang_tokens(
+    vllm_config: "VllmConfig", unit: int
+) -> tuple[int, int]:
+    """Return ``(prefill_gang_tokens, prefill_gang_idle_tokens)`` of
+    ``additional_config['tt']``, each 0 when unset.
+
+    Gangs are a mode of the TT chunk core, so the knobs need a model that
+    declares ``tt_prefill_chunk_tokens``; the idle cap needs gangs on.
+    """
+    tt_config = get_tt_config(vllm_config)
+    values = []
+    for knob in (_PREFILL_GANG_TOKENS_KNOB, _PREFILL_GANG_IDLE_TOKENS_KNOB):
+        value = tt_config.get(knob, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"additional_config['tt']['{knob}'] must be an integer >= 0, "
+                f"got {value!r}"
+            )
+        if value and not unit:
+            raise ValueError(
+                f"additional_config['tt']['{knob}'] requires a model that "
+                "declares tt_prefill_chunk_tokens"
+            )
+        values.append(value)
+    gang, idle = values
+    if idle and not gang:
+        raise ValueError(
+            f"additional_config['tt']['{_PREFILL_GANG_IDLE_TOKENS_KNOB}'] requires "
+            f"'{_PREFILL_GANG_TOKENS_KNOB}'"
+        )
+    return gang, idle
+
+
 def get_tt_prefill_chunk_unit(vllm_config: "VllmConfig") -> int:
     """The model's declared ``tt_prefill_chunk_tokens`` (0 = undeclared)."""
     additional = getattr(vllm_config, "additional_config", None) or {}
@@ -541,7 +586,10 @@ def get_tt_prefill_chunk_policy(
     if stored is None:
         return None
     return TTPrefillChunkPolicy(
-        chunk_tokens=int(stored["chunk_tokens"]), exclusive=bool(stored["exclusive"])
+        chunk_tokens=int(stored["chunk_tokens"]),
+        exclusive=bool(stored["exclusive"]),
+        gang_tokens=int(stored.get("gang_tokens", 0)),
+        gang_idle_tokens=int(stored.get("gang_idle_tokens", 0)),
     )
 
 
@@ -561,4 +609,6 @@ def store_tt_prefill_chunk_policy(
     additional[_PREFILL_CHUNK_POLICY_KEY] = {
         "chunk_tokens": int(policy.chunk_tokens),
         "exclusive": bool(policy.exclusive),
+        "gang_tokens": int(policy.gang_tokens),
+        "gang_idle_tokens": int(policy.gang_idle_tokens),
     }

@@ -522,3 +522,225 @@ def test_chunk_core_under_async_scheduling():
     # the second long prompt and waits, then chunks next to the decoders.
     assert trace.spans("L1") == [(0, 5 * CHUNK + 9)]
     assert trace.spans("L2") == [(i * CHUNK, (i + 1) * CHUNK) for i in range(3)]
+
+
+# ------------------------------------------------------------------ gangs
+
+
+def _gang_scheduler(gang_tokens, **kwargs):
+    return _scheduler(
+        _ExclusiveChunkModel, tt={"prefill_gang_tokens": gang_tokens}, **kwargs
+    )
+
+
+def test_gang_knob_resolves_into_the_policy():
+    s = _gang_scheduler(8 * CHUNK)
+    assert s._prefill_chunk_policy == TTPrefillChunkPolicy(CHUNK, True, 8 * CHUNK)
+    assert _scheduler(_ExclusiveChunkModel)._prefill_chunk_policy.gang_tokens == 0
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_gang_knob_must_be_a_non_negative_integer(value):
+    with pytest.raises(ValueError, match="prefill_gang_tokens"):
+        _gang_scheduler(value)
+
+
+def test_gang_knob_needs_the_chunk_unit():
+    with pytest.raises(ValueError, match="prefill_gang_tokens"):
+        _scheduler(_PlainChunkedModel, tt={"prefill_gang_tokens": 1024})
+
+
+def test_gang_idle_cap_needs_gangs():
+    with pytest.raises(ValueError, match="prefill_gang_idle_tokens"):
+        _scheduler(_ExclusiveChunkModel, tt={"prefill_gang_idle_tokens": 1024})
+
+
+def test_gang_idle_cap_splits_a_burst_into_whole_gangs():
+    """With nothing decoding the idle cap bounds the gang; the rest follow as the
+    next gang while the first decode (gang_tokens), never split."""
+    s = _scheduler(
+        _ExclusiveChunkModel,
+        max_num_seqs=8,
+        tt={"prefill_gang_tokens": 4 * CHUNK, "prefill_gang_idle_tokens": 4 * CHUNK},
+    )
+    assert s._prefill_chunk_policy == TTPrefillChunkPolicy(
+        CHUNK, True, 4 * CHUNK, 4 * CHUNK
+    )
+    for i in range(4):
+        s.add_request(_request(f"g{i}", 2 * CHUNK))
+    assert _step(s)[1] == {"g0": (0, 2 * CHUNK), "g1": (0, 2 * CHUNK)}
+    assert _step(s)[1] == {"g2": (0, 2 * CHUNK), "g3": (0, 2 * CHUNK)}
+
+
+def test_gang_with_nothing_decoding_runs_every_waiting_prompt_whole_in_one_step():
+    """Without gangs one long prompt runs whole and the rest wait; a gang step
+    carries them all, so their first tokens come out of the same step."""
+    lengths = {"L1": 3 * CHUNK + 5, "L2": 4 * CHUNK, "S": 20, "L3": 2 * CHUNK + 1}
+    s = _gang_scheduler(CHUNK, max_num_seqs=8)
+    for req_id, n in lengths.items():
+        s.add_request(_request(req_id, n))
+    kind, spans = _step(s)
+    assert kind == "prefill"
+    assert spans == {r: (0, n) for r, n in lengths.items()}
+    assert not s.waiting
+
+
+def test_gang_while_decoding_is_bounded_by_gang_tokens():
+    s = _gang_scheduler(7 * CHUNK, max_num_seqs=8)
+    _start_decoders(s, 1)
+    for req_id in ("A", "B", "C"):
+        s.add_request(_request(req_id, 3 * CHUNK))
+    _, spans = _step(s)
+    assert spans == {"A": (0, 3 * CHUNK), "B": (0, 3 * CHUNK)}  # C would make 9
+    assert [r.request_id for r in s.waiting] == ["C"]
+    assert not any(r.is_prefill_chunk for r in s.running)
+
+
+def test_gang_keeps_admission_order_and_stops_at_the_first_misfit():
+    """A prefix: a small prompt behind one that does not fit waits its turn."""
+    s = _gang_scheduler(5 * CHUNK, max_num_seqs=8)
+    _start_decoders(s, 1)
+    s.add_request(_request("A", 2 * CHUNK))
+    s.add_request(_request("B", 4 * CHUNK))
+    s.add_request(_request("S", 10))
+    _, spans = _step(s)
+    assert spans == {"A": (0, 2 * CHUNK)}
+    assert [r.request_id for r in s.waiting] == ["B", "S"]
+
+
+def test_gang_first_prompt_over_the_budget_is_chunked_as_before():
+    s = _gang_scheduler(2 * CHUNK, max_num_seqs=8)
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 5 * CHUNK))
+    s.add_request(_request("S", 30))
+    trace = _Trace()
+    _run_until(s, lambda: _prompt_done(s, "L"), trace)
+    assert trace.spans("L") == [(i * CHUNK, (i + 1) * CHUNK) for i in range(5)]
+    # exclusive: S rode with L's first chunk (no partial yet), as without gangs
+    assert trace.spans("S") == [(0, 30)]
+    assert trace.steps[0][1] == {"L": (0, CHUNK), "S": (0, 30)}
+
+
+def test_gang_respects_free_seats():
+    s = _gang_scheduler(100 * CHUNK, max_num_seqs=3)
+    _start_decoders(s, 1)
+    for req_id in ("A", "B", "C"):
+        s.add_request(_request(req_id, 2 * CHUNK))
+    _, spans = _step(s)
+    assert spans == {"A": (0, 2 * CHUNK), "B": (0, 2 * CHUNK)}
+    assert [r.request_id for r in s.waiting] == ["C"]
+
+
+def test_gang_waits_for_a_partial_to_finish():
+    """A prompt split before the gang knob took effect (or one over the budget)
+    keeps the pipeline exclusively; the gang starts after its final chunk."""
+    s = _gang_scheduler(2 * CHUNK, max_num_seqs=8)
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 4 * CHUNK))
+    assert _step(s)[1] == {"L": (0, CHUNK)}
+    s.add_request(_request("A", CHUNK + 1))
+    s.add_request(_request("B", 20))
+    trace = _Trace()
+    _run_until(s, lambda: _prompt_done(s, "A"), trace)
+    prefills = [sp for kind, sp in trace.steps if kind == "prefill"]
+    assert prefills[:4] == [
+        {"L": (CHUNK, 2 * CHUNK)},
+        {"L": (2 * CHUNK, 3 * CHUNK)},
+        {"L": (3 * CHUNK, 4 * CHUNK)},
+        {"A": (0, CHUNK + 1), "B": (0, 20)},
+    ]
+
+
+def test_gang_steps_compose_with_the_decode_interleave():
+    s = _gang_scheduler(4 * CHUNK, interleave=True, max_num_seqs=8)
+    _start_decoders(s, 1)
+    assert _step(s)[0] == "decode"
+    kinds = []
+    for i in range(3):
+        s.add_request(_request(f"g{i}", 3 * CHUNK))
+        kinds.append(_step(s)[0])
+    # two gang steps, then the interleave's decode step; g2 runs after it
+    assert kinds == ["prefill", "prefill", "decode"]
+    assert _step(s)[1] == {"g2": (0, 3 * CHUNK)}
+
+
+def test_gang_under_async_scheduling():
+    s = _gang_scheduler(
+        6 * CHUNK, async_scheduling=True, interleave=True, max_num_seqs=8
+    )
+    s.add_request(_request("d0", 16, max_tokens=400))
+    for i in range(3):
+        s.add_request(_request(f"L{i}", 3 * CHUNK + i))
+    trace = _Trace()
+    inflight: deque = deque()
+    names = ("L0", "L1", "L2", "M0", "M1", "M2")
+    for step in range(200):
+        if step == 3:
+            for i in range(3):
+                s.add_request(_request(f"M{i}", 2 * CHUNK + i))
+        if step > 3 and all(r in s.requests and _prompt_done(s, r) for r in names):
+            break
+        out, tokens, kind, _ = _schedule(s, trace)
+        inflight.append((out, tokens))
+        if len(inflight) > 1 or kind == "idle":
+            done_out, done_tokens = inflight.popleft()
+            s.update_from_output(done_out, _runner_output(done_tokens))
+        assert not any(r.is_prefill_chunk for r in s.running)
+    else:
+        raise AssertionError("prompts did not finish")
+    # every prompt ran whole: the first four together (nothing decoded yet),
+    # the M prompts while d0 and the L prompts decode, at most 6 chunks a step
+    for r in names:
+        assert len(trace.spans(r)) == 1, (r, trace.spans(r))
+    assert {"d0", "L0", "L1", "L2"} == set(trace.steps[0][1])
+    for kind, sp in trace.steps[1:]:
+        if kind == "prefill":
+            assert sum(b - a for a, b in sp.values()) <= 6 * CHUNK
+
+
+# ------------------------------------------------------------------ policy file
+
+
+def test_policy_file_switches_gangs_and_the_interleave_at_runtime(
+    tmp_path, monkeypatch
+):
+    policy = tmp_path / "policy.json"
+    monkeypatch.setenv("TT_SCHED_POLICY_FILE", str(policy))
+    s = _scheduler(_ExclusiveChunkModel, interleave=True, max_num_seqs=8)
+    _start_decoders(s, 1)
+    s.add_request(_request("A", 3 * CHUNK))
+    assert _step(s)[1] == {"A": (0, CHUNK)}  # no file yet: the chunk path
+    _run_until(s, lambda: _prompt_done(s, "A"))
+    policy.write_text(
+        '{"prefill_gang_tokens": 4096, "decode_interleave_prefill_steps": 1}'
+    )
+    s.add_request(_request("B", 3 * CHUNK))
+    s.add_request(_request("C", 3 * CHUNK))
+    assert _step(s)[1] == {"B": (0, 3 * CHUNK), "C": (0, 3 * CHUNK)}
+    assert s._decode_interleave._prefill_steps == 1
+    s.add_request(_request("D", 3 * CHUNK))
+    assert _step(s)[0] == "decode"  # one prefill step, then the decode step
+    # a key left out of a new version returns to the configured value
+    policy.write_text("{}")
+    import os
+
+    os.utime(policy, ns=(1, 1))
+    assert _step(s)[1] == {"D": (0, CHUNK)}
+    assert s._prefill_chunk_policy == TTPrefillChunkPolicy(CHUNK, True)
+    assert s._decode_interleave._prefill_steps == 2
+
+
+def test_sched_trace_records_each_step(tmp_path, monkeypatch):
+    import json
+
+    trace_file = tmp_path / "trace.jsonl"
+    monkeypatch.setenv("TT_SCHED_TRACE", str(trace_file))
+    s = _scheduler(_ExclusiveChunkModel, max_num_seqs=8)
+    _start_decoders(s, 1)
+    s.add_request(_request("L", 3 * CHUNK))
+    _step(s)
+    _step(s)
+    lines = [json.loads(x) for x in trace_file.read_text().splitlines()]
+    assert [x["kind"] for x in lines] == ["prefill", "prefill", "prefill"]
+    assert lines[1]["reqs"] == {"L": [0, CHUNK, 3 * CHUNK]}
+    assert lines[1]["decoding"] == 1 and lines[1]["waiting"] == 0
