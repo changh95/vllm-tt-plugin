@@ -249,6 +249,39 @@ Every rule reads scheduling-side state that `schedule()` itself advances, so
 the core behaves the same under async scheduling. While the unit is declared,
 the runner passes `prefill_final_mask` to `prefill_forward`.
 
+#### Prefill gangs
+
+`--additional-config '{"tt": {"prefill_gang_tokens": G}}'` (default 0, off)
+changes what a prefill step that starts prompts contains. With no prompt
+partial, the step admits the waiting prompts whole, in admission order, as one
+gang. It takes the longest prefix whose remaining tokens fit:
+
+- the token budget and the free seats;
+- `G`, once some running request has had a decode step;
+- `prefill_gang_idle_tokens` (default 0: no cap beyond the budget) before
+  that. A request that has its first token but no decode step yet is still part
+  of the burst that admitted it.
+
+If the first waiting prompt alone exceeds the cap, the step falls back to the
+chunk rules above.
+
+Why: a TT step cannot mix prefill and decode rows. Prefill time that runs while
+a request decodes therefore lands in that request's inter-token gaps. Splitting
+or interleaving prefill more finely changes only how the stall is spread (ITL
+tail, TTFT), not how much stall a request's decode window holds. A gang's
+prompts emit their first tokens from the same step, so their decodes start
+together. Under a closed-loop load with fixed output lengths, each burst then
+prefills before the decode windows open instead of inside them: per-request
+TPOT approaches the decode step, and TTFT grows by the same prefill time.
+`prefill_gang_idle_tokens` trades between the two. A small `G` (about two
+chunks) keeps the stall a staggered arrival puts on running decodes close to
+the interleave's.
+
+Gangs only regroup whole prompts into steps. A prompt computes what it would
+compute alone, as long as the model's prefill of a prompt is independent of the
+other rows in its step, which the chunk core already assumes for the whole
+prompts it batches.
+
 ### Decode interleave
 
 Preferring prefill whenever prefill work is pending has one bad consequence.
