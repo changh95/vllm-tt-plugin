@@ -325,6 +325,13 @@ class _SchedTrace:
             f.write(json.dumps(line) + "\n")
 
 
+def _decode_started(request: Request) -> bool:
+    """Whether a running request has had a decode step scheduled: its prefill
+    yields one output token, each scheduled decode step one more (in flight
+    under async scheduling as a placeholder)."""
+    return request.num_output_tokens + request.num_output_placeholders > 1
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -885,6 +892,7 @@ class TTScheduler(AsyncScheduler):
                     chunk_policy,
                     partial_prefills,
                     has_running_decode=bool(pure_decodes),
+                    has_started_decode=any(map(_decode_started, pure_decodes)),
                 )
         finally:
             self.running.extend(pure_decodes)
@@ -906,6 +914,7 @@ class TTScheduler(AsyncScheduler):
         partial_prefills: list[Request],
         *,
         has_running_decode: bool,
+        has_started_decode: bool | None = None,
     ) -> SchedulerOutput:
         """Run the base prefill pass under the TT chunk core.
 
@@ -922,9 +931,10 @@ class TTScheduler(AsyncScheduler):
 
         - Gangs (``gang_tokens`` > 0), when no prompt is partial: the step
           carries the waiting prompts whole, in admission order, up to
-          ``gang_tokens`` while requests decode and up to the token budget (or
-          ``gang_idle_tokens``) while nothing does (``_prefill_gang``). A first
-          prompt over the cap takes the chunk path above instead.
+          ``gang_tokens`` once a running request has decoded
+          (``has_started_decode``) and up to the token budget (or
+          ``gang_idle_tokens``) before (``_prefill_gang``). A first prompt over
+          the cap takes the chunk path above instead.
 
         The platform sized the token budget so that it never splits a prompt;
         ``_check_prefill_chunk_alignment`` refuses any chunk off the grid.
@@ -944,7 +954,9 @@ class TTScheduler(AsyncScheduler):
 
         gang = None
         if not partial_prefills and policy.gang_tokens:
-            gang = self._prefill_gang(policy, has_running_decode=has_running_decode)
+            if has_started_decode is None:
+                has_started_decode = has_running_decode
+            gang = self._prefill_gang(policy, has_started_decode=has_started_decode)
 
         oldest_long = None
         if not partial_prefills and gang is None:
@@ -977,21 +989,24 @@ class TTScheduler(AsyncScheduler):
         return result
 
     def _prefill_gang(
-        self, policy: TTPrefillChunkPolicy, *, has_running_decode: bool
+        self, policy: TTPrefillChunkPolicy, *, has_started_decode: bool
     ) -> set[str] | None:
         """The request ids of a gang step, or ``None`` for the chunk path.
 
         A gang is the longest prefix, in the order the base scheduler admits
         waiting requests, whose remaining tokens fit the step whole: the token
         budget (``_schedule_prefill_only`` hides the decodes, so nothing else
-        spends it), the free seats, and ``gang_tokens`` while requests decode
-        (``gang_idle_tokens``, if set, while nothing does). It is ``None`` only
+        spends it), the free seats, and ``gang_tokens`` once a running request
+        has decoded (``gang_idle_tokens``, if set, before). It is ``None`` only
         when the first prompt alone exceeds that cap; the chunk path then runs
         it (whole while nothing decodes, split otherwise), as without gangs.
 
         The admitted prompts emit their first tokens together, so their decodes
         start in the same step: a decode that starts mid-way through the others'
-        prefills has them all in its inter-token gaps instead.
+        prefills has them all in its inter-token gaps instead. Requests that
+        have their first token but no decode step yet (``_decode_started``) do
+        not count as decoding: a burst that reached the engine over several
+        steps still forms one wave rather than splitting at ``gang_tokens``.
         """
         if self.policy == SchedulingPolicy.FCFS:
             # _select_waiting_queue_for_scheduling: skipped_waiting drains first
@@ -999,7 +1014,7 @@ class TTScheduler(AsyncScheduler):
         else:
             order = sorted(r for q in self._waiting_queues() for r in q)
         limit = self.max_num_scheduled_tokens
-        if has_running_decode:
+        if has_started_decode:
             limit = min(limit, policy.gang_tokens)
         elif policy.gang_idle_tokens:
             limit = min(limit, policy.gang_idle_tokens)

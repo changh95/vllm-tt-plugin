@@ -527,6 +527,13 @@ def test_chunk_core_under_async_scheduling():
 # ------------------------------------------------------------------ gangs
 
 
+def _start_decoding(scheduler, n):
+    """n requests past their first decode step (gang_tokens caps a gang once a
+    running request has decoded)"""
+    _start_decoders(scheduler, n)
+    assert _step(scheduler)[0] == "decode"
+
+
 def _gang_scheduler(gang_tokens, **kwargs):
     return _scheduler(
         _ExclusiveChunkModel, tt={"prefill_gang_tokens": gang_tokens}, **kwargs
@@ -587,7 +594,7 @@ def test_gang_with_nothing_decoding_runs_every_waiting_prompt_whole_in_one_step(
 
 def test_gang_while_decoding_is_bounded_by_gang_tokens():
     s = _gang_scheduler(7 * CHUNK, max_num_seqs=8)
-    _start_decoders(s, 1)
+    _start_decoding(s, 1)
     for req_id in ("A", "B", "C"):
         s.add_request(_request(req_id, 3 * CHUNK))
     _, spans = _step(s)
@@ -599,7 +606,7 @@ def test_gang_while_decoding_is_bounded_by_gang_tokens():
 def test_gang_keeps_admission_order_and_stops_at_the_first_misfit():
     """A prefix: a small prompt behind one that does not fit waits its turn."""
     s = _gang_scheduler(5 * CHUNK, max_num_seqs=8)
-    _start_decoders(s, 1)
+    _start_decoding(s, 1)
     s.add_request(_request("A", 2 * CHUNK))
     s.add_request(_request("B", 4 * CHUNK))
     s.add_request(_request("S", 10))
@@ -610,7 +617,7 @@ def test_gang_keeps_admission_order_and_stops_at_the_first_misfit():
 
 def test_gang_first_prompt_over_the_budget_is_chunked_as_before():
     s = _gang_scheduler(2 * CHUNK, max_num_seqs=8)
-    _start_decoders(s, 1)
+    _start_decoding(s, 1)
     s.add_request(_request("L", 5 * CHUNK))
     s.add_request(_request("S", 30))
     trace = _Trace()
@@ -623,7 +630,7 @@ def test_gang_first_prompt_over_the_budget_is_chunked_as_before():
 
 def test_gang_respects_free_seats():
     s = _gang_scheduler(100 * CHUNK, max_num_seqs=3)
-    _start_decoders(s, 1)
+    _start_decoding(s, 1)
     for req_id in ("A", "B", "C"):
         s.add_request(_request(req_id, 2 * CHUNK))
     _, spans = _step(s)
@@ -635,7 +642,7 @@ def test_gang_waits_for_a_partial_to_finish():
     """A prompt split before the gang knob took effect (or one over the budget)
     keeps the pipeline exclusively; the gang starts after its final chunk."""
     s = _gang_scheduler(2 * CHUNK, max_num_seqs=8)
-    _start_decoders(s, 1)
+    _start_decoding(s, 1)
     s.add_request(_request("L", 4 * CHUNK))
     assert _step(s)[1] == {"L": (0, CHUNK)}
     s.add_request(_request("A", CHUNK + 1))
@@ -653,7 +660,7 @@ def test_gang_waits_for_a_partial_to_finish():
 
 def test_gang_steps_compose_with_the_decode_interleave():
     s = _gang_scheduler(4 * CHUNK, interleave=True, max_num_seqs=8)
-    _start_decoders(s, 1)
+    _start_decoding(s, 1)
     assert _step(s)[0] == "decode"
     kinds = []
     for i in range(3):
@@ -744,3 +751,30 @@ def test_sched_trace_records_each_step(tmp_path, monkeypatch):
     assert [x["kind"] for x in lines] == ["prefill", "prefill", "prefill"]
     assert lines[1]["reqs"] == {"L": [0, CHUNK, 3 * CHUNK]}
     assert lines[1]["decoding"] == 1 and lines[1]["waiting"] == 0
+
+
+def test_gang_requests_without_a_decode_step_do_not_cap_the_next_gang():
+    """A burst that reaches the engine over two steps: the first gang's requests
+    have their first token but have not decoded, so the stragglers still form a
+    gang at the idle cap; once one of them has decoded, gang_tokens applies."""
+    s = _gang_scheduler(2 * CHUNK, max_num_seqs=8)
+    s.add_request(_request("a", 3 * CHUNK))
+    assert _step(s)[1] == {"a": (0, 3 * CHUNK)}
+    for req_id in ("b", "c"):
+        s.add_request(_request(req_id, 3 * CHUNK))
+    # a is running with its first token only: b and c run whole together
+    assert _step(s)[1] == {"b": (0, 3 * CHUNK), "c": (0, 3 * CHUNK)}
+    assert _step(s)[0] == "decode"
+    s.add_request(_request("d", 3 * CHUNK))
+    # now a, b, c have decoded: d is over gang_tokens and splits
+    assert _step(s)[1] == {"d": (0, CHUNK)}
+
+
+def test_gang_decode_started_counts_async_placeholders():
+    from vllm_tt_plugin.scheduler import _decode_started
+
+    r = _request("x", 10)
+    r.num_output_placeholders = 1  # the prefill's token in flight
+    assert not _decode_started(r)
+    r.num_output_placeholders = 2  # and the first decode's
+    assert _decode_started(r)
