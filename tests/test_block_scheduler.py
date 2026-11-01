@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
 import time
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,12 +29,13 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_tt_plugin.config import (
     store_tt_adaptive_block_output,
+    store_tt_async_block_scheduling,
     store_tt_block_kv_extent_tokens,
     store_tt_output_tokens_per_step,
 )
@@ -91,6 +93,8 @@ def _scheduler(
     adaptive: bool = False,
     max_num_seqs: int = 1,
     kv_extent: int = 0,
+    exact_finish: bool = False,
+    prefill_output_first: bool = False,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -136,6 +140,9 @@ def _scheduler(
         store_tt_adaptive_block_output(config, True)
     if kv_extent:
         store_tt_block_kv_extent_tokens(config, kv_extent)
+    store_tt_async_block_scheduling(
+        config, exact_finish=exact_finish, prefill_output_first=prefill_output_first
+    )
     num_blocks = max_model_len // BLOCK_SIZE + 2
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
@@ -1653,3 +1660,100 @@ def test_the_default_block_width_is_unchanged_by_the_declaration():
         output_width=CANVAS, adaptive=True, max_num_seqs=4, kv_extent=CANVAS + 8
     )
     assert sched.num_lookahead_tokens == 2 * CANVAS
+
+
+def _serve_with_batch_queue(scheduler: TTScheduler, request: Request) -> list:
+    """EngineCore.step_with_batch_queue (two deep) over ``scheduler`` for one
+    adaptive block request; the model commits a canvas on every block step and
+    one token on the prefill. Returns the engine's events in order: the kind of
+    each scheduled step ("prefill", "block", "empty") and ("emit", n) for each
+    output the engine pops."""
+    scheduler.add_request(request)
+    events: list = []
+    queue: deque = deque()
+    while scheduler.has_requests() or queue:
+        if scheduler.has_requests():
+            step = scheduler.schedule()
+            if step.total_num_scheduled_tokens == 0:
+                events.append("empty")
+                output = EMPTY_MODEL_RUNNER_OUTPUT
+            else:
+                block = get_tt_block_step_decisions(step)[request.request_id]
+                events.append("block" if block else "prefill")
+                output = _runner_output(step, [5] * (CANVAS if block else 1))
+            queue.appendleft((step, output))
+            if len(queue) < 2 and (
+                step.total_num_scheduled_tokens > 0 or scheduler.has_requests()
+            ):
+                continue
+        step, output = queue.pop()
+        for outputs in scheduler.update_from_output(step, output).values():
+            events += [("emit", len(o.new_token_ids)) for o in outputs.outputs]
+    return events
+
+
+@pytest.mark.parametrize("exact_finish", [False, True])
+def test_async_block_request_runs_no_block_past_max_tokens(exact_finish):
+    """Upstream's async skip counts all but one in-flight placeholder as
+    rejectable drafts, so it schedules one more block step once the in-flight
+    blocks already reach max_tokens; ``tt_async_block_exact_finish`` counts a
+    block step's canvas as committed and the request ends on its last block."""
+    max_tokens = 1 + 2 * CANVAS  # the prefill's token, then two whole canvases
+    scheduler = _scheduler(
+        async_scheduling=True, adaptive=True, exact_finish=exact_finish
+    )
+    request = _request(max_tokens)
+
+    events = _serve_with_batch_queue(scheduler, request)
+
+    assert events.count("block") == (2 if exact_finish else 3)
+    assert [e for e in events if e[0] == "emit"] == [
+        ("emit", 1),
+        ("emit", CANVAS),
+        ("emit", CANVAS),
+    ]
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    # the extra step's canvas is reserved and never committed
+    assert request.num_output_placeholders == (0 if exact_finish else CANVAS)
+
+
+@pytest.mark.parametrize("prefill_output_first", [False, True])
+def test_async_prefill_token_streams_before_the_first_block_step(
+    prefill_output_first,
+):
+    """The batch queue pops a step only once the next one has run, so the
+    prefill's token streams after the first block step; with
+    ``tt_async_prefill_output_first`` an empty step follows the prefill and the
+    engine pops the prefill's output before any block step runs."""
+    scheduler = _scheduler(
+        async_scheduling=True,
+        adaptive=True,
+        exact_finish=True,
+        prefill_output_first=prefill_output_first,
+    )
+    request = _request(1 + 2 * CANVAS)
+
+    events = _serve_with_batch_queue(scheduler, request)
+
+    first_emit = events.index(("emit", 1))
+    assert events[:2] == ["prefill", "empty" if prefill_output_first else "block"]
+    assert ("block" in events[:first_emit]) is not prefill_output_first
+    assert events.count("block") == 2
+    assert [e for e in events if e[0] == "emit"] == [
+        ("emit", 1),
+        ("emit", CANVAS),
+        ("emit", CANVAS),
+    ]
+
+
+def test_sync_scheduling_ignores_the_async_block_capabilities():
+    """Both are batch-queue remedies; a synchronous engine commits every step
+    before the next schedule, so neither may change it."""
+    scheduler = _scheduler(
+        async_scheduling=False,
+        adaptive=True,
+        exact_finish=True,
+        prefill_output_first=True,
+    )
+    assert not scheduler._async_block_exact_finish
+    assert not scheduler._async_prefill_output_first

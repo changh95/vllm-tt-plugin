@@ -235,6 +235,60 @@ def store_tt_block_kv_extent_tokens(vllm_config: "VllmConfig", extent: int) -> N
     additional[_BLOCK_KV_EXTENT_KEY] = int(extent)
 
 
+# Platform-derived; see _ADAPTIVE_BLOCK_OUTPUT_KEY. Both are block-output
+# scheduling choices under asynchronous scheduling that a model opts into.
+_ASYNC_BLOCK_EXACT_FINISH_KEY = "_tt_async_block_exact_finish"
+_ASYNC_PREFILL_OUTPUT_FIRST_KEY = "_tt_async_prefill_output_first"
+
+
+def is_tt_async_block_exact_finish(vllm_config: "VllmConfig") -> bool:
+    """Whether async scheduling stops a block request at in-flight max_tokens.
+
+    Upstream skips a request whose in-flight placeholders already reach
+    ``max_tokens``, but it counts every placeholder past the first as a draft
+    that may be rejected. A block step's K placeholders are all committed, so
+    upstream schedules one more block step at the end of every request, whose
+    output is then trimmed away: a whole block of device time before the
+    request's last tokens stream. A model whose block steps always commit their
+    full width declares ``tt_async_block_exact_finish``, and the scheduler
+    then counts the in-flight block as committed output.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_ASYNC_BLOCK_EXACT_FINISH_KEY, False))
+
+
+def is_tt_async_prefill_output_first(vllm_config: "VllmConfig") -> bool:
+    """Whether async scheduling streams a prefill's token before decode runs.
+
+    Under async scheduling the engine's batch queue pops a step's output only
+    after it has scheduled and executed the next step, so a prompt's first
+    token streams after the first decode step. For a model whose decode step
+    runs on the host to its end (nothing to overlap), that is the whole step
+    of extra time to first token. A model declaring
+    ``tt_async_prefill_output_first`` gets an empty step after each prefill
+    that samples a first token, so the engine pops the prefill's output first.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_ASYNC_PREFILL_OUTPUT_FIRST_KEY, False))
+
+
+def store_tt_async_block_scheduling(
+    vllm_config: "VllmConfig", *, exact_finish: bool, prefill_output_first: bool
+) -> None:
+    """Record the model's two async block-scheduling capabilities on the config.
+
+    Internal platform-to-runtime handoff from ``tt_async_block_exact_finish``
+    and ``tt_async_prefill_output_first``; the platform has validated them
+    against the block output width.
+    """
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_ASYNC_BLOCK_EXACT_FINISH_KEY] = bool(exact_finish)
+    additional[_ASYNC_PREFILL_OUTPUT_FIRST_KEY] = bool(prefill_output_first)
+
+
 def store_tt_output_tokens_per_step(
     vllm_config: "VllmConfig", output_tokens_per_step: int
 ) -> None:
