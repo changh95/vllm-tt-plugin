@@ -282,6 +282,16 @@ compute alone, as long as the model's prefill of a prompt is independent of the
 other rows in its step, which the chunk core already assumes for the whole
 prompts it batches.
 
+A model whose prefill streams a step's prompts through one pass (paying its
+pipeline fill and drain once per step, not once per prompt) may run them faster
+at a larger internal chunk than it would pick for a prompt alone. Choosing that
+chunk from the prompt's own length only keeps every prompt's numerics
+independent of its gang. That is a possible later tweak, not done: a fixed
+per-profile rule also slows single prompts and changes outputs against the
+current rule. On the resident Qwen3.8 rows build, 2K prompts streamed at 1024
+run 19% faster than at 512 (9,561 vs 8,037 prefill tok/s for 8 prompts). A 2K
+prompt alone is faster at 512 (391 vs 442 ms).
+
 ### Decode interleave
 
 Preferring prefill whenever prefill work is pending has one bad consequence.
