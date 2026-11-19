@@ -46,6 +46,8 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
+| `req_ids` | Supplied only when the model declares `prefix_resume` with `req_ids` (prefill and decode). One request id per submitted row. |
+| `tail_orders` | Supplied only to a `prefix_resume` model, on a prefill step where some row carries an order. One entry per row: `None`, or a dict with `"store": (slot, end, generation)` (after this row's chunk, which ends at `end`, save its state in `slot`) and/or `"restore": (slot, end, generation)` (this row resumes at `end`: use `slot`'s saved state). The scheduler never names one slot in both a store and a restore of the same step. |
 | `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
 For row `i`, `prefill_forward` computes

@@ -21,12 +21,18 @@ from vllm_tt_plugin.config import (
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
+    get_tt_prefix_resume,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     tt_requests_cannot_resume,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.prefix_resume import (
+    TAIL_ORDERS_ATTR,
+    PrefixResume,
+    PrefixResumeConfig,
+)
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 
 if TYPE_CHECKING:
@@ -97,6 +103,7 @@ TT_SCHEDULER_OUTPUT_FIELDS = (
     _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
     _TT_BLOCK_STEP_DECISIONS_ATTR,
     _TT_STEP_STATE_ATTR,
+    TAIL_ORDERS_ATTR,
 )
 
 
@@ -379,6 +386,12 @@ class TTScheduler(AsyncScheduler):
                 self._prefill_chunk_alignment,
             )
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
+        prefix_resume = get_tt_prefix_resume(self.vllm_config)
+        self._prefix_resume = (
+            PrefixResume(PrefixResumeConfig(**prefix_resume), self.kv_cache_manager)
+            if prefix_resume and self.kv_cache_manager.enable_caching
+            else None
+        )
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
@@ -909,7 +922,20 @@ class TTScheduler(AsyncScheduler):
         if pending_reset_discards:
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
+        prefix_resume = getattr(self, "_prefix_resume", None)
+        if prefix_resume is not None:
+            orders = prefix_resume.finalize(scheduler_output, self.requests, is_decode)
+            if orders:
+                set_tt_scheduler_output_field(
+                    scheduler_output, TAIL_ORDERS_ATTR, orders
+                )
         return scheduler_output
+
+    def _get_local_prefix_cache_hit(self, request: Request):
+        """vLLM's local hit, capped to a saved tail for a prefix-resume model."""
+        hit = super()._get_local_prefix_cache_hit(request)
+        prefix_resume = getattr(self, "_prefix_resume", None)
+        return hit if prefix_resume is None else prefix_resume.cap_hit(request, hit)
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests and partial continuations.

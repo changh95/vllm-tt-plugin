@@ -46,6 +46,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    get_tt_prefix_resume,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     get_tt_supports_device_grammar,
@@ -79,6 +80,11 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.prefix_resume import (
+    get_tail_orders,
+    prefix_resume_kwargs,
+    tail_orders_for_rows,
+)
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
@@ -310,6 +316,7 @@ class TTModelRunner:
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+        self._prefix_resume = get_tt_prefix_resume(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
         self._shutdown_complete = False
         self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
@@ -2774,6 +2781,11 @@ class TTModelRunner:
             slot_remap = self._decode_state_slot_remap(row_req_ids)
 
         grammar_rows_per_request = self._spec_grammar_rows_per_request(scheduler_output)
+        prefix_tail_orders = (
+            tail_orders_for_rows(get_tail_orders(scheduler_output), row_req_ids)
+            if is_prompt
+            else None
+        )
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -2793,6 +2805,7 @@ class TTModelRunner:
             output_tokens=output_tokens,
             decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
+            prefix_tail_orders=prefix_tail_orders,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[bad_words_token_ids],
@@ -4137,6 +4150,11 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        kwargs.update(
+            prefix_resume_kwargs(
+                getattr(self, "_prefix_resume", None), model_input, prefill=True
+            )
+        )
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)

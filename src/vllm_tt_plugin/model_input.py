@@ -175,6 +175,11 @@ class TTModelInput:
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
+    # Prefill-only, prefix-resume models only (prefix_resume.py): one entry per
+    # row, None or {"restore": (slot, end, generation), "store": (...)}; None
+    # when no row of the step carries an order.
+    prefix_tail_orders: list[dict | None] | None = None
+
     # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
     # drafts the block's columns 1..K carry, kept alongside the block because
     # the accept walk needs them again after the verify returns. ``spec_mode``

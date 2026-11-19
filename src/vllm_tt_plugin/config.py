@@ -254,6 +254,32 @@ def store_tt_block_kv_extent_tokens(vllm_config: "VllmConfig", extent: int) -> N
     additional[_BLOCK_KV_EXTENT_KEY] = int(extent)
 
 
+# Platform-derived from model_capabilities["prefix_resume"]; see prefix_resume.py.
+_PREFIX_RESUME_KEY = "_tt_prefix_resume"
+
+
+def get_tt_prefix_resume(vllm_config: "VllmConfig") -> dict[str, Any] | None:
+    """The validated prefix_resume capability, or None (absent, or prefix caching off).
+
+    Read by the scheduler (the hit cap, the tail directory, prompt-only caching)
+    and by the model runner (request ids and tail orders to the model).
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    value = additional.get(_PREFIX_RESUME_KEY)
+    return dict(value) if value else None
+
+
+def store_tt_prefix_resume(
+    vllm_config: "VllmConfig", resolved: dict[str, Any] | None
+) -> None:
+    """Record the platform's resolution of the prefix_resume capability."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_PREFIX_RESUME_KEY] = dict(resolved) if resolved else None
+
+
 def store_tt_output_tokens_per_step(
     vllm_config: "VllmConfig", output_tokens_per_step: int
 ) -> None:

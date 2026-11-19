@@ -44,6 +44,7 @@ from vllm_tt_plugin.config import (
     validate_tt_scheduler_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.prefix_resume import resolve_and_store_prefix_resume
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     resolve_speculative_plan,
@@ -2214,6 +2215,9 @@ class TTPlatform(Platform):
         logger.info(
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
+        )
+        resolve_and_store_prefix_resume(
+            vllm_config, model_capabilities, model_class, supports_prefix_caching
         )
 
         if is_block_output_model:
