@@ -13,9 +13,52 @@ import torch
 from vllm.v1.sample.ops.topk_topp_sampler import (
     TopKTopPSampler,
     apply_top_k_top_p,
+    empty_exponential_noise_like,
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import Sampler
+
+# Largest top-k served by the top-k-first path; a larger k (or none: vLLM passes
+# the vocab size) takes vLLM's full-vocab sort.
+_TOPK_FIRST_MAX_K = 1024
+# Candidates taken beyond max(k): top-k keeps every logit tied with the k-th
+# largest, and device logits are bf16, so ties at the boundary are common.
+_TOPK_FIRST_TIE_MARGIN = 64
+
+
+def topk_first_filter(logits, k, p):
+    """The candidates apply_top_k_top_p would leave, without sorting the vocab.
+
+    Returns (values, vocab indices), each [batch, max(k) + margin]: the top
+    logits of every row in ascending order, with the ones apply_top_k_top_p
+    masks set to -inf. The masks follow vLLM's: top-k keeps every logit >= the
+    row's k-th largest (ties included), and top-p runs on the kept logits in
+    ascending order over float32 softmax and cumsum (the removed ones
+    contribute 0 to both). Where the top-p cut falls inside a run of equal
+    logits, vLLM's unstable sort decides which of them go; here the lower vocab
+    indices go first, as in a stable ascending sort, so the kept count and
+    probabilities match and the choice is deterministic. Returns None when a
+    row has more logits tied at its k-th value than the candidates hold, which
+    only the full sort keeps.
+    """
+    k = k.to(torch.long)
+    width = min(logits.shape[1], int(k.max()) + _TOPK_FIRST_TIE_MARGIN)
+    values, indices = logits.topk(width, dim=-1)
+    kth = values.gather(1, (k - 1).unsqueeze(1))
+    if not torch.equal((logits >= kth).sum(dim=1), (values >= kth).sum(dim=1)):
+        return None
+    # ascending by value, ties by vocab index
+    by_index = indices.argsort(dim=-1)
+    values, indices = values.gather(1, by_index), indices.gather(1, by_index)
+    values, order = values.sort(dim=-1, stable=True)
+    indices = indices.gather(1, order)
+    values = values.masked_fill(values < kth, -float("inf"))
+    if p is not None:
+        probs_sum = values.softmax(dim=-1, dtype=torch.float32).cumsum(dim=-1)
+        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+        top_p_mask[:, -1] = False
+        values = values.masked_fill(top_p_mask, -float("inf"))
+    return values, indices
 
 
 @dataclass
@@ -54,6 +97,10 @@ class TTTopKTopPSampler(TopKTopPSampler):
 
     def forward_native(self, logits, generators, k, p):
         batch, vocab = logits.shape
+        if not generators and self._topk_first_applies(logits, k):
+            sampled = self._sample_topk_first(logits, k, p)
+            if sampled is not None:
+                return sampled, None
         if (
             logits.device.type != "cpu"
             or batch == 0
@@ -68,6 +115,33 @@ class TTTopKTopPSampler(TopKTopPSampler):
         # generator itself, and verify its complete state before reusing noise.
         with self._sampling_lock:
             return self._sample_seeded(logits, generators, k, p)
+
+    def _topk_first_applies(self, logits, k):
+        # Seeded rows keep the full-vocab noise of their generators; the
+        # processed logprob modes return full-vocab processed logits.
+        batch, vocab = logits.shape
+        return (
+            k is not None
+            and batch > 0
+            and logits.device.type == "cpu"
+            and self.logprobs_mode not in ("processed_logits", "processed_logprobs")
+            and int(k.min()) >= 1
+            and int(k.max()) <= min(_TOPK_FIRST_MAX_K, vocab - 1)
+        )
+
+    def _sample_topk_first(self, logits, k, p):
+        """Unseeded rows with top-k: the same distribution as vLLM's
+        forward_native, with top-p and the exponential-noise draw over the
+        max(k) candidates instead of the vocab. None: take the full path."""
+        filtered = topk_first_filter(logits, k, p)
+        if filtered is None:
+            return None
+        values, indices = filtered
+        probs = values.softmax(dim=-1, dtype=torch.float32)
+        q = empty_exponential_noise_like(probs, self.use_fp64_gumbel)
+        q.exponential_()
+        chosen = sample_with_exponential_noise(probs, q)
+        return indices.gather(1, chosen.unsqueeze(1)).view(-1)
 
     def _sample_seeded(self, logits, generators, k, p):
         batch, vocab = logits.shape
