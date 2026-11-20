@@ -257,6 +257,38 @@ class TTHostSampler(Sampler):
             return logits
         return Sampler.apply_temperature(logits, temp, all_random)
 
+    @staticmethod
+    def apply_penalties(logits, sampling_metadata, output_token_ids):
+        # vLLM builds [rows, vocab] bin counts and masks for the prompt and the
+        # output every step and scales every logit; on CPU, touch only the
+        # tokens each penalized row has seen. Same operations in the same order
+        # and dtypes as vLLM's apply_penalties, so the logits are bit-identical.
+        if sampling_metadata.no_penalties or logits.device.type != "cpu":
+            return Sampler.apply_penalties(logits, sampling_metadata, output_token_ids)
+        vocab = logits.shape[1]
+        presence = sampling_metadata.presence_penalties
+        frequency = sampling_metadata.frequency_penalties
+        repetition = sampling_metadata.repetition_penalties
+        for row in range(logits.shape[0]):
+            p, f, r = presence[row], frequency[row], repetition[row]
+            if p == 0 and f == 0 and r == 1:
+                continue
+            # async scheduling leaves -1 placeholders that vLLM ignores
+            out = torch.tensor(
+                [t for t in output_token_ids[row] if 0 <= t < vocab], dtype=torch.long
+            )
+            if r != 1:
+                prompt = sampling_metadata.prompt_token_ids[row]
+                seen = torch.cat([prompt[prompt < vocab].to(torch.long), out]).unique()
+                values = logits[row, seen]
+                scaling = torch.where(values > 0, 1.0 / r, r)
+                logits[row, seen] = (values * scaling).to(logits.dtype)
+            if out.numel():
+                ids, counts = out.unique(return_counts=True)
+                logits[row, ids] -= f * counts
+                logits[row, ids] -= p
+        return logits
+
 
 def create_host_sampler():
     sampler = TTHostSampler()
