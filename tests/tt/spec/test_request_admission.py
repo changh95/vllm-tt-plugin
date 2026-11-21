@@ -9,8 +9,9 @@ logprobs, structured output, ``allowed_token_ids``, ``bad_words`` and
 only ``argmax_ids`` admits them when it supports narrow decode
 (``TT_SPEC_DRAFT_POLICY=solo``), decoding such a request without speculation,
 and otherwise refuses each with HTTP 400 rather than answering without it.
-``logit_bias`` is refused on every speculating launch, by vLLM itself before
-the plugin.
+No accept walk applies ``logit_bias`` or ``min_p``: a launch with narrow decode
+admits them and decodes such a request without speculation, and any other
+speculating launch refuses them, in vLLM itself before the plugin.
 """
 
 from __future__ import annotations
@@ -44,11 +45,23 @@ def test_a_control_is_admitted_exactly_when_logits_or_narrow_decode_serve_it(
     assert "cannot serve" in str(result.body), result.body
 
 
-def test_logit_bias_is_refused_on_every_speculating_launch(
-    spec_server, ascending_prompt, record
+ORDINARY_DECODE_CONTROLS = {
+    "logit_bias": {"logit_bias": {"17": 1.0}},
+    "min_p": {"temperature": 0.8, "min_p": 0.1, "seed": 7},
+}
+
+
+@pytest.mark.parametrize("name", list(ORDINARY_DECODE_CONTROLS))
+def test_logit_bias_and_min_p_are_admitted_exactly_with_narrow_decode(
+    spec_server, spec_config, ascending_prompt, record, name
 ):
     result = spec_server.complete(
-        ascending_prompt(16, start=3100), max_tokens=4, logit_bias={"17": 1.0}
+        ascending_prompt(16, start=3100),
+        max_tokens=4,
+        **ORDINARY_DECODE_CONTROLS[name],
     )
     record(status=result.status, body=result.body)
+    if spec_config.draft_policy != "always":
+        assert result.status == 200, result.body
+        return
     assert result.status == 400, result.body

@@ -430,6 +430,7 @@ If you add a new class-level attribute to `TTPlatform`, add its name to
 The same autouse fixture, `reset_tt_platform_class_state` in
 `tests/conftest.py`, also saves and restores the patches `platform.py`
 installs: `InputProcessor.process_inputs`,
+`SamplingParams._validate_spec_decode`,
 `AsyncLLM._add_streaming_input_request`, `EngineCore.reset_prefix_cache`,
 `EngineCore.pause_scheduler`, `EngineCoreProc.pause_scheduler`, and the
 `_tt_original_*` markers. A new `_install_*_patch` must extend that restore

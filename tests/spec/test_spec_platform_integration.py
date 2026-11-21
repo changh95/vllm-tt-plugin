@@ -409,22 +409,46 @@ def test_a_model_serving_logits_admits_every_control_the_walk_applies(
     _validate(SamplingParams(temperature=0.8, seed=3, **{field: value()}))
 
 
-@pytest.mark.parametrize("modes", [("argmax_ids",), ("argmax_ids", "logits")])
-def test_logit_bias_stays_refused_whatever_the_model_serves(
-    monkeypatch, vllm_config, modes
-):
-    """vLLM refuses it on a speculating launch first; this is the backstop.
-
-    A request built past vLLM's own validation must not reach a walk that has
-    no logit-bias step.
-    """
+def _ordinary_decode_params(control):
     from vllm.sampling_params import SamplingParams
 
+    if control == "logit_bias":
+        params = SamplingParams(temperature=0.0)
+        params.logit_bias = {3: 1.0}
+        return params
+    if control == "tiny min_p":
+        return SamplingParams(temperature=0.7, min_p=1e-6)
+    return SamplingParams(temperature=0.7, min_p=0.1)
+
+
+@pytest.mark.parametrize("control", ["logit_bias", "min_p", "tiny min_p"])
+@pytest.mark.parametrize("modes", [("argmax_ids",), ("argmax_ids", "logits")])
+def test_logit_bias_and_min_p_are_refused_where_every_step_verifies(
+    monkeypatch, vllm_config, modes, control
+):
+    """No accept walk applies either, the logits walk included.
+
+    vLLM refuses both on such a launch first; this is the backstop for a
+    request built past vLLM's own validation. A ``min_p`` at or below vLLM's
+    1e-5 threshold passes vLLM and, on this launch, reaches no path that
+    applies it, so the plugin refuses it rather than ignoring it.
+    """
+    _speculating_platform(
+        monkeypatch, vllm_config, supports_narrow_decode=False, accept_modes=modes
+    )
+    with pytest.raises(VLLMValidationError, match=control.split()[-1]) as refused:
+        _validate(_ordinary_decode_params(control))
+    assert "supports_narrow_decode" in str(refused.value)
+
+
+@pytest.mark.parametrize("control", ["logit_bias", "min_p", "tiny min_p"])
+@pytest.mark.parametrize("modes", [("argmax_ids",), ("argmax_ids", "logits")])
+def test_logit_bias_and_min_p_are_admitted_with_narrow_decode(
+    monkeypatch, vllm_config, modes, control
+):
+    """They decode without speculation, whatever the model serves."""
     _speculating_platform(monkeypatch, vllm_config, accept_modes=modes)
-    params = SamplingParams(temperature=0.0)
-    params.logit_bias = {3: 1.0}
-    with pytest.raises(VLLMValidationError, match="logit_bias"):
-        _validate(params)
+    _validate(_ordinary_decode_params(control))  # must not raise
 
 
 _SAMPLED = [
@@ -515,6 +539,8 @@ def test_a_greedy_request_is_served_where_every_step_verifies(monkeypatch, vllm_
         {"temperature": 0.0, "repetition_penalty": 1.0},
         {"temperature": 0.0, "repetition_penalty": 0.9},
         {"temperature": 0.0, "top_p": 0.5, "top_k": 4, "min_p": 0.1},
+        {"temperature": 0.0, "logit_bias": {3: 1.0}},
+        {"temperature": 0.0, "logit_bias": {3: 0.0}},
     ],
 )
 def test_admission_refuses_exactly_what_the_runner_will_not_speculate(
@@ -544,20 +570,22 @@ def test_admission_refuses_exactly_what_the_runner_will_not_speculate(
         block_sizes=[16],
         kernel_block_sizes=[16],
     )
-    batch.add_request(
-        CachedRequestState(
-            req_id="r0",
-            prompt_token_ids=[1, 2, 3],
-            mm_features=None,
-            sampling_params=params,
-            generator=None,
-            block_ids=([0],),
-            num_computed_tokens=3,
-            output_token_ids=[],
-        )
+    request = CachedRequestState(
+        req_id="r0",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        sampling_params=params,
+        generator=None,
+        block_ids=([0],),
+        num_computed_tokens=3,
+        output_token_ids=[],
     )
+    batch.add_request(request)
     runner = object.__new__(TTModelRunner)
     runner.input_batch = batch
+    # The runner reads a request's controls from its state as well as from
+    # the batch's sets.
+    runner.requests = {"r0": request}
     speculable = TTModelRunner._request_is_speculable(runner, "r0")
 
     # The runner above holds no accept modes, so it judges as an argmax_ids

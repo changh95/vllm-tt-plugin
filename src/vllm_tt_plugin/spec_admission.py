@@ -327,7 +327,39 @@ def resolve_speculative_plan(
     return outcome
 
 
+def ordinary_decode_controls(params) -> list[str]:
+    """The controls on ``params`` that no accept walk applies, by name.
+
+    ``logit_bias``, and a ``min_p`` that takes effect: neither the greedy walk
+    nor the ``logits`` walk (``spec_accept``) applies either, so a request
+    carrying one is never answered by a verify in any accept mode. On a launch
+    whose plan keeps ``supports_narrow_decode`` it decodes without
+    speculation, sampled on the host by vLLM's own processors
+    (``build_host_logitsprocs``); without narrow decode every step is a verify
+    and admission refuses it. Empty when the request carries neither.
+
+    Any non-empty ``logit_bias`` counts, an all-zero one included: that costs
+    the request its speculation and changes nothing it emits. ``min_p`` takes
+    effect when it is above 0 on a request that is not greedy, which is when
+    vLLM's ``MinPLogitsProcessor`` applies it. vLLM's ``SamplingParams``
+    already resets ``min_p`` to 0 below ``_SAMPLING_EPS`` temperature, and the
+    temperature test keeps this answer independent of that. Not vLLM's own
+    1e-5 refusal threshold: the ordinary decode applies a smaller ``min_p``
+    too, so a request carrying one would otherwise be speculated by the
+    ``logits`` walk without it on some steps and sampled with it on others.
+    """
+    from vllm.sampling_params import _SAMPLING_EPS
+
+    controls = []
+    if params.logit_bias:
+        controls.append("logit_bias")
+    if params.min_p > 0.0 and params.temperature >= _SAMPLING_EPS:
+        controls.append(f"min_p={params.min_p!r}")
+    return controls
+
+
 __all__ = [
     "method_requirements",
+    "ordinary_decode_controls",
     "resolve_speculative_plan",
 ]

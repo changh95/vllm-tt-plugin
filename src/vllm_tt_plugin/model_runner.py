@@ -30,7 +30,7 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_tt_plugin.async_decode import (
@@ -56,7 +56,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
     is_tt_device_grammar_preload_eligible,
 )
-from vllm_tt_plugin.host_sampler import create_host_sampler
+from vllm_tt_plugin.host_sampler import build_host_logitsprocs, create_host_sampler
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
     InputBatch,
@@ -86,7 +86,10 @@ from vllm_tt_plugin.prefix_resume import (
     tail_orders_for_rows,
 )
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
-from vllm_tt_plugin.spec_admission import method_requirements
+from vllm_tt_plugin.spec_admission import (
+    method_requirements,
+    ordinary_decode_controls,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
@@ -496,12 +499,11 @@ class TTModelRunner:
 
         # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
         # custom logits processors). Used by the host sampler when device
-        # sampling isn't supported for a given batch.
-        self._host_logitsprocs: LogitsProcessors = build_logitsprocs(
-            vllm_config=vllm_config,
-            device=torch.device("cpu"),
-            is_pin_memory=False,
-            is_pooling_model=False,
+        # sampling isn't supported for a given batch. A speculating launch with
+        # narrow decode keeps min_p and logit_bias (``build_host_logitsprocs``).
+        self._host_logitsprocs: LogitsProcessors = build_host_logitsprocs(
+            vllm_config,
+            self._spec_plan,
             custom_logitsprocs=(self.model_config.logits_processors or ()),
         )
 
@@ -1598,12 +1600,20 @@ class TTModelRunner:
         A model that serves ``logits`` lets a verify walk acceptance against
         the target distribution under the request's own temperature, top-k,
         top-p, penalties, seed, token filters and grammar, and return its
-        logprobs, which covers every control admission lets through on a
-        speculating launch, whichever proposer drafted. Without it only the
-        greedy walk exists, which also certifies a sampled request on a model
-        declaring ``spec_ids_are_sampled`` when the step samples on the device
+        logprobs, whichever proposer drafted. Without it only the greedy walk
+        exists, which also certifies a sampled request on a model declaring
+        ``spec_ids_are_sampled`` when the step samples on the device
         (``device_sampled``; see ``_request_is_argmax_certifiable``).
+
+        Neither walk applies ``logit_bias`` or ``min_p``, so a request carrying
+        either (``ordinary_decode_controls``) is not speculable in any mode:
+        admission lets it onto a launch with narrow decode only, where every
+        step it shares is the ordinary decode.
         """
+        req_state = getattr(self, "requests", {}).get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        if params is not None and ordinary_decode_controls(params):
+            return False
         if ACCEPT_MODE_LOGITS in getattr(self, "_spec_accept_modes", ()):
             return True
         return self._request_is_argmax_certifiable(req_id, device_sampled)
@@ -1665,7 +1675,10 @@ class TTModelRunner:
         an ``argmax_ids`` launch with narrow decode they keep the request off
         the drafts, so every step it shares is the ordinary decode
         (``_step_verifies``), which applies them; admission refuses them only
-        on a launch with neither ``logits`` nor narrow decode.
+        on a launch with neither ``logits`` nor narrow decode. ``logit_bias``
+        and a ``min_p`` that takes effect are uncertifiable too, but no walk
+        applies them, so ``_request_is_speculable`` rules them out before any
+        mode is chosen.
         """
         batch = self.input_batch
         draws_ids = bool(device_sampled) and bool(
@@ -1700,6 +1713,7 @@ class TTModelRunner:
                 params.min_tokens > len(req_state.output_token_ids)
                 and bool(params.all_stop_token_ids)
             )
+            or bool(ordinary_decode_controls(params))
         )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

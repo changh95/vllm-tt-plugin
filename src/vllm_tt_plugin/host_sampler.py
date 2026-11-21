@@ -190,3 +190,43 @@ def create_host_sampler():
         sampler.logprobs_mode, sampler.use_fp64_gumbel
     )
     return sampler
+
+
+def build_host_logitsprocs(vllm_config, spec_plan, custom_logitsprocs=()):
+    """The logits processors the host sampler applies on this launch.
+
+    vLLM's ``build_logitsprocs``, except on a speculating launch whose plan
+    keeps ``supports_narrow_decode``. There vLLM builds only
+    ``MinTokensLogitsProcessor``, because its speculative samplers apply no
+    ``min_p`` or ``logit_bias``. A TT launch with narrow decode serves a
+    request carrying either without speculation
+    (``spec_admission.ordinary_decode_controls``): every step it shares
+    is the ordinary decode, sampled here. So it gets vLLM's whole builtin set,
+    as the same server without speculation would. Custom processors stay
+    refused on every speculating launch, with vLLM's own message.
+    """
+    from vllm.v1.sample.logits_processor import (
+        BUILTIN_LOGITS_PROCESSORS,
+        STR_SPEC_DEC_REJECTS_LOGITSPROCS,
+        LogitsProcessors,
+        build_logitsprocs,
+    )
+
+    device = torch.device("cpu")
+    if not (
+        vllm_config.speculative_config is not None
+        and spec_plan is not None
+        and spec_plan.supports_narrow_decode
+    ):
+        return build_logitsprocs(
+            vllm_config=vllm_config,
+            device=device,
+            is_pin_memory=False,
+            is_pooling_model=False,
+            custom_logitsprocs=custom_logitsprocs,
+        )
+    if custom_logitsprocs:
+        raise ValueError(STR_SPEC_DEC_REJECTS_LOGITSPROCS)
+    return LogitsProcessors(
+        ctor(vllm_config, device, False) for ctor in BUILTIN_LOGITS_PROCESSORS
+    )

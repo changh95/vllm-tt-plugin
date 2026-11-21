@@ -805,9 +805,12 @@ serves only `argmax_ids` and supports narrow decode, those five decode without
 speculation, as a sampled request does: the request is offered no drafts and
 every step it shares runs as the ordinary decode, which applies them. Without
 narrow decode every step is a verify, so `TTPlatform.validate_request` rejects
-them on a speculative launch. `logit_bias` is rejected on every speculative
-launch, and vLLM itself rejects it first. Prompt logprobs remain unsupported
-for all TT models. Only vLLM's Python frontend runs these checks, so a
+them on a speculative launch. No accept walk applies `logit_bias` or a
+`min_p` that takes effect, `logits` included: with narrow decode a request
+carrying either decodes without speculation in every accept mode, sampled on
+the host by vLLM's own processors, and without it vLLM itself rejects the
+request on a speculative launch. Prompt logprobs remain unsupported for all
+TT models. Only vLLM's Python frontend runs these checks, so a
 speculative launch with `VLLM_USE_RUST_FRONTEND=1` is refused at startup.
 
 See [the model contract](docs/SPEC_DECODE_CONTRACT.md) for candidate shapes,

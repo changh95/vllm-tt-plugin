@@ -30,8 +30,10 @@ serve speculative decoding within the following execution limits:
   what the model declares (section 4h). A plan must offer at least one of
   them; `fused_sample` has no runner path. An ordinary narrow decode does not
   send `spec_mode`.
-- **speculation for every admitted request, on a model serving `logits`.** The
-  runner rejection-samples each verify row on the host against the target
+- **speculation for every admitted request, on a model serving `logits`**,
+  except one carrying `logit_bias` or a `min_p` that takes effect, which no
+  walk applies (below). The runner rejection-samples each verify row on the
+  host against the target
   distribution under the row's own temperature, top-k, top-p, presence,
   frequency and repetition penalties and seed, its grammar bitmask,
   `allowed_token_ids`, `bad_words` and `min_tokens`, and returns the logprobs
@@ -58,13 +60,25 @@ serve speculative decoding within the following execution limits:
   for it, so it is offered no drafts and every step it shares runs as the
   ordinary decode, which applies those controls as a launch without
   speculation does. Without `supports_narrow_decode` every step would be a
-  verify answering the request without them, so it is refused per request. In
-  both modes `logit_bias` is refused. vLLM's own
-  request validation refuses `logit_bias`, and a `min_p` above 1e-5, whenever
-  speculation is configured, before the plugin sees the request. vLLM's
-  `build_logitsprocs` builds no min_p processor for a speculating launch, so a
-  smaller `min_p` has no effect, and it refuses custom logits processors
-  (`--logits-processors`) when `TTModelRunner` is constructed.
+  verify answering the request without them, so it is refused per request.
+- `logit_bias`, and a `min_p` above 0 on a request that is not greedy (which
+  vLLM's `MinPLogitsProcessor` applies), are applied by no accept walk,
+  `logits` included (`spec_admission.ordinary_decode_controls`). On a model
+  whose plan keeps `supports_narrow_decode` such a request is admitted and
+  decoded without speculation in every accept mode:
+  `TTModelRunner._request_is_speculable` is false for it, so it is offered no
+  drafts and every step it shares runs as the ordinary decode, sampled on the
+  host with vLLM's builtin processors (`build_host_logitsprocs`), as a launch
+  without speculation samples it.
+  vLLM refuses both, `min_p` above 1e-5, whenever speculation is configured
+  (`SamplingParams._validate_spec_decode`), and
+  `_install_tt_spec_sampling_validation_patch` lifts that refusal for a
+  narrow-decode TT engine only. Without narrow decode both stay refused, by
+  vLLM and by `TTPlatform._reject_unsupported_speculative_request`, which also
+  refuses a smaller `min_p` that vLLM lets through and no path there applies.
+  vLLM resets `min_p` to 0 on a greedy request, so greedy with `min_p` is
+  never refused. Custom logits processors (`--logits-processors`) are refused on
+  every speculating launch when `TTModelRunner` is constructed.
 - **ordinary decode steps inside a speculating launch**, for a model
   declaring `supports_narrow_decode`: a step with nothing to verify is sent as
   that model's own decode call and can overlap, so configuring speculation does
@@ -237,7 +251,8 @@ a scheduler-owned drafter cache the plugin does not yet allocate.
 `accept_modes` must include `argmax_ids` or `logits`, the return formats the
 runner executes. A model may also declare `fused_sample`, but that declaration
 enables no execution path. Declaring `logits` enables sampled speculation for
-every request admission lets through (section 4h); declaring both lets a greedy
+every request admission lets through but one carrying `logit_bias` or a
+`min_p` that takes effect (section 4h); declaring both lets a greedy
 step keep the smaller `argmax_ids` readback. A non-empty `k_by_rows` must reach
 `max_num_seqs`: its last `max_rows` must be at least `max_num_seqs`, so that
 every live batch size the launch admits has a draft cap.
@@ -614,7 +629,9 @@ order, and the first one that holds decides.
    serve `logits`, for a request with a non-zero temperature or a penalty, and
    for one carrying logprobs, structured output, `allowed_token_ids`,
    `bad_words` or a `min_tokens` the output has not reached yet; on a model that
-   does, every admitted request is speculable (section 4h). A verify in
+   does, every admitted request is speculable (section 4h). In every mode it
+   is false for a request carrying `logit_bias` or a `min_p` that takes
+   effect, which no walk applies (section 2). A verify in
    `argmax_ids` mode returns the target argmax for every row, so that row would
    commit the unfiltered argmax, without its logprobs, instead of a token drawn
    with its request's temperature and penalties and filtered by its grammar and
@@ -971,6 +988,9 @@ target argmax even with no draft of its own. Padding rows do not decide the
 mode. On a model declaring `spec_ids_are_sampled`, a non-zero temperature
 no longer rules a row out on a device-sampled step (section 4d, rule 2; a
 penalty still does): the `argmax_ids` answer carries the device sampler's draws for it.
+A row carrying `logit_bias` or a `min_p` that takes effect never reaches this
+choice: no walk applies either, so every step it shares is the ordinary
+decode (section 4d, rule 2).
 
 **What the model returns.** `VerifyOutput(spec_mode="logits", logits=...)`,
 with `logits` a floating point `[B, 1+K, V]` tensor: every submitted row,
@@ -1146,8 +1166,8 @@ penalty history, and `TTModelRunner._request_is_argmax_certifiable` keeps the
 penalty sets out). The token controls of section 4d are unchanged: on a model
 serving only `argmax_ids`, logprobs, structured output, `allowed_token_ids`,
 `bad_words` and a pending `min_tokens` keep a request plain with narrow
-decode and are refused per request without it, and `logit_bias` is refused
-on every speculative launch. `min_p`, `top_p` and `top_k` never
+decode and are refused per request without it, and so are `logit_bias` and a
+`min_p` that takes effect, in every accept mode. `top_p` and `top_k` never
 ruled a request out and still do not; a `top_k` the device sampler cannot
 serve makes the step host-sampled, which is the next rule.
 

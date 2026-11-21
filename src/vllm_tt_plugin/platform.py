@@ -47,6 +47,7 @@ from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.prefix_resume import resolve_and_store_prefix_resume
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
+    ordinary_decode_controls,
     resolve_speculative_plan,
 )
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
@@ -1119,6 +1120,68 @@ def _install_tt_input_processor_patch() -> None:
         return request
 
     input_processor.InputProcessor.process_inputs = process_inputs_tt
+
+
+def _install_tt_spec_sampling_validation_patch() -> None:
+    """Lift vLLM's min_p / logit_bias refusal for a narrow-decode TT engine.
+
+    vLLM's ``SamplingParams._validate_spec_decode`` refuses ``min_p`` above
+    1e-5 and any ``logit_bias`` whenever speculation is configured, because
+    its speculative samplers apply neither. A TT engine whose SpecPlan keeps
+    ``supports_narrow_decode`` serves such a request without speculation
+    instead: ``TTModelRunner._request_is_speculable`` is false for it, so every
+    step it shares is the ordinary decode, sampled on the host with vLLM's own
+    processors (``build_host_logitsprocs``).
+
+    ``process_inputs_tt`` binds the requesting engine's VllmConfig in
+    ``_tt_request_vllm_config`` around the ``InputProcessor.process_inputs``
+    call that reaches ``SamplingParams.verify``. When that engine's plan keeps
+    narrow decode, the original runs on a copy with ``min_p`` and
+    ``logit_bias`` cleared, so only those two checks are lifted and
+    ``TTPlatform._reject_unsupported_speculative_request`` decides them. Every
+    other call runs the original unchanged: no TT request context, no plan,
+    or a plan without narrow decode.
+
+    TODO: remove once vLLM's speculative samplers apply min_p and logit_bias,
+    or vLLM exposes a platform hook for this check.
+    """
+    import copy
+    import inspect
+
+    import vllm.sampling_params as sampling_params
+
+    if hasattr(sampling_params, "_tt_original_validate_spec_decode"):
+        return
+
+    original = getattr(sampling_params.SamplingParams, "_validate_spec_decode", None)
+    parameters = (
+        None if original is None else list(inspect.signature(original).parameters)
+    )
+    if parameters != ["self", "speculative_config"]:
+        raise RuntimeError(
+            "TT speculative decoding wraps vLLM's "
+            "SamplingParams._validate_spec_decode(self, speculative_config) to "
+            "serve min_p and logit_bias without speculation, but this vLLM has "
+            f"{original!r} with parameters {parameters!r}. Re-check the wrapper "
+            "against this vLLM before running it."
+        )
+    sampling_params._tt_original_validate_spec_decode = original
+
+    def _validate_spec_decode_tt(self, speculative_config):
+        vllm_config = _tt_request_vllm_config.get()
+        spec_plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
+        if (
+            speculative_config is None
+            or spec_plan is None
+            or not spec_plan.supports_narrow_decode
+        ):
+            return original(self, speculative_config)
+        lifted = copy.copy(self)
+        lifted.min_p = 0.0
+        lifted.logit_bias = None
+        return original(lifted, speculative_config)
+
+    sampling_params.SamplingParams._validate_spec_decode = _validate_spec_decode_tt
 
 
 def _install_tt_dp_prefix_cache_routing_patch() -> None:
@@ -2401,6 +2464,7 @@ class TTPlatform(Platform):
                 model_config.generation_config = "vllm"
 
         _install_tt_input_processor_patch()
+        _install_tt_spec_sampling_validation_patch()
         _install_tt_dp_prefix_cache_routing_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
@@ -2711,10 +2775,15 @@ class TTPlatform(Platform):
         commits the target argmax, so both kinds are refused: a verify would
         answer the request without them, silently.
 
-        vLLM itself refuses logit_bias, and a min_p above 1e-5, on a
-        speculating launch before this runs. Refused per request rather than at
-        config time because a launch may mix requests that speculate with
-        requests that cannot.
+        ``logit_bias`` and a ``min_p`` that takes effect
+        (``ordinary_decode_controls``) are applied by no accept walk, ``logits``
+        included, so only the ordinary decode serves them: admitted when the
+        plan keeps ``supports_narrow_decode``, refused otherwise whatever modes
+        it serves. vLLM's own refusal of both on a speculating launch is lifted
+        for a narrow-decode engine only
+        (``_install_tt_spec_sampling_validation_patch``). Refused per request
+        rather than at config time because a launch may mix requests that
+        speculate with requests that cannot.
         """
         from vllm.exceptions import VLLMValidationError
         from vllm.sampling_params import SamplingType
@@ -2729,8 +2798,11 @@ class TTPlatform(Platform):
         serves_logits = ACCEPT_MODE_LOGITS in spec_plan.accept_modes
 
         unsupported = []
-        if params.logit_bias:
-            unsupported.append("logit_bias")
+        # No accept walk applies these, so they need the ordinary decode.
+        ordinary_only = []
+        if not spec_plan.supports_narrow_decode:
+            ordinary_only = ordinary_decode_controls(params)
+        unsupported += ordinary_only
         # temperature and the penalties are absent: those requests speculate
         # in logits mode, or decode without speculation. ``sampled`` below
         # covers a launch that has neither. The controls only a logits walk
@@ -2776,6 +2848,12 @@ class TTPlatform(Platform):
                 "without them would change what was asked for without saying "
                 "so."
             )
+        if ordinary_only:
+            reasons.append(
+                "No accept walk applies logit_bias or min_p, so they need a "
+                "model whose SpecPlan keeps supports_narrow_decode, where they "
+                "decode without speculation."
+            )
         if logits_only:
             reasons.append(
                 "Logprobs, grammars and token filters need a model that "
@@ -2799,8 +2877,8 @@ class TTPlatform(Platform):
         elif spec_plan.supports_narrow_decode:
             reasons.append(
                 "Sampled requests (temperature, the penalties), logprobs, "
-                "grammars and token filters ARE served here -- they simply "
-                "decode without speculation."
+                "grammars, token filters, logit_bias and min_p ARE served "
+                "here -- they simply decode without speculation."
             )
         raise VLLMValidationError(
             f"Speculative decoding on {cls.device_name} cannot serve this "

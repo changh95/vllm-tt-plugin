@@ -489,13 +489,15 @@ def test_a_model_drafter_drafts_for_a_sampled_request():
 # region What vLLM lets through
 
 
-def test_a_speculating_launch_admits_a_small_min_p_and_applies_it_nowhere():
-    """A min_p up to 1e-5 reaches neither sampler on a speculating launch.
+def test_vllms_speculating_launch_admits_a_small_min_p_and_builds_no_processor():
+    """vLLM's own speculative rules for ``min_p``, which the plugin builds on.
 
-    vLLM admits it with speculation and builds no min_p processor for the
-    launch, so the ordinary sampler ignores it, and the walk has no min_p. A
-    vLLM that builds one fails here: the walk needs min_p then, or the two
-    paths sample different distributions.
+    vLLM admits a ``min_p`` up to 1e-5 with speculation and builds no min_p
+    processor for the launch. The plugin keeps that set only on a launch
+    without narrow decode (``build_host_logitsprocs``), where admission
+    refuses any ``min_p`` on a sampled request, a small one included
+    (``spec_admission.ordinary_decode_controls``), because no path there
+    applies it. A vLLM that changes either rule fails here.
     """
     speculative = object()
     SamplingParams(min_p=1e-5)._validate_spec_decode(speculative)
