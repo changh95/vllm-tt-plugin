@@ -3,11 +3,14 @@
 """Which request controls a speculating server admits, over HTTP.
 
 ``TTPlatform.validate_request`` decides this from the model's declared accept
-modes. A launch whose model serves ``logits`` applies logprobs, structured
-output, ``allowed_token_ids``, ``bad_words`` and ``min_tokens`` in its accept
-walk and admits them. A launch whose model serves only ``argmax_ids`` cannot,
-and refuses each with HTTP 400 rather than answering without it. ``logit_bias``
-is refused on every speculating launch, by vLLM itself before the plugin.
+modes and narrow decode. A launch whose model serves ``logits`` applies
+logprobs, structured output, ``allowed_token_ids``, ``bad_words`` and
+``min_tokens`` in its accept walk and admits them. A launch whose model serves
+only ``argmax_ids`` admits them when it supports narrow decode
+(``TT_SPEC_DRAFT_POLICY=solo``), decoding such a request without speculation,
+and otherwise refuses each with HTTP 400 rather than answering without it.
+``logit_bias`` is refused on every speculating launch, by vLLM itself before
+the plugin.
 """
 
 from __future__ import annotations
@@ -25,14 +28,16 @@ CONTROLS = {
 
 
 @pytest.mark.parametrize("name", list(CONTROLS))
-def test_a_control_is_admitted_exactly_when_the_model_serves_logits(
+def test_a_control_is_admitted_exactly_when_logits_or_narrow_decode_serve_it(
     spec_server, spec_config, ascending_prompt, record, name
 ):
     result = spec_server.complete(
         ascending_prompt(16, start=3000), max_tokens=4, **CONTROLS[name]
     )
     record(status=result.status, body=result.body)
-    if "logits" in spec_config.accept_modes:
+    # As in test_mixed_sampling.py: TT_SPEC_DRAFT_POLICY=always launches
+    # without narrow decode, solo with it.
+    if "logits" in spec_config.accept_modes or spec_config.draft_policy != "always":
         assert result.status == 200, result.body
         return
     assert result.status == 400, result.body

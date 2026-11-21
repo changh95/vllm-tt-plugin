@@ -1660,10 +1660,12 @@ class TTModelRunner:
         A greedy request is still not certifiable when a control moves its
         argmax or asks for more than ids: a grammar, an allowlist, a bad word
         or a pending ``min_tokens`` rules out the token the unfiltered argmax
-        might be, and logprobs need the logits themselves. Admission refuses
-        all of these on a launch without ``logits``, so in practice they only
-        make ``_spec_mode_for_step`` pick ``logits`` on a launch that serves
-        both modes.
+        might be, and logprobs need the logits themselves. On a launch that
+        serves both modes they make ``_spec_mode_for_step`` pick ``logits``. On
+        an ``argmax_ids`` launch with narrow decode they keep the request off
+        the drafts, so every step it shares is the ordinary decode
+        (``_step_verifies``), which applies them; admission refuses them only
+        on a launch with neither ``logits`` nor narrow decode.
         """
         batch = self.input_batch
         draws_ids = bool(device_sampled) and bool(

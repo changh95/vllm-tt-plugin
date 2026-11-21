@@ -785,9 +785,9 @@ expect on such an adapter:
   and keep requests within the device sampler's limits (the
   [default top-k](#default-top-k-for-device-sampling) above); a step any row
   of which samples on the host withholds the drafts and runs as before;
-- a presence, frequency or repetition penalty keeps a request plain, and
-  logprobs, structured output, `bad_words`, `allowed_token_ids` and
-  `min_tokens` are refused on a speculative launch exactly as above;
+- a presence, frequency or repetition penalty keeps a request plain, and so
+  do logprobs, structured output, `bad_words`, `allowed_token_ids` and a
+  pending `min_tokens`, which follow the rule in the next paragraph;
 - on an adapter that also serves `logits`, the device draws take precedence on
   a device-sampled step and the host `logits` walk serves the rest;
 - a launch without narrow decode still refuses sampled and penalized requests
@@ -801,11 +801,14 @@ On an adapter that serves `logits`, logprobs, structured output, `bad_words`,
 `allowed_token_ids` and `min_tokens` speculate too: the host accept walk
 applies each of them at every candidate column and returns each committed
 token's logprobs, as upstream's rejection sampler does. On an adapter that
-serves only `argmax_ids`, `TTPlatform.validate_request` rejects those five on
-a speculative launch. `logit_bias` is rejected on every speculative launch,
-and vLLM itself rejects it first. Prompt logprobs remain unsupported for all
-TT models. Only vLLM's Python frontend runs these checks, so a speculative
-launch with `VLLM_USE_RUST_FRONTEND=1` is refused at startup.
+serves only `argmax_ids` and supports narrow decode, those five decode without
+speculation, as a sampled request does: the request is offered no drafts and
+every step it shares runs as the ordinary decode, which applies them. Without
+narrow decode every step is a verify, so `TTPlatform.validate_request` rejects
+them on a speculative launch. `logit_bias` is rejected on every speculative
+launch, and vLLM itself rejects it first. Prompt logprobs remain unsupported
+for all TT models. Only vLLM's Python frontend runs these checks, so a
+speculative launch with `VLLM_USE_RUST_FRONTEND=1` is refused at startup.
 
 See [the model contract](docs/SPEC_DECODE_CONTRACT.md) for candidate shapes,
 acceptance, K+1 lookahead reservation and lifecycle hooks. See

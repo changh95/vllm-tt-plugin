@@ -51,9 +51,15 @@ serve speculative decoding within the following execution limits:
   `top_k` alone do not change the argmax, so they do not stop a request
   speculating. Section 4d.
 - on a model serving only `argmax_ids`, a request carrying logprobs, structured
-  output, `bad_words`, `allowed_token_ids` or a nonzero `min_tokens` is refused
-  per request: the greedy walk cannot apply those, so a verify would answer the
-  request without them. In both modes `logit_bias` is refused. vLLM's own
+  output, `bad_words`, `allowed_token_ids` or a nonzero `min_tokens` cannot be
+  certified by the greedy walk, which cannot apply those. With
+  `supports_narrow_decode` it is admitted and decoded without speculation, as a
+  sampled request is: `TTModelRunner._request_is_argmax_certifiable` is false
+  for it, so it is offered no drafts and every step it shares runs as the
+  ordinary decode, which applies those controls as a launch without
+  speculation does. Without `supports_narrow_decode` every step would be a
+  verify answering the request without them, so it is refused per request. In
+  both modes `logit_bias` is refused. vLLM's own
   request validation refuses `logit_bias`, and a `min_p` above 1e-5, whenever
   speculation is configured, before the plugin sees the request. vLLM's
   `build_logitsprocs` builds no min_p processor for a speculating launch, so a
@@ -604,12 +610,15 @@ order, and the first one that holds decides.
    implements one input shape, so every decode step of the launch is a verify,
    including a step whose `num_valid_drafts` is 0 on every row.
 2. **A live row's request is not speculable: ordinary decode.**
-   `TTModelRunner._request_is_speculable` is false for a request with a
-   non-zero temperature or a penalty on a model that does not serve `logits`;
-   on a model that does, every admitted request is speculable (section 4h). A
-   verify in `argmax_ids` mode returns the target argmax for every row, so that
-   row would commit the argmax, not a token drawn with its request's
-   temperature and penalties. The step is an ordinary decode instead, whatever
+   `TTModelRunner._request_is_speculable` is false, on a model that does not
+   serve `logits`, for a request with a non-zero temperature or a penalty, and
+   for one carrying logprobs, structured output, `allowed_token_ids`,
+   `bad_words` or a `min_tokens` the output has not reached yet; on a model that
+   does, every admitted request is speculable (section 4h). A verify in
+   `argmax_ids` mode returns the target argmax for every row, so that row would
+   commit the unfiltered argmax, without its logprobs, instead of a token drawn
+   with its request's temperature and penalties and filtered by its grammar and
+   token filters. The step is an ordinary decode instead, whatever
    the other rows carry. On a model declaring `spec_ids_are_sampled` a request whose only
    such control is its temperature (a penalty keeps it plain) is
    speculable on a step that samples on the device
@@ -640,10 +649,11 @@ live row still has an unresolved commit. `TTModelRunner._prepare_model_inputs`
 then drops each row's `TTModelRunner._req_accepted_counts` entry, because the
 step commits one token per row and the ordinary commit path records no count.
 
-**A sampled or penalized request is never answered by an `argmax_ids`
-verify.** On a model serving `logits`, a verify carrying such a row asks for
-`logits` and samples it (section 4h). On a model serving only `argmax_ids`
-with narrow decode, rule 2 keeps such a request out of every verify. The cost
+**A sampled or penalized request, or one carrying logprobs, structured
+output or a token filter, is never answered by an `argmax_ids` verify.** On a
+model serving `logits`, a verify carrying such a row asks for `logits` and
+samples it (section 4h). On a model serving only `argmax_ids` with narrow
+decode, rule 2 keeps such a request out of every verify. The cost
 falls on the other rows of its steps: their drafts are dropped, which the
 scheduler counts as rejected, so no request speculates on a step that such a
 request shares. On a launch with neither narrow decode nor `logits`, every
@@ -651,8 +661,10 @@ step is an `argmax_ids` verify, so
 `TTPlatform._reject_unsupported_speculative_request` refuses a request with a
 non-zero temperature or a penalty when it arrives, using the same conditions
 under which vLLM's `InputBatch.add_request` files the request into
-`random_reqs` or a penalty set. Speculating for such a request on a model that
-serves only `argmax_ids` means declaring `logits`.
+`random_reqs` or a penalty set, and a request carrying logprobs, structured
+output, `allowed_token_ids`, `bad_words` or a nonzero `min_tokens`. Speculating
+for such a request on a model that serves only `argmax_ids` means declaring
+`logits`.
 
 `_install_tt_input_processor_patch` binds the requesting
 `InputProcessor.vllm_config` while `InputProcessor.process_inputs` runs, so
@@ -1133,8 +1145,9 @@ presence, frequency or repetition penalty stays plain (the draws carry no
 penalty history, and `TTModelRunner._request_is_argmax_certifiable` keeps the
 penalty sets out). The token controls of section 4d are unchanged: on a model
 serving only `argmax_ids`, logprobs, structured output, `allowed_token_ids`,
-`bad_words` and a nonzero `min_tokens` are still refused per request, and
-`logit_bias` on every speculative launch. `min_p`, `top_p` and `top_k` never
+`bad_words` and a pending `min_tokens` keep a request plain with narrow
+decode and are refused per request without it, and `logit_bias` is refused
+on every speculative launch. `min_p`, `top_p` and `top_k` never
 ruled a request out and still do not; a `top_k` the device sampler cannot
 serve makes the step host-sampled, which is the next rule.
 
@@ -1272,8 +1285,9 @@ checks report the offending values. On a model that does not serve `logits`, a
 non-zero temperature or a penalty is admitted without draft publication on a
 launch with narrow decode, and refused per request on a launch without it
 (section 4d; a model declaring `spec_ids_are_sampled` publishes drafts for a
-sampled request on a device-sampled step, section 4d rule 2), and logprobs, structured output, `bad_words`,
-`allowed_token_ids` and `min_tokens` are refused; a model that serves `logits`
-speculates for all of them (section 4h). The ordinary async capability check
+sampled request on a device-sampled step, section 4d rule 2), and so are
+logprobs, structured output, `bad_words`, `allowed_token_ids` and
+`min_tokens`; a model that serves `logits` speculates for all of them
+(section 4h). The ordinary async capability check
 separately permits
 synchronous fallback with a warning, as specified in section 4c.

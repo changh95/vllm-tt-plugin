@@ -2693,20 +2693,23 @@ class TTPlatform(Platform):
         through: the runner rejection-samples each verify row on the host under
         the row's temperature, top-k, top-p, penalties, logprobs, grammar,
         allowed_token_ids, bad_words and min_tokens. On a model serving only
-        ``argmax_ids``, which certifies greedy decoding only:
+        ``argmax_ids``, which certifies greedy decoding only, a request the
+        greedy walk cannot certify decodes without speculation when the model
+        declares ``supports_narrow_decode``: ``TTModelRunner._publish_draft``
+        offers it no drafts, and ``_step_verifies`` runs every step it shares
+        as the ordinary decode, which applies its controls exactly as a launch
+        without speculation does. That covers
 
-        - logprobs, structured output, allowed_token_ids, bad_words and
-          min_tokens are refused, because the greedy walk cannot apply them and
-          a verify would answer the request without them, silently;
-        - a sampled or penalized request decodes without speculation when the
-          model declares ``supports_narrow_decode``
-          (``TTModelRunner._publish_draft`` offers it no drafts, and
-          ``_step_verifies`` runs the step as the ordinary decode), and is
-          refused when it does not, because then every decode step is a verify
-          that commits the target argmax. On a model declaring
+        - a sampled or penalized request. On a model declaring
           ``spec_ids_are_sampled`` a non-zero temperature alone no longer rules
           a request out on a device-sampled step (SPEC_DECODE_CONTRACT.md,
-          section 4d rule 2); a penalty still does.
+          section 4d rule 2); a penalty still does;
+        - logprobs, structured output, allowed_token_ids, bad_words and a
+          pending min_tokens, which the greedy walk cannot apply.
+
+        Without ``supports_narrow_decode`` every decode step is a verify that
+        commits the target argmax, so both kinds are refused: a verify would
+        answer the request without them, silently.
 
         vLLM itself refuses logit_bias, and a min_p above 1e-5, on a
         speculating launch before this runs. Refused per request rather than at
@@ -2730,18 +2733,23 @@ class TTPlatform(Platform):
             unsupported.append("logit_bias")
         # temperature and the penalties are absent: those requests speculate
         # in logits mode, or decode without speculation. ``sampled`` below
-        # covers a launch that has neither.
-        if not serves_logits:
+        # covers a launch that has neither. The controls only a logits walk
+        # applies are refused on that same launch: with narrow decode they too
+        # keep the request on the ordinary decode
+        # (``TTModelRunner._request_is_argmax_certifiable``).
+        logits_only = []
+        if not serves_logits and not spec_plan.supports_narrow_decode:
             if params.logprobs is not None:
-                unsupported.append(f"logprobs={params.logprobs!r}")
+                logits_only.append(f"logprobs={params.logprobs!r}")
             if getattr(params, "structured_outputs", None) is not None:
-                unsupported.append("structured_outputs")
+                logits_only.append("structured_outputs")
             if params.bad_words:
-                unsupported.append("bad_words")
+                logits_only.append("bad_words")
             if params.allowed_token_ids:
-                unsupported.append("allowed_token_ids")
+                logits_only.append("allowed_token_ids")
             if params.min_tokens:
-                unsupported.append(f"min_tokens={params.min_tokens!r}")
+                logits_only.append(f"min_tokens={params.min_tokens!r}")
+        unsupported += logits_only
 
         # The same four conditions under which vLLM's InputBatch.add_request
         # files the request into random_reqs or a penalty set, which is what
@@ -2768,10 +2776,12 @@ class TTPlatform(Platform):
                 "without them would change what was asked for without saying "
                 "so."
             )
-        if unsupported and not serves_logits:
+        if logits_only:
             reasons.append(
                 "Logprobs, grammars and token filters need a model that "
-                "serves the logits accept mode."
+                "serves the logits accept mode, or one whose SpecPlan keeps "
+                "supports_narrow_decode so that they decode without "
+                "speculation."
             )
         if sampled:
             reasons.append(
@@ -2788,8 +2798,9 @@ class TTPlatform(Platform):
             )
         elif spec_plan.supports_narrow_decode:
             reasons.append(
-                "Sampled requests (temperature, the penalties) ARE served "
-                "here -- they simply decode without speculation."
+                "Sampled requests (temperature, the penalties), logprobs, "
+                "grammars and token filters ARE served here -- they simply "
+                "decode without speculation."
             )
         raise VLLMValidationError(
             f"Speculative decoding on {cls.device_name} cannot serve this "

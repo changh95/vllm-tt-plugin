@@ -205,9 +205,11 @@ device:
 - structured prefill;
 - logprobs, including `logprobs=0`;
 - row-sharded sampling (`sampling_dp > 1`);
-- speculative decoding: a `logits` verify applies the grammar on the host, and
-  a launch whose model serves only `argmax_ids` rejects structured requests at
-  admission;
+- speculative decoding: a `logits` verify applies the grammar on the host. A
+  launch whose model serves only `argmax_ids` never verifies a structured
+  request: with narrow decode the request decodes without speculation
+  (SPEC_DECODE_CONTRACT.md, section 4d rule 2), and without it admission
+  rejects the request;
 - block-output models;
 - host-only options (`min_p`, `logit_bias`, `bad_words`, `allowed_token_ids`,
   `min_tokens`, custom logits processors).

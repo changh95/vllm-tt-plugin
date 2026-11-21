@@ -342,17 +342,16 @@ _LOGITS_ONLY_IDS = [
 
 
 @pytest.mark.parametrize("field, value", _LOGITS_ONLY_CONTROLS, ids=_LOGITS_ONLY_IDS)
-@pytest.mark.parametrize("narrow", [True, False], ids=["narrow", "verify-only"])
-def test_a_request_the_greedy_walk_cannot_serve_is_refused(
-    monkeypatch, vllm_config, field, value, narrow
+def test_a_request_the_greedy_walk_cannot_serve_is_refused_where_every_step_verifies(
+    monkeypatch, vllm_config, field, value
 ):
     """Answering greedily anyway would change what was asked for, silently.
 
     On a model that serves only ``argmax_ids`` the accept walk compares token
     ids and never sees logits, so it cannot arbitrate a token filter or a
-    grammar, and it cannot produce logprobs. A verify would answer such a
-    request without them, plausible and wrong, so admission refuses it with or
-    without narrow decode.
+    grammar, and it cannot produce logprobs. Without narrow decode every step
+    is a verify, which would answer such a request without them, plausible and
+    wrong, so admission refuses it.
 
     ``min_p``, ``top_p`` and ``top_k`` are absent from this list because vLLM
     neutralises them itself on a greedy request, so they can only arrive
@@ -363,7 +362,7 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
     _speculating_platform(
         monkeypatch,
         vllm_config,
-        supports_narrow_decode=narrow,
+        supports_narrow_decode=False,
         accept_modes=("argmax_ids",),
     )
     params = SamplingParams(temperature=0.0, **{field: value()})
@@ -372,9 +371,29 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
     message = str(excinfo.value)
     assert "cannot serve" in message
     assert field in message
-    # Only a launch with narrow decode serves sampled requests, so only its
-    # refusal may say so.
-    assert ("ARE served" in message) is narrow
+    assert "supports_narrow_decode" in message
+    # This launch serves no sampled request either, so its refusal must not
+    # say that it does.
+    assert "ARE served" not in message
+
+
+@pytest.mark.parametrize("field, value", _LOGITS_ONLY_CONTROLS, ids=_LOGITS_ONLY_IDS)
+def test_a_narrow_decode_launch_admits_what_only_its_ordinary_decode_applies(
+    monkeypatch, vllm_config, field, value
+):
+    """With narrow decode such a request decodes without speculation.
+
+    ``TTModelRunner._request_is_argmax_certifiable`` is false for it, so it is
+    offered no drafts and every step it shares runs as the ordinary decode,
+    which applies the control as a launch without speculation does. Refusing
+    it would cost the launch an API the same server serves without
+    speculation, for no change in what the request gets.
+    """
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform(monkeypatch, vllm_config, accept_modes=("argmax_ids",))
+    _validate(SamplingParams(temperature=0.0, **{field: value()}))  # must not raise
+    _validate(SamplingParams(temperature=0.8, seed=3, **{field: value()}))
 
 
 @pytest.mark.parametrize("modes", [("argmax_ids", "logits"), ("logits",)])
@@ -639,9 +658,9 @@ def test_each_live_engine_uses_its_own_speculative_admission(
     ]
     for launch, processor in zip(launches, processors):
         params = _sampled_params(field, value)
-        rejected = (
-            launch == "verify-only" and (field, value) != ("temperature", 0.0)
-        ) or (launch == "narrow" and field == "logprobs")
+        # A narrow-decode launch decodes logprobs requests without
+        # speculation; only the verify-only launch refuses them.
+        rejected = launch == "verify-only" and (field, value) != ("temperature", 0.0)
         if rejected:
             with pytest.raises(VLLMValidationError, match=field):
                 _process_until_admission(processor, params)

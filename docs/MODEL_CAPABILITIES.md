@@ -109,18 +109,21 @@ decode, and unsupported logprob requests. These runtime
 restrictions remain in force when `supports_sample_on_device=True`. Generic
 speculative request restrictions remain separate from ordinary sampling: a
 model whose `spec_plan` offers only `argmax_ids` speculates for greedy
-requests only and refuses logprobs, structured output and token filters on a
-speculating launch, while a model that also offers `logits` speculates for
-sampled requests and applies all of those on the host. See
+requests only: with `supports_narrow_decode` it decodes sampled requests and
+requests carrying logprobs, structured output or token filters without
+speculation, and without it refuses them on a speculating launch, while a model
+that also offers `logits` speculates for sampled requests and applies all of
+those on the host. See
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md).
 
 `spec_ids_are_sampled` is the one exception to the greedy-only rule, and it
 holds only while the step actually samples on the device: a request whose
 only non-greedy control is its temperature is then drafted and its
 `argmax_ids` verify is answered with the device sampler's draws (exact
-rejection sampling). A penalty keeps a request plain, the token controls
-above stay refused, a host-sampled step withholds the drafts and drops a
-retained proposal, and on a model that also serves `logits` the device draws
+rejection sampling). A penalty or one of the token controls above keeps a
+request plain (a launch without narrow decode refuses the token controls), a
+host-sampled step withholds the drafts and drops a retained proposal, and on a
+model that also serves `logits` the device draws
 take precedence on such a step. Per-request admission on a launch without
 narrow decode is unchanged by the capability. The rules are gathered in
 [SPEC_DECODE_CONTRACT.md, section 4i](SPEC_DECODE_CONTRACT.md#4i-sampled-ids-spec_ids_are_sampled).
@@ -207,7 +210,7 @@ speculative admission does not guarantee that state exists yet.
 | `lanes_per_request` | Required | Model decode rows consumed by one speculative request, at least 1. This value does not mean lane-DP lanes. The plugin validates the lower bound but does not enforce a row budget. |
 | `extra_bytes_per_seq` | Required | Nonnegative fixed device bytes per speculative request. The plugin does not reserve or enforce this byte budget. |
 | `extra_bytes_per_token` | Required | Nonnegative device bytes per KV token beyond target KV storage. The plugin does not reserve or enforce this byte budget. |
-| `accept_modes` | Required | Nonempty sequence using `logits`, `argmax_ids`, or `fused_sample`. `SpecPlan` normalizes the sequence to a tuple and rejects strings, unknown names, and duplicates. Admission requires `argmax_ids` or `logits` among the offered modes; `fused_sample` has no runner path. With both offered, the runner asks for `logits` on a step with at least one live row that `TTModelRunner._request_is_argmax_certifiable` rejects: a non-zero temperature, a penalty, logprobs (including `logprobs=0`), structured output, `allowed_token_ids`, `bad_words`, or a `min_tokens` the output has not reached yet. Otherwise it asks for `argmax_ids`. Without `logits`, `TTPlatform.validate_request` refuses logprobs, structured output, `allowed_token_ids`, `bad_words`, and `min_tokens` on a speculative launch. See section 4h of [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md). |
+| `accept_modes` | Required | Nonempty sequence using `logits`, `argmax_ids`, or `fused_sample`. `SpecPlan` normalizes the sequence to a tuple and rejects strings, unknown names, and duplicates. Admission requires `argmax_ids` or `logits` among the offered modes; `fused_sample` has no runner path. With both offered, the runner asks for `logits` on a step with at least one live row that `TTModelRunner._request_is_argmax_certifiable` rejects: a non-zero temperature, a penalty, logprobs (including `logprobs=0`), structured output, `allowed_token_ids`, `bad_words`, or a `min_tokens` the output has not reached yet. Otherwise it asks for `argmax_ids`. Without `logits`, such a row keeps the step the ordinary decode on a plan with `supports_narrow_decode`, and `TTPlatform.validate_request` refuses logprobs, structured output, `allowed_token_ids`, `bad_words`, and `min_tokens` on a speculative launch whose plan does not set it. See section 4h of [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md). |
 | `drafter_state` | Required | One of `internal`, `paged`, or `shared_with_target`. Admission rejects `paged` because the plugin has no scheduler-owned drafter-cache allocation. |
 | `drafter_target_cache_requires` | `()` | Sequence using `named_layer_caches` and `absolute_positions`. `SpecPlan` rejects strings, unknown names, duplicates, and a nonempty sequence unless `drafter_state="shared_with_target"`. The plugin does not verify that the target cache satisfies these requirements. |
 | `supports_narrow_decode` | `False` | Declares ordinary `[B, 1]` decode support alongside wide `[B, 1+K]` verification. The runner uses this permission for draftless steps when the drafter's hidden-state requirements allow narrow decode. This value is a `SpecPlan` field, not a `model_capabilities` key. |
