@@ -876,14 +876,23 @@ class TTModelRunner:
         slot = self._req_state_slot.get(req_id)
         model = getattr(self, "model", None)
         release = getattr(model, "release_request", None)
-        if preempted:
+        preempt = getattr(model, "preempt_request", None) if preempted else None
+        if slot is not None and callable(preempt):
             # A model that can keep a preempted request's state (e.g. swap it
             # to host memory and restore it when the scheduler resumes the
             # request, instead of re-prefilling prompt + output) says so with
-            # ``preempt_request(slot)``; it releases the slot like
-            # ``release_request`` does.
-            release = getattr(model, "preempt_request", None) or release
-        if slot is not None and callable(release):
+            # ``preempt_request(slot, token_ids)``; it releases the slot like
+            # ``release_request`` does. token_ids: the request's prompt and the
+            # output tokens this runner has seen (a resume replays them as its
+            # prompt), so the model can match the resume exactly.
+            state = getattr(self, "requests", {}).get(req_id)
+            token_ids = (
+                list(state.prompt_token_ids or ()) + list(state.output_token_ids)
+                if state is not None
+                else None
+            )
+            preempt(slot, token_ids=token_ids)
+        elif slot is not None and callable(release):
             release(slot)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:

@@ -234,12 +234,12 @@ def test_preempted_request_goes_to_model_preempt_hook(lifecycle):
             pass
 
     runner = TTModelRunner.__new__(TTModelRunner)
-    runner.requests = {"req-0": object()}
+    runner.requests = {"req-0": SimpleNamespace(prompt_token_ids=[5, 6, 7], output_token_ids=[8, 9])}
     runner.encoder_cache = {}
     runner.input_batch = InputBatchSpy()
     runner.model = SimpleNamespace(
         release_request=lambda slot: events.append(("release", slot)),
-        preempt_request=lambda slot: events.append(("preempt", slot)),
+        preempt_request=lambda slot, token_ids: events.append(("preempt", slot, token_ids)),
     )
     runner._decode_layout_changed_since_last_decode = False
     runner._req_state_slot = {"req-0": 2}
@@ -249,7 +249,8 @@ def test_preempted_request_goes_to_model_preempt_hook(lifecycle):
 
     runner._update_states(scheduler_output)
 
-    assert events == [("release" if lifecycle == "finished" else "preempt", 2)]
+    expect = ("release", 2) if lifecycle == "finished" else ("preempt", 2, [5, 6, 7, 8, 9])
+    assert events == [expect]
 
 
 def test_release_model_request_never_falls_back_to_batch_row():
