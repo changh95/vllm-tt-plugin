@@ -214,6 +214,44 @@ def test_update_states_releases_model_request_before_removing_row(
     assert runner._req_state_slot == {}
 
 
+@pytest.mark.parametrize("lifecycle", ["finished", "preempted"])
+def test_preempted_request_goes_to_model_preempt_hook(lifecycle):
+    """A model with ``preempt_request`` gets a preempted request's slot there
+    (to keep its state for the resume); a finished one still goes to
+    ``release_request``. Models without the hook keep today's release."""
+    events = []
+
+    class InputBatchSpy:
+        req_id_to_index = {"req-0": 0}
+
+        def remove_request(self, req_id):
+            return self.req_id_to_index.pop(req_id, None)
+
+        def condense(self, removed_req_indices):
+            pass
+
+        def refresh_logitsprocs(self):
+            pass
+
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.requests = {"req-0": object()}
+    runner.encoder_cache = {}
+    runner.input_batch = InputBatchSpy()
+    runner.model = SimpleNamespace(
+        release_request=lambda slot: events.append(("release", slot)),
+        preempt_request=lambda slot: events.append(("preempt", slot)),
+    )
+    runner._decode_layout_changed_since_last_decode = False
+    runner._req_state_slot = {"req-0": 2}
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.finished_req_ids = {"req-0"} if lifecycle == "finished" else set()
+    scheduler_output.preempted_req_ids = {"req-0"} if lifecycle == "preempted" else None
+
+    runner._update_states(scheduler_output)
+
+    assert events == [("release" if lifecycle == "finished" else "preempt", 2)]
+
+
 def test_release_model_request_never_falls_back_to_batch_row():
     released = []
     runner = TTModelRunner.__new__(TTModelRunner)

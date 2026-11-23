@@ -859,7 +859,7 @@ class TTModelRunner:
             )
         return per_layer  # type: ignore[return-value]
 
-    def _release_model_request(self, req_id: str) -> None:
+    def _release_model_request(self, req_id: str, preempted: bool = False) -> None:
         """Release model-owned state while the slot mapping is still valid.
 
         Released by the request's CURRENT slot, which is the identity the model
@@ -874,7 +874,15 @@ class TTModelRunner:
         ``_notify_model_slot_moves``.
         """
         slot = self._req_state_slot.get(req_id)
-        release = getattr(getattr(self, "model", None), "release_request", None)
+        model = getattr(self, "model", None)
+        release = getattr(model, "release_request", None)
+        if preempted:
+            # A model that can keep a preempted request's state (e.g. swap it
+            # to host memory and restore it when the scheduler resumes the
+            # request, instead of re-prefilling prompt + output) says so with
+            # ``preempt_request(slot)``; it releases the slot like
+            # ``release_request`` does.
+            release = getattr(model, "preempt_request", None) or release
         if slot is not None and callable(release):
             release(slot)
 
@@ -911,7 +919,7 @@ class TTModelRunner:
         # Explicit preemption invalidates model-owned request state. Temporary
         # unscheduling does not: a request may simply be hidden for this step.
         for req_id in scheduler_output.preempted_req_ids or ():
-            self._release_model_request(req_id)
+            self._release_model_request(req_id, preempted=True)
         # A finished or preempted request's split prefill is over (a resume
         # replays from position 0 as a resumed request).
         split = getattr(self, "_split_prefill_req_ids", None)

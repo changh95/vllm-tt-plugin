@@ -262,8 +262,8 @@ def test_preemption_releases_its_state_slot():
     )
     released: list[int] = []
     r.model = SimpleNamespace(release_request=released.append)
-    r._release_model_request = lambda req_id: TTModelRunner._release_model_request(
-        r, req_id
+    r._release_model_request = lambda req_id, **kw: TTModelRunner._release_model_request(
+        r, req_id, **kw
     )
     r._req_state_slot.update({"P": 0, "KEEP": 1})
     r.requests.update(dict.fromkeys(["P", "KEEP"]))
