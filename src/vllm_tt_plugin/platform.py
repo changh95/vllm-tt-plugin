@@ -872,6 +872,39 @@ def _install_tt_async_spec_method_patch() -> None:
     ]
 
 
+def _install_tt_spec_sampling_patch() -> None:
+    """Admit min_p and logit_bias on a launch whose spec plan resolves commits.
+
+    Upstream refuses both on any speculative launch
+    (``SamplingParams._validate_spec_decode``) because its GPU sampler builds
+    only the min_tokens logits processor there. On a TT launch whose plan sets
+    ``narrow_decode_resolves_commits`` such a request is never speculable and
+    every step it shares is an ordinary decode the host samples with all of
+    the builtin logits processors (``TTModelRunner`` builds them for that
+    plan), so it is served instead -- as on a launch that does not speculate.
+    Any other speculative launch keeps upstream's refusal. Idempotent.
+    """
+    from vllm.sampling_params import SamplingParams
+
+    if hasattr(SamplingParams, "_tt_original_validate_spec_decode"):
+        return
+    original = SamplingParams._validate_spec_decode
+
+    def _validate_spec_decode(self, speculative_config):
+        if speculative_config is not None:
+            try:
+                vllm_config = TTPlatform._resolve_tt_admission_handle()
+                plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
+            except Exception:  # noqa: BLE001 - admission state unavailable: upstream's rule
+                plan = None
+            if plan is not None and getattr(plan, "narrow_decode_resolves_commits", False):
+                return
+        return original(self, speculative_config)
+
+    SamplingParams._tt_original_validate_spec_decode = original
+    SamplingParams._validate_spec_decode = _validate_spec_decode
+
+
 def _async_spec_gate_shape_problem(vllm_config_module: Any) -> str | None:
     """Why the gate no longer looks like the one documented, or None.
 
@@ -1606,6 +1639,7 @@ class TTPlatform(Platform):
         # which is where upstream decides asynchronous scheduling against the
         # speculative method name. This hook is that call's first statement.
         _install_tt_async_spec_method_patch()
+        _install_tt_spec_sampling_patch()
         register_tt_models(
             register_test_models=_should_pre_register_tt_test_models_from_cli()
         )
@@ -1687,6 +1721,7 @@ class TTPlatform(Platform):
         # that reaches configuration without the CLI path: a second engine, or
         # a direct VllmConfig construction, then finds the gate patched.
         _install_tt_async_spec_method_patch()
+        _install_tt_spec_sampling_patch()
         _warn_unpatched_async_spec_gate(vllm_config)
         # The class carries process-level admission state, so a live
         # block-output engine cannot share the process with a second engine:

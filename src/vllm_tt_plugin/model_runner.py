@@ -151,6 +151,7 @@ def _needs_host_only_sampling(params: Any) -> bool:
     return (
         getattr(params, "logprobs", None) is not None
         or getattr(params, "structured_outputs", None) is not None
+        or float(getattr(params, "min_p", 0.0) or 0.0) > 0.0
         or bool(getattr(params, "logit_bias", None))
         or bool(getattr(params, "bad_words", None))
         or bool(getattr(params, "allowed_token_ids", None))
@@ -427,6 +428,17 @@ class TTModelRunner:
             is_pooling_model=False,
             custom_logitsprocs=(self.model_config.logits_processors or ()),
         )
+        if getattr(self, "_spec_narrow_resolves", False):
+            # Upstream builds only min_tokens on a speculative launch. On a plan
+            # that resolves commits, a min_p / logit_bias request is admitted
+            # (platform._install_tt_spec_sampling_patch) and every step it
+            # shares is host-sampled, so the host needs every builtin processor.
+            from vllm.v1.sample.logits_processor import BUILTIN_LOGITS_PROCESSORS
+
+            self._host_logitsprocs = LogitsProcessors(
+                ctor(vllm_config, torch.device("cpu"), False)
+                for ctor in BUILTIN_LOGITS_PROCESSORS
+            )
 
     def shutdown(self) -> None:
         """Deterministically release optional model-lifetime captures.

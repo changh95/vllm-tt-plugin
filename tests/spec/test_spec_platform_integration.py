@@ -339,6 +339,35 @@ def test_a_host_only_request_is_admitted_when_the_model_resolves_commits(
     _validate(SamplingParams(temperature=0.0, **{field: value}))  # must not raise
 
 
+@pytest.mark.parametrize("resolves", [True, False])
+def test_min_p_and_logit_bias_follow_the_commit_resolving_plan(monkeypatch, vllm_config, resolves):
+    """Upstream refuses min_p / logit_bias on any speculative launch (its GPU
+    sampler builds only min_tokens there). A TT plan that resolves commits
+    host-samples every step such a request shares, with every builtin logits
+    processor, so the TT patch admits them there and nowhere else."""
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_tt_plugin.platform import _install_tt_spec_sampling_patch
+
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4,
+        supports_narrow_decode=resolves,
+        narrow_decode_resolves_commits=resolves,
+    )
+    config = _speculative(vllm_config)
+    _run_hook(monkeypatch, config, model)
+    _install_tt_spec_sampling_patch()
+    for params in (
+        SamplingParams(temperature=0.0, logit_bias={5: 1.0}),
+        SamplingParams(temperature=0.8, min_p=0.1),
+    ):
+        if resolves:
+            params._validate_spec_decode(config.speculative_config)
+        else:
+            with pytest.raises(ValueError, match="not yet supported with speculative"):
+                params._validate_spec_decode(config.speculative_config)
+
+
 def test_the_commit_resolving_flag_needs_the_narrow_decode():
     from vllm_tt_plugin.spec_decode import (
         ACCEPT_MODE_ARGMAX_IDS,
