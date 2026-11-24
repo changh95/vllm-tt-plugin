@@ -478,9 +478,8 @@ def _with_request(runner, req_id, **controls):
     from vllm.sampling_params import SamplingParams
 
     requests = getattr(runner, "requests", None) or {}
-    requests[req_id] = SimpleNamespace(
-        sampling_params=SamplingParams(temperature=0.0, **controls)
-    )
+    controls.setdefault("temperature", 0.0)
+    requests[req_id] = SimpleNamespace(sampling_params=SamplingParams(**controls))
     runner.requests = requests
     return runner
 
@@ -516,6 +515,68 @@ def test_no_request_publishes_drafts_while_a_host_only_request_is_live():
     del batch.req_id_to_index["lp"]  # (it finished: the greedy request drafts again)
     TTModelRunner._publish_draft(runner, "r0", [1, 2, 3])
     assert runner._proposed_draft_token_ids == {"r0": [1, 2, 3]}
+
+
+def _sampling_runner(verify_samples, narrow_resolves=True, max_k=32, **controls):
+    from types import SimpleNamespace
+
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = _FakeBatch(random=["r0"])
+    runner.input_batch.req_id_to_index = {"r0": 0}
+    runner.model = SimpleNamespace(model_capabilities={"max_device_top_k": max_k})
+    runner._spec_verify_samples = verify_samples
+    runner._spec_narrow_resolves = narrow_resolves
+    _with_request(runner, "r0", **controls)
+    return runner, TTModelRunner
+
+
+@pytest.mark.parametrize(
+    "verify_samples, top_k, expect",
+    [(True, 20, True), (True, 32, True), (True, 0, False), (True, 64, False), (False, 20, False)],
+)
+def test_a_sampled_request_speculates_where_the_verify_rows_sample(verify_samples, top_k, expect):
+    """On a plan with ``verify_rows_sample`` the model draws each verify row with
+    the request's parameters, so id equality certifies the sampled continuation:
+    a temperature > 0 request the device can sample (top_k within its limit) is
+    speculable; one it cannot sample, or any on another plan, is not."""
+    runner, cls = _sampling_runner(verify_samples, temperature=0.7, top_k=top_k, top_p=0.95)
+    assert cls._request_is_speculable(runner, "r0") is expect
+
+
+def test_a_sampled_request_the_device_cannot_sample_keeps_steps_ordinary():
+    """Host-sampled (top_k unbounded): no verify may answer it, as for logprobs."""
+    runner, cls = _sampling_runner(True, temperature=0.7, top_k=0)
+    assert cls._host_only_live(runner) is True
+    runner, cls = _sampling_runner(True, temperature=0.7, top_k=20)
+    assert cls._host_only_live(runner) is False
+
+
+def test_a_penalized_sampled_request_stays_unspeculable():
+    runner, cls = _sampling_runner(True, temperature=0.7, top_k=20, presence_penalty=0.5)
+    runner.input_batch.presence_penalties_reqs = {"r0"}
+    assert cls._request_is_speculable(runner, "r0") is False
+
+
+def test_verify_rows_sample_needs_the_commit_resolving_narrow_decode():
+    from vllm_tt_plugin.spec_decode import (
+        ACCEPT_MODE_ARGMAX_IDS,
+        DRAFTER_STATE_INTERNAL,
+        SpecPlan,
+    )
+
+    with pytest.raises(ValueError, match="narrow_decode_resolves_commits"):
+        SpecPlan(
+            effective_k=3,
+            lanes_per_request=4,
+            extra_bytes_per_seq=0,
+            extra_bytes_per_token=0,
+            accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+            drafter_state=DRAFTER_STATE_INTERNAL,
+            supports_narrow_decode=True,
+            verify_rows_sample=True,
+        )
 
 
 def test_another_request_being_sampled_does_not_block_this_one():

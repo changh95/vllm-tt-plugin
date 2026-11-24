@@ -193,12 +193,29 @@ class SpecPlan:
     # while it is live every step is an ordinary decode the host samples
     # (``TTModelRunner._host_only_live``). Requires ``supports_narrow_decode``.
     narrow_decode_resolves_commits: bool = False
+    # Whether, in ``argmax_ids`` mode, the model draws each verify row's id
+    # with its request's device sampling parameters (temperature, top-k,
+    # top-p, seed, at that row's position) instead of taking the argmax. The id
+    # walk then certifies sampled decoding as it certifies greedy: a draft is
+    # accepted with the probability the target gives it, and the rejecting
+    # position commits its own draw. A request with temperature > 0 becomes
+    # speculable when the device can sample it (top_k within the model's
+    # ``max_device_top_k``); penalties still reshape the target per accepted
+    # token, so penalized requests stay unspeculable, and a request the device
+    # cannot sample is kept out of verifies like any host-only request.
+    # Requires ``narrow_decode_resolves_commits``.
+    verify_rows_sample: bool = False
 
     def __post_init__(self) -> None:
         if self.effective_k < 1:
             raise ValueError(
                 "SpecPlan.effective_k must be at least 1; a model that cannot "
                 f"speculate returns SpecReject instead, got {self.effective_k}"
+            )
+        if self.verify_rows_sample and not self.narrow_decode_resolves_commits:
+            raise ValueError(
+                "SpecPlan.verify_rows_sample needs narrow_decode_resolves_commits: a "
+                "sampled request the device cannot sample must be kept out of verifies"
             )
         if self.narrow_decode_resolves_commits and not self.supports_narrow_decode:
             raise ValueError(

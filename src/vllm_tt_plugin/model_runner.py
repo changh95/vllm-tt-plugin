@@ -299,6 +299,11 @@ class TTModelRunner:
             self._spec_supports_narrow_decode
             and getattr(spec_plan, "narrow_decode_resolves_commits", False)
         )
+        # A model whose verify rows sample with each request's parameters lets a
+        # device-samplable request with temperature > 0 speculate.
+        self._spec_verify_samples = bool(
+            self._spec_narrow_resolves and getattr(spec_plan, "verify_rows_sample", False)
+        )
         # Who proposes: the model's own drafter on device, or a host drafter.
         # Read from the one requirements table rather than from a second list of
         # method names, and once, because that table is rebuilt per call.
@@ -508,6 +513,9 @@ class TTModelRunner:
         self._spec_narrow_resolves = bool(
             getattr(self, "_spec_narrow_resolves", False)
             and self._spec_supports_narrow_decode
+        )
+        self._spec_verify_samples = bool(
+            getattr(self, "_spec_verify_samples", False) and self._spec_narrow_resolves
         )
 
     def _narrow_steps_serve_the_drafter(self) -> bool:
@@ -1519,11 +1527,35 @@ class TTModelRunner:
             req_ids = getattr(batch, "req_id_to_index", {}).keys()
         for req_id in req_ids:
             state = requests.get(req_id)
-            if state is not None and _needs_host_only_sampling(
-                getattr(state, "sampling_params", None)
+            if state is None:
+                continue
+            params = getattr(state, "sampling_params", None)
+            if _needs_host_only_sampling(params):
+                return True
+            # A sampled request the device cannot draw for (top_k past its
+            # limit or unbounded) is host-sampled: no verify may answer it.
+            if (
+                getattr(self, "_spec_narrow_resolves", False)
+                and float(getattr(params, "temperature", 0.0) or 0.0) > 0.0
+                and not TTModelRunner._device_samplable(self, req_id)
             ):
                 return True
         return False
+
+    def _device_samplable(self, req_id: str) -> bool:
+        """Whether the device can draw this request's tokens (its top_k within
+        the model's ``max_device_top_k``; no limit declared: any)."""
+        state = (getattr(self, "requests", None) or {}).get(req_id)
+        params = getattr(state, "sampling_params", None)
+        if params is None:
+            return False
+        model = getattr(self, "model", None)
+        caps = getattr(model, "model_capabilities", None) or {}
+        max_k = caps.get("max_device_top_k")
+        if max_k is None:
+            return True
+        top_k = int(getattr(params, "top_k", 0) or 0)
+        return 1 <= top_k <= int(max_k)
 
     def _request_is_speculable(self, req_id: str) -> bool:
         """False when this request's sampling cannot be certified by id equality.
@@ -1541,12 +1573,18 @@ class TTModelRunner:
         # sets has no sampled request to withhold drafts from, so the answer is
         # the same as an empty set -- speculable.
         for attr in (
-            "random_reqs",
             "presence_penalties_reqs",
             "frequency_penalties_reqs",
             "repetition_penalties_reqs",
         ):
             if req_id in getattr(batch, attr, ()):
+                return False
+        if req_id in getattr(batch, "random_reqs", ()):
+            # A sampled request: speculable only on a model whose verify rows
+            # draw with its parameters, and only when the device can sample it.
+            if not getattr(self, "_spec_verify_samples", False):
+                return False
+            if not TTModelRunner._device_samplable(self, req_id):
                 return False
         # Logprobs, a grammar or a token filter need logits a verify never
         # returns (admitted only on a plan with narrow_decode_resolves_commits).
