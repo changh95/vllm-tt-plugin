@@ -2514,9 +2514,16 @@ class TTPlatform(Platform):
         Refused per request rather than at config time because these are
         per-request controls, and a launch may legitimately mix requests that
         speculate with requests that cannot.
+
+        A model whose plan sets ``narrow_decode_resolves_commits`` does serve
+        them: the runner keeps every step an ordinary decode the host samples
+        while such a request is live (``TTModelRunner._host_only_live``), so
+        nothing is refused there -- the request decodes without speculation and
+        the other requests stop speculating until it finishes.
         """
         vllm_config = cls._resolve_tt_admission_handle()
-        if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
+        plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
+        if plan is None or getattr(plan, "narrow_decode_resolves_commits", False):
             return
 
         unsupported = []

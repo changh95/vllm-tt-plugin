@@ -365,6 +365,56 @@ def test_a_draftless_step_still_verifies_while_a_commit_is_unresolved():
     assert model_input.input_tokens.shape == (MAX_NUM_REQS, 1 + 3)
 
 
+def _host_only(request: CachedRequestState, **controls) -> CachedRequestState:
+    """Give a request a control only the host sampler applies."""
+    request.sampling_params = SamplingParams(temperature=0.0, **controls)
+    return request
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [{"logprobs": 1}, {"min_tokens": 4}, {"logit_bias": {5: 1.0}}],
+    ids=["logprobs", "min_tokens", "logit_bias"],
+)
+def test_a_host_only_request_keeps_the_step_ordinary_on_a_resolving_model(controls):
+    """No verify while a request needs host-only sampling, even to resolve a commit.
+
+    A verify answers every row with an argmax id, so the request would lose its
+    logprobs or filter on that step. A model whose plan sets
+    ``narrow_decode_resolves_commits`` records multi-token commits itself, so
+    the runner sends the ordinary decode instead: drafts withheld from every
+    row, no side tensors, and the host samples (logits come back).
+    """
+    batch = _batch()
+    requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
+    _host_only(requests["b"], **controls)
+    runner = _fake_runner(
+        batch, requests, supports_narrow_decode=True, accepted_counts={"a": 3}
+    )
+    runner._spec_narrow_resolves = True
+
+    model_input = _decode(runner, "a", "b", drafts=_drafts(a=[7, 8, 9]))
+
+    assert model_input.spec_mode is None
+    assert model_input.accepted_counts is None
+    assert model_input.num_valid_drafts is None
+    assert model_input.input_tokens.shape == (MAX_NUM_REQS, 1)
+
+
+def test_a_host_only_request_on_a_model_without_the_flag_still_verifies():
+    """Without the declaration the resolving verify stays (and the platform refuses such requests)."""
+    batch = _batch()
+    requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
+    _host_only(requests["b"], logprobs=1)
+    runner = _fake_runner(
+        batch, requests, supports_narrow_decode=True, accepted_counts={"a": 3}
+    )
+
+    model_input = _decode(runner, "a", "b")
+
+    assert model_input.spec_mode is not None
+
+
 def test_narrow_decode_widens_when_any_row_carries_a_draft():
     batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}

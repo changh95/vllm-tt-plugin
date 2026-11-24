@@ -73,6 +73,10 @@ class FakeSpecModel:
     # K x 36 MiB, because nothing here budgets against them.
     supported_k: tuple[int, ...] = (3, 7, 11)
     max_supported_num_seqs: int = 1
+    # The narrow [B, 1] decode beside the verify, and whether the model records
+    # multi-token commits itself (so a narrow decode may follow one).
+    supports_narrow_decode = False
+    narrow_decode_resolves_commits = False
     accept_modes: tuple[str, ...] = (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS)
     drafter_state: str = DRAFTER_STATE_INTERNAL
     extra_bytes_per_seq: int = 36 << 20
@@ -126,7 +130,8 @@ class FakeSpecModel:
             extra_bytes_per_token=cls.extra_bytes_per_token,
             accept_modes=cls.accept_modes,
             drafter_state=cls.drafter_state,
-            supports_narrow_decode=False,
+            supports_narrow_decode=cls.supports_narrow_decode,
+            narrow_decode_resolves_commits=cls.narrow_decode_resolves_commits,
         )
 
     # ---- the primitives --------------------------------------------------

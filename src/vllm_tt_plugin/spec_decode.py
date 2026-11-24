@@ -182,12 +182,29 @@ class SpecPlan:
     # shape rather than two; a model that sets this offers a second, narrower
     # shape and the runner prefers it on those steps.
     supports_narrow_decode: bool = False
+    # Whether a narrow decode may also follow a step that committed several
+    # tokens for a row. A model that records each step's commits itself (the
+    # accepted counts reach it through ``propose_draft_tokens``) does not need
+    # the draftless resolving verify that otherwise follows such a commit. The
+    # runner uses this to keep a request whose sampling only the host applies
+    # (logprobs, structured outputs, logit_bias, bad_words, allowed_token_ids,
+    # min_tokens) out of every verify: on a launch whose plan sets it, such a
+    # request is admitted rather than refused, decoded without speculation, and
+    # while it is live every step is an ordinary decode the host samples
+    # (``TTModelRunner._host_only_live``). Requires ``supports_narrow_decode``.
+    narrow_decode_resolves_commits: bool = False
 
     def __post_init__(self) -> None:
         if self.effective_k < 1:
             raise ValueError(
                 "SpecPlan.effective_k must be at least 1; a model that cannot "
                 f"speculate returns SpecReject instead, got {self.effective_k}"
+            )
+        if self.narrow_decode_resolves_commits and not self.supports_narrow_decode:
+            raise ValueError(
+                "SpecPlan.narrow_decode_resolves_commits needs supports_narrow_decode: "
+                "it lets a narrow decode follow a multi-token commit, so the model "
+                "must serve the narrow shape"
             )
         if self.lanes_per_request < 1:
             raise ValueError(

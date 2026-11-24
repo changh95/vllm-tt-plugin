@@ -137,6 +137,27 @@ class _SyncForward:
     spec_hidden: Any | None = None
 
 
+def _needs_host_only_sampling(params: Any) -> bool:
+    """Whether a request asks for something only the host sampler applies.
+
+    Logprobs, a grammar, a token filter, logit_bias and min_tokens all need the
+    step's logits, and a verify in ``argmax_ids`` mode returns none: a row it
+    answered would come back without them, silently. Such a request is never
+    speculable, and on a plan with ``narrow_decode_resolves_commits`` it keeps
+    every step an ordinary host-sampled decode while it is live.
+    """
+    if params is None:
+        return False
+    return (
+        getattr(params, "logprobs", None) is not None
+        or getattr(params, "structured_outputs", None) is not None
+        or bool(getattr(params, "logit_bias", None))
+        or bool(getattr(params, "bad_words", None))
+        or bool(getattr(params, "allowed_token_ids", None))
+        or bool(getattr(params, "min_tokens", 0))
+    )
+
+
 def _step_verifies(
     supports_narrow_decode: bool,
     num_valid_drafts: torch.Tensor,
@@ -269,6 +290,13 @@ class TTModelRunner:
         # server. ``load_model`` narrows this further, once the model exists.
         self._spec_supports_narrow_decode = bool(
             spec_plan and spec_plan.supports_narrow_decode
+        )
+        # A model that also records multi-token commits itself lets the runner
+        # skip the draftless resolving verify, which is how a request needing
+        # host-only sampling stays out of every verify (``_host_only_live``).
+        self._spec_narrow_resolves = bool(
+            self._spec_supports_narrow_decode
+            and getattr(spec_plan, "narrow_decode_resolves_commits", False)
         )
         # Who proposes: the model's own drafter on device, or a host drafter.
         # Read from the one requirements table rather than from a second list of
@@ -465,6 +493,10 @@ class TTModelRunner:
         )
         if self._spec_supports_narrow_decode:
             self._spec_supports_narrow_decode = self._narrow_steps_serve_the_drafter()
+        self._spec_narrow_resolves = bool(
+            getattr(self, "_spec_narrow_resolves", False)
+            and self._spec_supports_narrow_decode
+        )
 
     def _narrow_steps_serve_the_drafter(self) -> bool:
         """Whether a step that verifies nothing can still feed the drafter.
@@ -1450,10 +1482,36 @@ class TTModelRunner:
         scheduler is told to verify next, so an entry nothing rewrote would be
         verified against a token the request has already moved past.
         """
-        if tokens and self._request_is_speculable(req_id):
+        if (
+            tokens
+            and self._request_is_speculable(req_id)
+            and not TTModelRunner._host_only_live(self)
+        ):
             self._proposed_draft_token_ids[req_id] = list(tokens)
         else:
             self._proposed_draft_token_ids.pop(req_id, None)
+
+    def _host_only_live(self, req_ids=None) -> bool:
+        """Whether a live request (of ``req_ids``, or of the batch) needs host-only sampling.
+
+        While one is, no request publishes drafts, and on a plan with
+        ``narrow_decode_resolves_commits`` every step is an ordinary decode the
+        host samples, so that request never meets a verify, which would answer
+        it without its logprobs, grammar or token filter.
+        """
+        requests = getattr(self, "requests", None) or {}
+        if not requests:
+            return False
+        if req_ids is None:
+            batch = getattr(self, "input_batch", None)
+            req_ids = getattr(batch, "req_id_to_index", {}).keys()
+        for req_id in req_ids:
+            state = requests.get(req_id)
+            if state is not None and _needs_host_only_sampling(
+                getattr(state, "sampling_params", None)
+            ):
+                return True
+        return False
 
     def _request_is_speculable(self, req_id: str) -> bool:
         """False when this request's sampling cannot be certified by id equality.
@@ -1478,6 +1536,13 @@ class TTModelRunner:
         ):
             if req_id in getattr(batch, attr, ()):
                 return False
+        # Logprobs, a grammar or a token filter need logits a verify never
+        # returns (admitted only on a plan with narrow_decode_resolves_commits).
+        state = (getattr(self, "requests", None) or {}).get(req_id)
+        if state is not None and _needs_host_only_sampling(
+            getattr(state, "sampling_params", None)
+        ):
+            return False
         return True
 
     def _note_unspeculable_verify_rows(self, row_req_ids: list[str]) -> None:
@@ -2027,7 +2092,14 @@ class TTModelRunner:
                     row_req_ids,
                     self._num_speculative_tokens,
                 )
-                if _step_verifies(
+                # A live request needing host-only sampling keeps the step an
+                # ordinary decode, drafts withheld and any multi-token commit
+                # left to the model, which records commits itself on a plan
+                # with ``narrow_decode_resolves_commits``.
+                host_only = getattr(
+                    self, "_spec_narrow_resolves", False
+                ) and TTModelRunner._host_only_live(self, row_req_ids)
+                if not host_only and _step_verifies(
                     self._spec_supports_narrow_decode,
                     num_valid_drafts,
                     accepted_counts,

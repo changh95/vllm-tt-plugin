@@ -310,6 +310,57 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
 @pytest.mark.parametrize(
     "field, value",
     [
+        ("logprobs", 1),
+        ("min_tokens", 4),
+        ("bad_words", ["no"]),
+        ("logit_bias", {5: 1.0}),
+        ("allowed_token_ids", [1, 2, 3]),
+    ],
+)
+def test_a_host_only_request_is_admitted_when_the_model_resolves_commits(
+    monkeypatch, vllm_config, field, value
+):
+    """A plan with ``narrow_decode_resolves_commits`` serves what the walk cannot.
+
+    The runner then keeps every step an ordinary decode the host samples while
+    such a request is live (``TTModelRunner._host_only_live``), so the request
+    gets its logprobs, grammar or token filter at baseline speed instead of an
+    HTTP 400.
+    """
+    from vllm.sampling_params import SamplingParams
+
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4,
+        supports_narrow_decode=True,
+        narrow_decode_resolves_commits=True,
+    )
+    _run_hook(monkeypatch, _speculative(vllm_config), model)
+    assert get_tt_spec_plan(vllm_config).narrow_decode_resolves_commits
+    _validate(SamplingParams(temperature=0.0, **{field: value}))  # must not raise
+
+
+def test_the_commit_resolving_flag_needs_the_narrow_decode():
+    from vllm_tt_plugin.spec_decode import (
+        ACCEPT_MODE_ARGMAX_IDS,
+        DRAFTER_STATE_INTERNAL,
+        SpecPlan,
+    )
+
+    with pytest.raises(ValueError, match="supports_narrow_decode"):
+        SpecPlan(
+            effective_k=3,
+            lanes_per_request=4,
+            extra_bytes_per_seq=0,
+            extra_bytes_per_token=0,
+            accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+            drafter_state=DRAFTER_STATE_INTERNAL,
+            narrow_decode_resolves_commits=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
         ("temperature", 0.7),
         ("presence_penalty", 0.5),
         ("frequency_penalty", 0.5),
@@ -390,6 +441,52 @@ def test_sampling_the_walk_cannot_certify_is_not_speculable(batch_kwargs):
     refusing the request.
     """
     assert _speculable(**batch_kwargs) is False
+
+
+def _with_request(runner, req_id, **controls):
+    from types import SimpleNamespace
+
+    from vllm.sampling_params import SamplingParams
+
+    requests = getattr(runner, "requests", None) or {}
+    requests[req_id] = SimpleNamespace(
+        sampling_params=SamplingParams(temperature=0.0, **controls)
+    )
+    runner.requests = requests
+    return runner
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [{"logprobs": 0}, {"min_tokens": 2}, {"bad_words": ["x"]}, {"allowed_token_ids": [1]}],
+    ids=["logprobs", "min_tokens", "bad_words", "allowed_token_ids"],
+)
+def test_a_host_only_request_is_not_speculable(controls):
+    """Its logits are needed on every step, and a verify returns none."""
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = _FakeBatch()
+    _with_request(runner, "r0", **controls)
+    assert TTModelRunner._request_is_speculable(runner, "r0") is False
+
+
+def test_no_request_publishes_drafts_while_a_host_only_request_is_live():
+    """Withheld from everyone, so the next step has nothing to verify."""
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = object.__new__(TTModelRunner)
+    batch = _FakeBatch()
+    batch.req_id_to_index = {"r0": 0, "lp": 1}
+    runner.input_batch = batch
+    _with_request(runner, "r0")
+    _with_request(runner, "lp", logprobs=1)
+    runner._proposed_draft_token_ids = {"r0": [9, 9]}
+    TTModelRunner._publish_draft(runner, "r0", [1, 2, 3])
+    assert runner._proposed_draft_token_ids == {}
+    del batch.req_id_to_index["lp"]  # (it finished: the greedy request drafts again)
+    TTModelRunner._publish_draft(runner, "r0", [1, 2, 3])
+    assert runner._proposed_draft_token_ids == {"r0": [1, 2, 3]}
 
 
 def test_another_request_being_sampled_does_not_block_this_one():
